@@ -19,7 +19,7 @@ if LIB_DIR not in sys.path:
 
 from erpclaw_lib.db import _DecimalSum
 
-_LOCAL_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../"))
+_LOCAL_ROOT = os.path.expanduser("~/Downloads/projects/erpclaw")
 _SERVER_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "erpclaw-setup", "scripts")
 if os.path.exists(os.path.join(_LOCAL_ROOT, "init_db.py")):
     PROJECT_ROOT = _LOCAL_ROOT

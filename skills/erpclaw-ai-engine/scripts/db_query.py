@@ -26,6 +26,8 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
+    from erpclaw_lib.query import Q, P, Table, Field, fn, Case, Order, Criterion, Not, NULL, DecimalSum, DecimalAbs
+    from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
@@ -114,9 +116,9 @@ def _validate_company(conn, company_id):
     """Validate company exists. Returns company row or calls _err."""
     if not company_id:
         err("--company-id is required")
-    company = conn.execute(
-        "SELECT * FROM company WHERE id = ?", (company_id,)
-    ).fetchone()
+    t = Table("company")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    company = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not company:
         err(f"Company not found: {company_id}",
              suggestion="Run 'tutorial' to create a demo company, or 'setup company' to create your own.")
@@ -127,27 +129,33 @@ def _insert_anomaly(conn, anomaly_type, severity, entity_type, entity_id,
                     description, evidence, baseline=None, actual=None,
                     deviation_pct=None):
     """Insert an anomaly if not already exists (idempotent). Returns anomaly_id or None."""
+    a = Table("anomaly")
+    q = (Q.from_(a).select(a.id)
+         .where(a.anomaly_type == P())
+         .where(a.entity_type == P())
+         .where(a.entity_id == P())
+         .where(a.status.isin([P(), P()])))
     existing = conn.execute(
-        """SELECT id FROM anomaly
-           WHERE anomaly_type = ? AND entity_type = ? AND entity_id = ?
-           AND status IN ('new', 'acknowledged')""",
-        (anomaly_type, entity_type, entity_id),
+        q.get_sql(), (anomaly_type, entity_type, entity_id, 'new', 'acknowledged'),
     ).fetchone()
     if existing:
         return None
 
     anomaly_id = str(uuid.uuid4())
+    q = (Q.into(a)
+         .columns("id", "anomaly_type", "severity", "entity_type",
+                  "entity_id", "description", "evidence", "baseline", "actual",
+                  "deviation_pct", "status")
+         .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
     conn.execute(
-        """INSERT INTO anomaly (id, anomaly_type, severity, entity_type,
-           entity_id, description, evidence, baseline, actual,
-           deviation_pct, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new')""",
+        q.get_sql(),
         (anomaly_id, anomaly_type, severity, entity_type, entity_id,
          description,
          json.dumps(evidence) if isinstance(evidence, dict) else evidence,
          json.dumps(baseline) if isinstance(baseline, dict) else baseline,
          json.dumps(actual) if isinstance(actual, dict) else actual,
-         str(deviation_pct) if deviation_pct is not None else None),
+         str(deviation_pct) if deviation_pct is not None else None,
+         'new'),
     )
     return anomaly_id
 
@@ -165,26 +173,23 @@ def acknowledge_anomaly(conn, args):
     if not args.anomaly_id:
         err("--anomaly-id is required")
 
-    anomaly = conn.execute(
-        "SELECT * FROM anomaly WHERE id = ?", (args.anomaly_id,)
-    ).fetchone()
+    a = Table("anomaly")
+    q = Q.from_(a).select(a.star).where(a.id == P())
+    anomaly = conn.execute(q.get_sql(), (args.anomaly_id,)).fetchone()
     if not anomaly:
         err(f"Anomaly not found: {args.anomaly_id}")
 
     if anomaly["status"] not in ("new",):
         err(f"Cannot acknowledge anomaly in status: {anomaly['status']}")
 
-    conn.execute(
-        "UPDATE anomaly SET status = 'acknowledged' WHERE id = ?",
-        (args.anomaly_id,),
-    )
+    q = Q.update(a).set(a.status, P()).where(a.id == P())
+    conn.execute(q.get_sql(), ('acknowledged', args.anomaly_id))
     conn.commit()
     audit(conn, "erpclaw-ai-engine", "acknowledge-anomaly", "anomaly", args.anomaly_id)
     conn.commit()
 
-    updated = row_to_dict(conn.execute(
-        "SELECT * FROM anomaly WHERE id = ?", (args.anomaly_id,)
-    ).fetchone())
+    q = Q.from_(a).select(a.star).where(a.id == P())
+    updated = row_to_dict(conn.execute(q.get_sql(), (args.anomaly_id,)).fetchone())
     ok({"anomaly": updated})
 
 
@@ -193,27 +198,26 @@ def dismiss_anomaly(conn, args):
     if not args.anomaly_id:
         err("--anomaly-id is required")
 
-    anomaly = conn.execute(
-        "SELECT * FROM anomaly WHERE id = ?", (args.anomaly_id,)
-    ).fetchone()
+    a = Table("anomaly")
+    q = Q.from_(a).select(a.star).where(a.id == P())
+    anomaly = conn.execute(q.get_sql(), (args.anomaly_id,)).fetchone()
     if not anomaly:
         err(f"Anomaly not found: {args.anomaly_id}")
 
     if anomaly["status"] in ("dismissed", "resolved"):
         err(f"Anomaly already in terminal status: {anomaly['status']}")
 
-    conn.execute(
-        """UPDATE anomaly SET status = 'dismissed', resolution_notes = ?
-           WHERE id = ?""",
-        (args.reason, args.anomaly_id),
-    )
+    q = (Q.update(a)
+         .set(a.status, P())
+         .set(a.resolution_notes, P())
+         .where(a.id == P()))
+    conn.execute(q.get_sql(), ('dismissed', args.reason, args.anomaly_id))
     conn.commit()
     audit(conn, "erpclaw-ai-engine", "dismiss-anomaly", "anomaly", args.anomaly_id)
     conn.commit()
 
-    updated = row_to_dict(conn.execute(
-        "SELECT * FROM anomaly WHERE id = ?", (args.anomaly_id,)
-    ).fetchone())
+    q = Q.from_(a).select(a.star).where(a.id == P())
+    updated = row_to_dict(conn.execute(q.get_sql(), (args.anomaly_id,)).fetchone())
     ok({"anomaly": updated})
 
 
@@ -240,25 +244,25 @@ def create_scenario(conn, args):
     assumptions["company_id"] = args.company_id
 
     scenario_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO scenario (id, question, scenario_type, assumptions,
-           created_at)
-           VALUES (?, ?, ?, ?, ?)""",
+    s = Table("scenario")
+    q = (Q.into(s)
+         .columns("id", "question", "scenario_type", "assumptions", "created_at")
+         .insert(P(), P(), P(), P(), P()))
+    conn.execute(q.get_sql(),
         (scenario_id, args.name, scenario_type,
-         json.dumps(assumptions), _now()),
-    )
+         json.dumps(assumptions), _now()))
     conn.commit()
     audit(conn, "erpclaw-ai-engine", "create-scenario", "scenario", scenario_id)
     conn.commit()
 
-    row = row_to_dict(conn.execute(
-        "SELECT * FROM scenario WHERE id = ?", (scenario_id,)
-    ).fetchone())
+    q = Q.from_(s).select(s.star).where(s.id == P())
+    row = row_to_dict(conn.execute(q.get_sql(), (scenario_id,)).fetchone())
     ok({"scenario": row})
 
 
 def list_scenarios(conn, args):
     """List scenarios."""
+    # raw SQL — json_extract() filter not supported by PyPika
     query = "SELECT * FROM scenario WHERE 1=1"
     params = []
 
@@ -302,26 +306,27 @@ def add_business_rule(conn, args):
         parsed_condition["company_id"] = args.company_id
 
     rule_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO business_rule (id, rule_text, parsed_condition,
-           applies_to, action, active, times_triggered, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?)""",
+    br = Table("business_rule")
+    q = (Q.into(br)
+         .columns("id", "rule_text", "parsed_condition", "applies_to",
+                  "action", "active", "times_triggered", "created_at", "updated_at")
+         .insert(P(), P(), P(), P(), P(), 1, 0, P(), P()))
+    conn.execute(q.get_sql(),
         (rule_id, args.rule_text,
          json.dumps(parsed_condition) if parsed_condition else None,
-         args.company_id, action_val, _now(), _now()),
-    )
+         args.company_id, action_val, _now(), _now()))
     conn.commit()
     audit(conn, "erpclaw-ai-engine", "add-business-rule", "business_rule", rule_id)
     conn.commit()
 
-    row = row_to_dict(conn.execute(
-        "SELECT * FROM business_rule WHERE id = ?", (rule_id,)
-    ).fetchone())
+    q = Q.from_(br).select(br.star).where(br.id == P())
+    row = row_to_dict(conn.execute(q.get_sql(), (rule_id,)).fetchone())
     ok({"business_rule": row})
 
 
 def list_business_rules(conn, args):
     """List business rules."""
+    # raw SQL — dynamic IS NULL filter not well supported by PyPika
     query = "SELECT * FROM business_rule WHERE 1=1"
     params = []
 
@@ -357,7 +362,7 @@ def evaluate_business_rules(conn, args):
 
     action_data = _parse_json_arg(args.action_data, "action-data")
 
-    # Load active rules
+    # raw SQL — dynamic IS NULL filter not well supported by PyPika
     query = "SELECT * FROM business_rule WHERE active = 1"
     params = []
     if args.company_id:
@@ -390,7 +395,7 @@ def evaluate_business_rules(conn, args):
             matched = _evaluate_conditions(conditions, action_data)
 
         if matched:
-            # Increment trigger count
+            # raw SQL — SET col = col + 1 arithmetic not well supported by PyPika
             conn.execute(
                 """UPDATE business_rule SET times_triggered = times_triggered + 1,
                    last_triggered_at = ? WHERE id = ?""",
@@ -474,20 +479,20 @@ def add_categorization_rule(conn, args):
         err("--account-id is required")
 
     # Validate account FK
-    acct = conn.execute(
-        "SELECT id FROM account WHERE id = ? OR name = ?",
-        (args.account_id, args.account_id),
-    ).fetchone()
+    acct_t = Table("account")
+    q = Q.from_(acct_t).select(acct_t.id).where(
+        (acct_t.id == P()) | (acct_t.name == P()))
+    acct = conn.execute(q.get_sql(), (args.account_id, args.account_id)).fetchone()
     if not acct:
         err(f"Account not found: {args.account_id}")
     args.account_id = acct["id"]
 
     # Validate optional cost center FK
     if args.cost_center_id:
-        cc = conn.execute(
-            "SELECT id FROM cost_center WHERE id = ? OR name = ?",
-            (args.cost_center_id, args.cost_center_id),
-        ).fetchone()
+        cc_t = Table("cost_center")
+        q = Q.from_(cc_t).select(cc_t.id).where(
+            (cc_t.id == P()) | (cc_t.name == P()))
+        cc = conn.execute(q.get_sql(), (args.cost_center_id, args.cost_center_id)).fetchone()
         if not cc:
             err(f"Cost center not found: {args.cost_center_id}")
         args.cost_center_id = cc["id"]
@@ -498,21 +503,21 @@ def add_categorization_rule(conn, args):
              f"Must be one of: {', '.join(sorted(VALID_SOURCES))}")
 
     rule_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO categorization_rule (id, pattern, source,
-           target_account_id, target_cost_center_id, confidence,
-           times_applied, times_overridden, created_by, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, '0.5', 0, 0, 'user', ?, ?)""",
+    cr = Table("categorization_rule")
+    q = (Q.into(cr)
+         .columns("id", "pattern", "source", "target_account_id",
+                  "target_cost_center_id", "confidence", "times_applied",
+                  "times_overridden", "created_by", "created_at", "updated_at")
+         .insert(P(), P(), P(), P(), P(), '0.5', 0, 0, 'user', P(), P()))
+    conn.execute(q.get_sql(),
         (rule_id, args.pattern, source, args.account_id,
-         args.cost_center_id, _now(), _now()),
-    )
+         args.cost_center_id, _now(), _now()))
     conn.commit()
     audit(conn, "erpclaw-ai-engine", "add-categorization-rule", "categorization_rule", rule_id)
     conn.commit()
 
-    row = row_to_dict(conn.execute(
-        "SELECT * FROM categorization_rule WHERE id = ?", (rule_id,)
-    ).fetchone())
+    q = Q.from_(cr).select(cr.star).where(cr.id == P())
+    row = row_to_dict(conn.execute(q.get_sql(), (rule_id,)).fetchone())
     ok({"categorization_rule": row})
 
 
@@ -523,7 +528,7 @@ def categorize_transaction(conn, args):
 
     desc_lower = args.description.lower()
 
-    # Load all rules ordered by confidence DESC
+    # raw SQL — ORDER BY arithmetic expression (confidence + 0) not well supported by PyPika
     rules = conn.execute(
         """SELECT * FROM categorization_rule
            ORDER BY confidence + 0 DESC, times_applied DESC"""
@@ -538,7 +543,7 @@ def categorize_transaction(conn, args):
             break
 
     if best_match:
-        # Increment times_applied
+        # raw SQL — SET col = col + 1 arithmetic not well supported by PyPika
         conn.execute(
             """UPDATE categorization_rule SET times_applied = times_applied + 1,
                last_applied_at = ? WHERE id = ?""",
@@ -575,50 +580,48 @@ def save_conversation_context(conn, args):
              f"Must be one of: {', '.join(sorted(VALID_CONTEXT_TYPES))}")
 
     ctx_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO conversation_context (id, user_id, context_type,
-           summary, related_entities, state, last_active, priority)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+    cc = Table("conversation_context")
+    q = (Q.into(cc)
+         .columns("id", "user_id", "context_type", "summary",
+                  "related_entities", "state", "last_active", "priority")
+         .insert(P(), P(), P(), P(), P(), P(), P(), P()))
+    conn.execute(q.get_sql(),
         (ctx_id, data.get("user_id"), context_type,
          data.get("summary"), json.dumps(data.get("related_entities")),
          json.dumps(data.get("state")), _now(),
-         data.get("priority", 0)),
-    )
+         data.get("priority", 0)))
     conn.commit()
 
-    row = row_to_dict(conn.execute(
-        "SELECT * FROM conversation_context WHERE id = ?", (ctx_id,)
-    ).fetchone())
+    q = Q.from_(cc).select(cc.star).where(cc.id == P())
+    row = row_to_dict(conn.execute(q.get_sql(), (ctx_id,)).fetchone())
     ok({"context": row})
 
 
 def get_conversation_context(conn, args):
     """Resume from saved conversation context."""
+    cc = Table("conversation_context")
     if args.context_id:
-        row = conn.execute(
-            "SELECT * FROM conversation_context WHERE id = ?",
-            (args.context_id,),
-        ).fetchone()
+        q = Q.from_(cc).select(cc.star).where(cc.id == P())
+        row = conn.execute(q.get_sql(), (args.context_id,)).fetchone()
         if not row:
             err(f"Context not found: {args.context_id}")
     else:
         # Get latest active context
-        row = conn.execute(
-            """SELECT * FROM conversation_context
-               ORDER BY last_active DESC LIMIT 1"""
-        ).fetchone()
+        q = Q.from_(cc).select(cc.star).orderby(cc.last_active, order=Order.desc).limit(1)
+        row = conn.execute(q.get_sql()).fetchone()
         if not row:
             ok({"context": None, "message": "No saved context found"})
 
     ctx = row_to_dict(row)
 
     # Also fetch any pending decisions for this context
+    pd = Table("pending_decision")
+    q = (Q.from_(pd).select(pd.star)
+         .where(pd.context_id == P())
+         .where(pd.status == P())
+         .orderby(pd.created_at, order=Order.desc))
     decisions = [row_to_dict(r) for r in conn.execute(
-        """SELECT * FROM pending_decision
-           WHERE context_id = ? AND status = 'pending'
-           ORDER BY created_at DESC""",
-        (ctx["id"],),
-    ).fetchall()]
+        q.get_sql(), (ctx["id"], 'pending')).fetchall()]
 
     ctx["pending_decisions"] = decisions
     ok({"context": ctx})
@@ -641,29 +644,29 @@ def add_pending_decision(conn, args):
     context_id = args.context_id
     if not context_id:
         context_id = str(uuid.uuid4())
-        conn.execute(
-            """INSERT INTO conversation_context (id, context_type, summary,
-               last_active, priority)
-               VALUES (?, 'pending_decision', ?, ?, 0)""",
-            (context_id, f"Decision: {args.description}", _now()),
-        )
+        cc = Table("conversation_context")
+        q = (Q.into(cc)
+             .columns("id", "context_type", "summary", "last_active", "priority")
+             .insert(P(), 'pending_decision', P(), P(), 0))
+        conn.execute(q.get_sql(),
+            (context_id, f"Decision: {args.description}", _now()))
 
     decision_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO pending_decision (id, context_id, question, options,
-           deadline, impact, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)""",
+    pdt = Table("pending_decision")
+    q = (Q.into(pdt)
+         .columns("id", "context_id", "question", "options",
+                  "deadline", "impact", "status", "created_at")
+         .insert(P(), P(), P(), P(), P(), P(), 'pending', P()))
+    conn.execute(q.get_sql(),
         (decision_id, context_id, args.description,
          json.dumps(options) if options else None,
          args.to_date,  # reuse --to-date as deadline
          args.decision_type,  # reuse as impact description
-         _now()),
-    )
+         _now()))
     conn.commit()
 
-    row = row_to_dict(conn.execute(
-        "SELECT * FROM pending_decision WHERE id = ?", (decision_id,)
-    ).fetchone())
+    q = Q.from_(pdt).select(pdt.star).where(pdt.id == P())
+    row = row_to_dict(conn.execute(q.get_sql(), (decision_id,)).fetchone())
     ok({"pending_decision": row, "context_id": context_id})
 
 
@@ -681,19 +684,18 @@ def log_audit_conversation(conn, args):
         details = _parse_json_arg(args.details, "details")
 
     audit_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO audit_conversation (id, timestamp, voucher_type,
-           ai_interpretation, actions_taken)
-           VALUES (?, ?, ?, ?, ?)""",
+    ac = Table("audit_conversation")
+    q = (Q.into(ac)
+         .columns("id", "timestamp", "voucher_type", "ai_interpretation", "actions_taken")
+         .insert(P(), P(), P(), P(), P()))
+    conn.execute(q.get_sql(),
         (audit_id, _now(), args.action_name,
          args.result,
-         json.dumps(details) if details else None),
-    )
+         json.dumps(details) if details else None))
     conn.commit()
 
-    row = row_to_dict(conn.execute(
-        "SELECT * FROM audit_conversation WHERE id = ?", (audit_id,)
-    ).fetchone())
+    q = Q.from_(ac).select(ac.star).where(ac.id == P())
+    row = row_to_dict(conn.execute(q.get_sql(), (audit_id,)).fetchone())
     ok({"audit_entry": row})
 
 
@@ -713,17 +715,15 @@ def score_relationship(conn, args):
 
     # Validate party exists
     if args.party_type == "customer":
-        party = conn.execute(
-            "SELECT id, company_id FROM customer WHERE id = ?",
-            (args.party_id,)
-        ).fetchone()
+        cust = Table("customer")
+        q = Q.from_(cust).select(cust.id, cust.company_id).where(cust.id == P())
+        party = conn.execute(q.get_sql(), (args.party_id,)).fetchone()
         if not party:
             err(f"Customer not found: {args.party_id}")
     else:
-        party = conn.execute(
-            "SELECT id, company_id FROM supplier WHERE id = ?",
-            (args.party_id,)
-        ).fetchone()
+        supp = Table("supplier")
+        q = Q.from_(supp).select(supp.id, supp.company_id).where(supp.id == P())
+        party = conn.execute(q.get_sql(), (args.party_id,)).fetchone()
         if not party:
             err(f"Supplier not found: {args.party_id}")
 
@@ -732,47 +732,48 @@ def score_relationship(conn, args):
 
     # --- Payment Score ---
     if args.party_type == "customer":
-        invoices = conn.execute(
-            """SELECT posting_date, due_date, grand_total, outstanding_amount
-                FROM sales_invoice
-                WHERE customer_id = ? AND status NOT IN ('draft', 'cancelled')""",
-            (args.party_id,),
-        ).fetchall()
+        si = Table("sales_invoice")
+        q = (Q.from_(si)
+             .select(si.posting_date, si.due_date, si.grand_total, si.outstanding_amount)
+             .where(si.customer_id == P())
+             .where(si.status.notin([P(), P()])))
+        invoices = conn.execute(q.get_sql(), (args.party_id, 'draft', 'cancelled')).fetchall()
     else:
-        invoices = conn.execute(
-            """SELECT posting_date, due_date, grand_total, outstanding_amount
-                FROM purchase_invoice
-                WHERE supplier_id = ? AND status NOT IN ('draft', 'cancelled')""",
-            (args.party_id,),
-        ).fetchall()
+        pi = Table("purchase_invoice")
+        q = (Q.from_(pi)
+             .select(pi.posting_date, pi.due_date, pi.grand_total, pi.outstanding_amount)
+             .where(pi.supplier_id == P())
+             .where(pi.status.notin([P(), P()])))
+        invoices = conn.execute(q.get_sql(), (args.party_id, 'draft', 'cancelled')).fetchall()
 
-    payments = conn.execute(
-        """SELECT posting_date, paid_amount FROM payment_entry
-           WHERE party_type = ? AND party_id = ?
-           AND status = 'submitted'""",
-        (args.party_type, args.party_id),
-    ).fetchall()
+    pe = Table("payment_entry")
+    q = (Q.from_(pe)
+         .select(pe.posting_date, pe.paid_amount)
+         .where(pe.party_type == P())
+         .where(pe.party_id == P())
+         .where(pe.status == P()))
+    payments = conn.execute(q.get_sql(), (args.party_type, args.party_id, 'submitted')).fetchall()
 
     total_invoices = len(invoices)
     if total_invoices == 0:
         # No history — return default scores
         score_id = str(uuid.uuid4())
-        conn.execute(
-            """INSERT INTO relationship_score (id, party_type, party_id,
-               score_date, overall_score, payment_score, volume_trend,
-               profitability_score, risk_score, lifetime_value, factors,
-               ai_summary, created_at)
-               VALUES (?, ?, ?, ?, '50', '50', 'stable', '50', '50', '0',
-                       ?, ?, ?)""",
+        rs = Table("relationship_score")
+        q = (Q.into(rs)
+             .columns("id", "party_type", "party_id", "score_date",
+                      "overall_score", "payment_score", "volume_trend",
+                      "profitability_score", "risk_score", "lifetime_value",
+                      "factors", "ai_summary", "created_at")
+             .insert(P(), P(), P(), P(), '50', '50', 'stable', '50', '50', '0',
+                     P(), P(), P()))
+        conn.execute(q.get_sql(),
             (score_id, args.party_type, args.party_id, today,
              json.dumps({"note": "No transaction history"}),
              "No transaction history available for scoring.",
-             _now()),
-        )
+             _now()))
         conn.commit()
-        row = row_to_dict(conn.execute(
-            "SELECT * FROM relationship_score WHERE id = ?", (score_id,)
-        ).fetchone())
+        q = Q.from_(rs).select(rs.star).where(rs.id == P())
+        row = row_to_dict(conn.execute(q.get_sql(), (score_id,)).fetchone())
         ok({"relationship_score": row})
 
     # Calculate payment score: on-time = 100, -2 per day late
@@ -800,6 +801,7 @@ def score_relationship(conn, args):
     one_eighty_days_ago = (datetime.strptime(today, "%Y-%m-%d")
                            - timedelta(days=180)).strftime("%Y-%m-%d")
 
+    # raw SQL — COALESCE(decimal_sum(...)) aggregate with date range filters
     if args.party_type == "customer":
         recent_vol = to_decimal(str(conn.execute(
             """SELECT COALESCE(decimal_sum(grand_total), '0') as total
@@ -859,7 +861,7 @@ def score_relationship(conn, args):
     else:
         risk_score = 50
 
-    # --- Lifetime Value ---
+    # raw SQL — COALESCE(decimal_sum(...)) aggregate
     if args.party_type == "customer":
         lifetime_row = conn.execute(
             """SELECT COALESCE(decimal_sum(grand_total), '0') as total
@@ -914,27 +916,28 @@ def score_relationship(conn, args):
     }
 
     score_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO relationship_score (id, party_type, party_id,
-           score_date, overall_score, payment_score, volume_trend,
-           profitability_score, risk_score, lifetime_value, factors,
-           ai_summary, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+    rs = Table("relationship_score")
+    q = (Q.into(rs)
+         .columns("id", "party_type", "party_id", "score_date",
+                  "overall_score", "payment_score", "volume_trend",
+                  "profitability_score", "risk_score", "lifetime_value",
+                  "factors", "ai_summary", "created_at")
+         .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+    conn.execute(q.get_sql(),
         (score_id, args.party_type, args.party_id, today,
          str(overall), str(payment_score), volume_trend,
          str(profitability_score), str(risk_score), lifetime_value,
-         json.dumps(factors), ai_summary, _now()),
-    )
+         json.dumps(factors), ai_summary, _now()))
     conn.commit()
 
-    row = row_to_dict(conn.execute(
-        "SELECT * FROM relationship_score WHERE id = ?", (score_id,)
-    ).fetchone())
+    q = Q.from_(rs).select(rs.star).where(rs.id == P())
+    row = row_to_dict(conn.execute(q.get_sql(), (score_id,)).fetchone())
     ok({"relationship_score": row})
 
 
 def list_relationship_scores(conn, args):
     """List relationship scores."""
+    # raw SQL — complex LEFT JOIN with COALESCE for company filtering
     query = "SELECT * FROM relationship_score WHERE 1=1"
     params = []
 
@@ -987,7 +990,7 @@ def detect_anomalies(conn, args):
     by_type = {}
     by_severity = {}
 
-    # --- Heuristic 1: duplicate_possible ---
+    # raw SQL — complex self-join with ABS(julianday()) and correlated subquery
     dupes = conn.execute(
         """SELECT g1.id as id1, g2.id as id2,
                   g1.posting_date as date1, g2.posting_date as date2,
@@ -1019,7 +1022,7 @@ def detect_anomalies(conn, args):
             by_type["duplicate_possible"] = by_type.get("duplicate_possible", 0) + 1
             by_severity["warning"] = by_severity.get("warning", 0) + 1
 
-    # --- Heuristic 2: round_number ---
+    # raw SQL — arithmetic expressions (col + 0, % 1000) and correlated subquery
     rounds = conn.execute(
         """SELECT id, posting_date, account_id, debit, credit
            FROM gl_entry
@@ -1052,12 +1055,11 @@ def detect_anomalies(conn, args):
             by_severity["info"] = by_severity.get("info", 0) + 1
 
     # --- Heuristic 3: budget_overrun ---
-    budgets = conn.execute(
-        """SELECT id, account_id, cost_center_id, budget_amount
-           FROM budget
-           WHERE company_id = ?""",
-        (company_id,),
-    ).fetchall()
+    bgt = Table("budget")
+    q = (Q.from_(bgt)
+         .select(bgt.id, bgt.account_id, bgt.cost_center_id, bgt.budget_amount)
+         .where(bgt.company_id == P()))
+    budgets = conn.execute(q.get_sql(), (company_id,)).fetchall()
 
     for b in budgets:
         bd = row_to_dict(b)
@@ -1066,7 +1068,7 @@ def detect_anomalies(conn, args):
         if not bd["account_id"]:
             continue
 
-        # Get actual spend
+        # raw SQL — COALESCE(decimal_sum()) arithmetic with dynamic WHERE
         actual_query = """
             SELECT COALESCE(decimal_sum(debit), '0') - COALESCE(decimal_sum(credit), '0') as actual
             FROM gl_entry
@@ -1101,7 +1103,7 @@ def detect_anomalies(conn, args):
                 by_type["budget_overrun"] = by_type.get("budget_overrun", 0) + 1
                 by_severity[severity] = by_severity.get(severity, 0) + 1
 
-    # --- Heuristic 4: late_pattern ---
+    # raw SQL — arithmetic expression (outstanding_amount + 0 > 0) for TEXT-to-number cast
     overdue = conn.execute(
         """SELECT id, customer_id, posting_date, due_date,
                   outstanding_amount, grand_total
@@ -1144,6 +1146,7 @@ def detect_anomalies(conn, args):
                       - timedelta(days=period_days)).strftime("%Y-%m-%d")
         prior_to = from_date
 
+        # raw SQL — COALESCE(decimal_sum(...)) aggregates with date-range filters
         _vol_queries = [
             ("SELECT COUNT(*) as cnt, COALESCE(decimal_sum(grand_total), '0') as total "
              "FROM sales_invoice WHERE company_id = ? AND posting_date >= ? AND posting_date <= ? "
@@ -1203,6 +1206,7 @@ def detect_anomalies(conn, args):
 
 def list_anomalies(conn, args):
     """Query detected anomalies."""
+    # raw SQL — json_extract() filter not supported by PyPika
     query = "SELECT * FROM anomaly WHERE 1=1"
     params = []
 
@@ -1252,7 +1256,7 @@ def forecast_cash_flow(conn, args):
     horizon_date = (datetime.strptime(today, "%Y-%m-%d")
                     + timedelta(days=horizon)).strftime("%Y-%m-%d")
 
-    # Starting balance: sum of cash/bank accounts
+    # raw SQL — JOIN with COALESCE(decimal_sum()) aggregates
     bal_row = conn.execute(
         """SELECT COALESCE(decimal_sum(debit), '0') as total_debit,
                   COALESCE(decimal_sum(credit), '0') as total_credit
@@ -1264,7 +1268,7 @@ def forecast_cash_flow(conn, args):
     ).fetchone()
     starting_balance = round_currency(to_decimal(str(bal_row["total_debit"])) - to_decimal(str(bal_row["total_credit"])))
 
-    # Projected inflows: open AR
+    # raw SQL — arithmetic expression (outstanding_amount + 0 > 0) for TEXT-to-number cast
     ar_rows = conn.execute(
         """SELECT due_date, outstanding_amount FROM sales_invoice
            WHERE company_id = ?
@@ -1281,7 +1285,7 @@ def forecast_cash_flow(conn, args):
         inflows.append({"date": due, "amount": str(amt)})
         total_inflows += amt
 
-    # Projected outflows: open AP
+    # raw SQL — arithmetic expression (outstanding_amount + 0 > 0) for TEXT-to-number cast
     ap_rows = conn.execute(
         """SELECT due_date, outstanding_amount FROM purchase_invoice
            WHERE company_id = ?
@@ -1318,12 +1322,14 @@ def forecast_cash_flow(conn, args):
         projected = start_bal + adj_inflows - adj_outflows
 
         forecast_id = str(uuid.uuid4())
-        conn.execute(
-            """INSERT INTO cash_flow_forecast (id, forecast_date, generated_at,
-               horizon_days, starting_balance, projected_inflows,
-               projected_outflows, projected_balance,
-               confidence_interval, assumptions, scenario)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        cff = Table("cash_flow_forecast")
+        q = (Q.into(cff)
+             .columns("id", "forecast_date", "generated_at", "horizon_days",
+                      "starting_balance", "projected_inflows", "projected_outflows",
+                      "projected_balance", "confidence_interval", "assumptions",
+                      "scenario")
+             .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+        conn.execute(q.get_sql(),
             (forecast_id, today, _now(), horizon,
              str(start_bal),
              json.dumps(inflows),
@@ -1333,8 +1339,7 @@ def forecast_cash_flow(conn, args):
              json.dumps({"company_id": company_id,
                          "inflow_multiplier": str(mults["inflow_mult"]),
                          "outflow_multiplier": str(mults["outflow_mult"])}),
-             scenario_name),
-        )
+             scenario_name))
         forecast_ids.append(forecast_id)
         balances[scenario_name] = round_currency(projected)
 
@@ -1344,11 +1349,10 @@ def forecast_cash_flow(conn, args):
         "mid": str(balances["expected"]),
         "high": str(balances["optimistic"]),
     }
+    cff_upd = Table("cash_flow_forecast")
+    q_upd = Q.update(cff_upd).set(cff_upd.confidence_interval, P()).where(cff_upd.id == P())
     for fid in forecast_ids:
-        conn.execute(
-            "UPDATE cash_flow_forecast SET confidence_interval = ? WHERE id = ?",
-            (json.dumps(ci), fid),
-        )
+        conn.execute(q_upd.get_sql(), (json.dumps(ci), fid))
 
     conn.commit()
 
@@ -1367,6 +1371,7 @@ def forecast_cash_flow(conn, args):
 
 def get_forecast(conn, args):
     """Retrieve latest forecast."""
+    # raw SQL — json_extract() filter not supported by PyPika
     query = """SELECT * FROM cash_flow_forecast WHERE 1=1"""
     params = []
 
@@ -1399,7 +1404,7 @@ def discover_correlations(conn, args):
 
     new_correlations = []
 
-    # Correlation 1: Sales vs Purchase volume
+    # raw SQL — COALESCE(decimal_sum(...)) aggregates with date-range filters
     sales = conn.execute(
         """SELECT COALESCE(decimal_sum(grand_total), '0') as total,
                   COUNT(*) as cnt
@@ -1430,11 +1435,13 @@ def discover_correlations(conn, args):
             strength = "weak"
 
         corr_id = str(uuid.uuid4())
-        conn.execute(
-            """INSERT INTO correlation (id, discovered_at, module_a, module_b,
-               description, evidence, strength, statistical_confidence,
-               actionable, suggested_action, status)
-               VALUES (?, ?, 'selling', 'buying', ?, ?, ?, ?, ?, ?, 'new')""",
+        corr = Table("correlation")
+        q = (Q.into(corr)
+             .columns("id", "discovered_at", "module_a", "module_b",
+                      "description", "evidence", "strength", "statistical_confidence",
+                      "actionable", "suggested_action", "status")
+             .insert(P(), P(), 'selling', 'buying', P(), P(), P(), P(), P(), P(), 'new'))
+        conn.execute(q.get_sql(),
             (corr_id, _now(),
              f"Sales-to-purchase ratio of {ratio} detected. "
              f"Sales: ${round_currency(sales_total)}, Purchases: ${round_currency(purchases_total)}",
@@ -1446,11 +1453,10 @@ def discover_correlations(conn, args):
              f"{min(sales['cnt'], purchases['cnt']) * 10}",
              1 if strength in ("strong", "moderate") else 0,
              "Review procurement efficiency relative to sales volume"
-             if ratio > Decimal("0.7") else None),
-        )
+             if ratio > Decimal("0.7") else None))
         new_correlations.append(corr_id)
 
-    # Correlation 2: Payment timing pattern
+    # raw SQL — complex CASE with correlated subqueries, AVG(julianday()), GROUP BY
     pay_data = conn.execute(
         """SELECT pe.party_type, COUNT(*) as cnt,
                   AVG(julianday(pe.posting_date) - julianday(
@@ -1475,10 +1481,12 @@ def discover_correlations(conn, args):
                 avg_d = round(pdd["avg_days"], 1)
                 strength = "strong" if abs(avg_d) < 15 else "moderate" if abs(avg_d) < 30 else "weak"
                 corr_id = str(uuid.uuid4())
-                conn.execute(
-                    """INSERT INTO correlation (id, discovered_at, module_a, module_b,
-                       description, evidence, strength, actionable, status)
-                       VALUES (?, ?, 'payments', ?, ?, ?, ?, 0, 'new')""",
+                corr2 = Table("correlation")
+                q2 = (Q.into(corr2)
+                      .columns("id", "discovered_at", "module_a", "module_b",
+                               "description", "evidence", "strength", "actionable", "status")
+                      .insert(P(), P(), 'payments', P(), P(), P(), P(), 0, 'new'))
+                conn.execute(q2.get_sql(),
                     (corr_id, _now(),
                      pdd["party_type"],
                      f"Average {pdd['party_type']} payment timing: "
@@ -1487,8 +1495,7 @@ def discover_correlations(conn, args):
                                  "party_type": pdd["party_type"],
                                  "avg_payment_days": avg_d,
                                  "payment_count": pdd["cnt"]}),
-                     strength),
-                )
+                     strength))
                 new_correlations.append(corr_id)
 
     conn.commit()
@@ -1500,6 +1507,7 @@ def discover_correlations(conn, args):
 
 def list_correlations(conn, args):
     """List discovered correlations."""
+    # raw SQL — json_extract() filter and dynamic IN clause
     query = "SELECT * FROM correlation WHERE 1=1"
     params = []
 
@@ -1537,7 +1545,7 @@ def status_action(conn, args):
     """AI engine summary."""
     result = {}
 
-    # Anomaly counts
+    # raw SQL — json_extract() filter with GROUP BY
     anomaly_q = "SELECT severity, COUNT(*) as cnt FROM anomaly WHERE status = 'new'"
     anomaly_params = []
     if args.company_id:
@@ -1553,7 +1561,7 @@ def status_action(conn, args):
         "by_severity": anomaly_counts,
     }
 
-    # Forecast
+    # raw SQL — json_extract() filter
     forecast_q = "SELECT COUNT(*) as cnt FROM cash_flow_forecast"
     forecast_params = []
     if args.company_id:
@@ -1561,22 +1569,21 @@ def status_action(conn, args):
         forecast_params.append(args.company_id)
     result["forecasts"] = conn.execute(forecast_q, forecast_params).fetchone()["cnt"]
 
-    # Rules
+    # Rules — simple counts
+    br = Table("business_rule")
+    q_active = Q.from_(br).select(fn.Count("*").as_("cnt")).where(br.active == 1)
+    q_total = Q.from_(br).select(fn.Count("*").as_("cnt"))
     result["business_rules"] = {
-        "active": conn.execute(
-            "SELECT COUNT(*) as cnt FROM business_rule WHERE active = 1"
-        ).fetchone()["cnt"],
-        "total": conn.execute(
-            "SELECT COUNT(*) as cnt FROM business_rule"
-        ).fetchone()["cnt"],
+        "active": conn.execute(q_active.get_sql()).fetchone()["cnt"],
+        "total": conn.execute(q_total.get_sql()).fetchone()["cnt"],
     }
 
-    # Categorization rules
-    result["categorization_rules"] = conn.execute(
-        "SELECT COUNT(*) as cnt FROM categorization_rule"
-    ).fetchone()["cnt"]
+    # Categorization rules — simple count
+    cr = Table("categorization_rule")
+    q = Q.from_(cr).select(fn.Count("*").as_("cnt"))
+    result["categorization_rules"] = conn.execute(q.get_sql()).fetchone()["cnt"]
 
-    # Correlations
+    # raw SQL — json_extract() filter
     corr_q = "SELECT COUNT(*) as cnt FROM correlation WHERE status = 'new'"
     corr_params = []
     if args.company_id:
@@ -1584,7 +1591,7 @@ def status_action(conn, args):
         corr_params.append(args.company_id)
     result["correlations"] = conn.execute(corr_q, corr_params).fetchone()["cnt"]
 
-    # Scenarios
+    # raw SQL — json_extract() filter
     scen_q = "SELECT COUNT(*) as cnt FROM scenario"
     scen_params = []
     if args.company_id:
@@ -1592,25 +1599,25 @@ def status_action(conn, args):
         scen_params.append(args.company_id)
     result["scenarios"] = conn.execute(scen_q, scen_params).fetchone()["cnt"]
 
-    # Relationship scores
-    result["relationship_scores"] = conn.execute(
-        "SELECT COUNT(*) as cnt FROM relationship_score"
-    ).fetchone()["cnt"]
+    # Relationship scores — simple count
+    rs_t = Table("relationship_score")
+    q = Q.from_(rs_t).select(fn.Count("*").as_("cnt"))
+    result["relationship_scores"] = conn.execute(q.get_sql()).fetchone()["cnt"]
 
-    # Pending decisions
-    result["pending_decisions"] = conn.execute(
-        "SELECT COUNT(*) as cnt FROM pending_decision WHERE status = 'pending'"
-    ).fetchone()["cnt"]
+    # Pending decisions — simple count with filter
+    pd_t = Table("pending_decision")
+    q = Q.from_(pd_t).select(fn.Count("*").as_("cnt")).where(pd_t.status == P())
+    result["pending_decisions"] = conn.execute(q.get_sql(), ('pending',)).fetchone()["cnt"]
 
-    # Conversation contexts
-    result["active_contexts"] = conn.execute(
-        "SELECT COUNT(*) as cnt FROM conversation_context"
-    ).fetchone()["cnt"]
+    # Conversation contexts — simple count
+    cc_t = Table("conversation_context")
+    q = Q.from_(cc_t).select(fn.Count("*").as_("cnt"))
+    result["active_contexts"] = conn.execute(q.get_sql()).fetchone()["cnt"]
 
-    # Audit log entries
-    result["audit_entries"] = conn.execute(
-        "SELECT COUNT(*) as cnt FROM audit_conversation"
-    ).fetchone()["cnt"]
+    # Audit log entries — simple count
+    ac_t = Table("audit_conversation")
+    q = Q.from_(ac_t).select(fn.Count("*").as_("cnt"))
+    result["audit_entries"] = conn.execute(q.get_sql()).fetchone()["cnt"]
 
     ok(result)
 

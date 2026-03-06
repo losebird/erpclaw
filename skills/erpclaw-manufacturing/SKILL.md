@@ -4,7 +4,7 @@ version: 1.0.0
 description: Manufacturing management -- BOMs, work orders, job cards, production planning, MRP, subcontracting, and production costing for ERPClaw ERP
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-manufacturing
 tier: 4
 category: manufacturing
 requires: [erpclaw-setup, erpclaw-gl, erpclaw-inventory]

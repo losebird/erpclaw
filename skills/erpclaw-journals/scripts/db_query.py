@@ -32,12 +32,21 @@ try:
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
     from erpclaw_lib.query_helpers import resolve_company_id
+    from erpclaw_lib.query import Q, P, Table, Field, fn, Order
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
     sys.exit(1)
 
 REQUIRED_TABLES = ["company", "account"]
+
+# PyPika table aliases
+_t_je = Table("journal_entry")
+_t_jel = Table("journal_entry_line")
+_t_account = Table("account")
+_t_company = Table("company")
+_t_cost_center = Table("cost_center")
+_t_rjt = Table("recurring_journal_template")
 
 VALID_ENTRY_TYPES = (
     "journal", "opening", "closing", "depreciation",
@@ -114,9 +123,8 @@ def _insert_lines(conn, journal_entry_id: str, lines: list[dict]):
 
 def _get_je_or_err(conn, journal_entry_id: str) -> dict:
     """Fetch a journal entry by ID. Calls err() if not found."""
-    row = conn.execute(
-        "SELECT * FROM journal_entry WHERE id = ?", (journal_entry_id,)
-    ).fetchone()
+    q = Q.from_(_t_je).select(_t_je.star).where(_t_je.id == P())
+    row = conn.execute(q.get_sql(), (journal_entry_id,)).fetchone()
     if not row:
         err(f"Journal entry {journal_entry_id} not found")
     return row_to_dict(row)
@@ -124,14 +132,14 @@ def _get_je_or_err(conn, journal_entry_id: str) -> dict:
 
 def _get_je_lines(conn, journal_entry_id: str) -> list[dict]:
     """Fetch journal entry lines with account name join."""
-    rows = conn.execute(
-        """SELECT jel.*, a.name AS account_name
-           FROM journal_entry_line jel
-           JOIN account a ON a.id = jel.account_id
-           WHERE jel.journal_entry_id = ?
-           ORDER BY jel.rowid""",
-        (journal_entry_id,),
-    ).fetchall()
+    jel = Table("journal_entry_line")
+    a = Table("account")
+    q = (Q.from_(jel)
+         .select(jel.star, a.name.as_("account_name"))
+         .join(a).on(a.id == jel.account_id)
+         .where(jel.journal_entry_id == P())
+         .orderby(jel.rowid))
+    rows = conn.execute(q.get_sql(), (journal_entry_id,)).fetchall()
     return [row_to_dict(r) for r in rows]
 
 
@@ -152,7 +160,8 @@ def add_journal_entry(conn, args):
         err(f"Invalid entry type '{entry_type}'. Valid: {VALID_ENTRY_TYPES}")
 
     # Validate company exists
-    company = conn.execute("SELECT id FROM company WHERE id = ?", (company_id,)).fetchone()
+    q = Q.from_(_t_company).select(_t_company.id).where(_t_company.id == P())
+    company = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not company:
         err(f"Company {company_id} not found")
 
@@ -172,9 +181,9 @@ def add_journal_entry(conn, args):
         err(str(e))
 
     # Validate all account_ids exist
+    q_acct = Q.from_(_t_account).select(_t_account.id, _t_account.is_frozen).where(_t_account.id == P())
     for i, line in enumerate(lines):
-        acct = conn.execute("SELECT id, is_frozen FROM account WHERE id = ?",
-                            (line["account_id"],)).fetchone()
+        acct = conn.execute(q_acct.get_sql(), (line["account_id"],)).fetchone()
         if not acct:
             err(f"Line {i+1}: account {line['account_id']} not found")
 
@@ -256,14 +265,15 @@ def update_journal_entry(conn, args):
             err(str(e))
 
         # Validate all account_ids exist
+        q_acct = Q.from_(_t_account).select(_t_account.id).where(_t_account.id == P())
         for i, line in enumerate(lines):
-            acct = conn.execute("SELECT id FROM account WHERE id = ?",
-                                (line["account_id"],)).fetchone()
+            acct = conn.execute(q_acct.get_sql(), (line["account_id"],)).fetchone()
             if not acct:
                 err(f"Line {i+1}: account {line['account_id']} not found")
 
         # Delete old lines, insert new
-        conn.execute("DELETE FROM journal_entry_line WHERE journal_entry_id = ?", (je_id,))
+        q_del = Q.from_(_t_jel).delete().where(_t_jel.journal_entry_id == P())
+        conn.execute(q_del.get_sql(), (je_id,))
         _insert_lines(conn, je_id, lines)
 
         conn.execute(
@@ -337,53 +347,52 @@ def list_journal_entries(conn, args):
     """List journal entries with filtering."""
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
-    conditions = ["je.company_id = ?"]
+    je = Table("journal_entry")
     params = [company_id]
 
+    # Build base query with required company filter
+    base = Q.from_(je).where(je.company_id == P())
+
     if args.je_status:
-        conditions.append("je.status = ?")
+        base = base.where(je.status == P())
         params.append(args.je_status)
 
     if args.entry_type:
-        conditions.append("je.entry_type = ?")
+        base = base.where(je.entry_type == P())
         params.append(args.entry_type)
 
     if args.from_date:
-        conditions.append("je.posting_date >= ?")
+        base = base.where(je.posting_date >= P())
         params.append(args.from_date)
 
     if args.to_date:
-        conditions.append("je.posting_date <= ?")
+        base = base.where(je.posting_date <= P())
         params.append(args.to_date)
 
     if args.account_id:
-        conditions.append("""je.id IN (
-            SELECT journal_entry_id FROM journal_entry_line WHERE account_id = ?
-        )""")
+        # Subquery: keep as raw SQL snippet via Criterion.any for clarity
+        jel = Table("journal_entry_line")
+        sub = Q.from_(jel).select(jel.journal_entry_id).where(jel.account_id == P())
+        base = base.where(je.id.isin(sub))
         params.append(args.account_id)
 
-    where = " AND ".join(conditions)
-
     # Total count
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM journal_entry je WHERE {where}", params
-    ).fetchone()
+    q_count = base.select(fn.Count("*"))
+    count_row = conn.execute(q_count.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     # Paginated results
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
+    list_params = params + [limit, offset]
 
-    rows = conn.execute(
-        f"""SELECT je.id, je.naming_series, je.posting_date, je.entry_type,
-               je.status, je.total_debit, je.total_credit, je.remark
-           FROM journal_entry je
-           WHERE {where}
-           ORDER BY je.posting_date DESC, je.created_at DESC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    q_list = (base.select(
+                  je.id, je.naming_series, je.posting_date, je.entry_type,
+                  je.status, je.total_debit, je.total_credit, je.remark)
+              .orderby(je.posting_date, order=Order.desc)
+              .orderby(je.created_at, order=Order.desc)
+              .limit(P()).offset(P()))
+    rows = conn.execute(q_list.get_sql(), list_params).fetchall()
 
     entries = [row_to_dict(r) for r in rows]
     ok({"entries": entries, "total_count": total_count,
@@ -544,9 +553,8 @@ def amend_journal_entry(conn, args):
             err("Invalid JSON format in --lines")
     else:
         # Copy lines from original
-        old_lines = conn.execute(
-            "SELECT * FROM journal_entry_line WHERE journal_entry_id = ?", (je_id,)
-        ).fetchall()
+        q_lines = Q.from_(_t_jel).select(_t_jel.star).where(_t_jel.journal_entry_id == P())
+        old_lines = conn.execute(q_lines.get_sql(), (je_id,)).fetchall()
         new_lines = []
         for ol in old_lines:
             old_dict = row_to_dict(ol)
@@ -612,8 +620,10 @@ def delete_journal_entry(conn, args):
     naming = je["naming_series"]
 
     # Delete lines first (FK constraint), then header
-    conn.execute("DELETE FROM journal_entry_line WHERE journal_entry_id = ?", (je_id,))
-    conn.execute("DELETE FROM journal_entry WHERE id = ?", (je_id,))
+    q_del_lines = Q.from_(_t_jel).delete().where(_t_jel.journal_entry_id == P())
+    conn.execute(q_del_lines.get_sql(), (je_id,))
+    q_del_je = Q.from_(_t_je).delete().where(_t_je.id == P())
+    conn.execute(q_del_je.get_sql(), (je_id,))
 
     audit(conn, "erpclaw-journals", "delete-journal-entry", "journal_entry", je_id,
            old_values={"naming_series": naming})
@@ -633,9 +643,8 @@ def duplicate_journal_entry(conn, args):
         err("--journal-entry-id is required")
 
     je = _get_je_or_err(conn, je_id)
-    old_lines = conn.execute(
-        "SELECT * FROM journal_entry_line WHERE journal_entry_id = ?", (je_id,)
-    ).fetchall()
+    q_lines = Q.from_(_t_jel).select(_t_jel.star).where(_t_jel.journal_entry_id == P())
+    old_lines = conn.execute(q_lines.get_sql(), (je_id,)).fetchall()
 
     new_lines = []
     for ol in old_lines:
@@ -687,10 +696,10 @@ def duplicate_journal_entry(conn, args):
 
 def _ensure_intercompany_account(conn, company_id, name, root_type, account_type):
     """Find or create an intercompany account for a company."""
-    acct = conn.execute(
-        "SELECT id FROM account WHERE name = ? AND company_id = ?",
-        (name, company_id),
-    ).fetchone()
+    q = (Q.from_(_t_account).select(_t_account.id)
+         .where(_t_account.name == P())
+         .where(_t_account.company_id == P()))
+    acct = conn.execute(q.get_sql(), (name, company_id)).fetchone()
     if acct:
         return acct["id"]
 
@@ -734,10 +743,9 @@ def create_intercompany_je(conn, args):
         err("Amount must be positive")
 
     # Validate both companies exist and share the same currency
-    src_co = conn.execute("SELECT id, default_currency FROM company WHERE id = ?",
-                          (source_company_id,)).fetchone()
-    tgt_co = conn.execute("SELECT id, default_currency FROM company WHERE id = ?",
-                          (target_company_id,)).fetchone()
+    q_co = Q.from_(_t_company).select(_t_company.id, _t_company.default_currency).where(_t_company.id == P())
+    src_co = conn.execute(q_co.get_sql(), (source_company_id,)).fetchone()
+    tgt_co = conn.execute(q_co.get_sql(), (target_company_id,)).fetchone()
     if not src_co:
         err(f"Source company {source_company_id} not found")
     if not tgt_co:
@@ -748,31 +756,33 @@ def create_intercompany_je(conn, args):
     # Ensure intercompany accounts exist in both companies
     src_ic_recv = _ensure_intercompany_account(
         conn, source_company_id, "Intercompany Receivable", "asset", "receivable")
-    src_revenue = conn.execute(
-        "SELECT id FROM account WHERE account_type = 'revenue' AND company_id = ? AND is_group = 0 LIMIT 1",
-        (source_company_id,),
-    ).fetchone()
+    q_rev = (Q.from_(_t_account).select(_t_account.id)
+             .where(_t_account.account_type == "revenue")
+             .where(_t_account.company_id == P())
+             .where(_t_account.is_group == 0)
+             .limit(1))
+    src_revenue = conn.execute(q_rev.get_sql(), (source_company_id,)).fetchone()
     if not src_revenue:
         err("Source company has no revenue account")
 
     tgt_ic_pay = _ensure_intercompany_account(
         conn, target_company_id, "Intercompany Payable", "liability", "payable")
-    tgt_expense = conn.execute(
-        "SELECT id FROM account WHERE account_type IN ('expense', 'cost_of_goods_sold') AND company_id = ? AND is_group = 0 LIMIT 1",
-        (target_company_id,),
-    ).fetchone()
+    q_exp = (Q.from_(_t_account).select(_t_account.id)
+             .where(_t_account.account_type.isin(["expense", "cost_of_goods_sold"]))
+             .where(_t_account.company_id == P())
+             .where(_t_account.is_group == 0)
+             .limit(1))
+    tgt_expense = conn.execute(q_exp.get_sql(), (target_company_id,)).fetchone()
     if not tgt_expense:
         err("Target company has no expense account")
 
     # Get cost centers for P&L entries
-    src_cc = conn.execute(
-        "SELECT id FROM cost_center WHERE company_id = ? AND is_group = 0 LIMIT 1",
-        (source_company_id,),
-    ).fetchone()
-    tgt_cc = conn.execute(
-        "SELECT id FROM cost_center WHERE company_id = ? AND is_group = 0 LIMIT 1",
-        (target_company_id,),
-    ).fetchone()
+    q_cc = (Q.from_(_t_cost_center).select(_t_cost_center.id)
+            .where(_t_cost_center.company_id == P())
+            .where(_t_cost_center.is_group == 0)
+            .limit(1))
+    src_cc = conn.execute(q_cc.get_sql(), (source_company_id,)).fetchone()
+    tgt_cc = conn.execute(q_cc.get_sql(), (target_company_id,)).fetchone()
 
     amt = str(round_currency(amount))
 
@@ -924,7 +934,8 @@ def add_recurring_template(conn, args):
     auto_submit = 1 if args.auto_submit else 0
 
     # Validate company
-    company = conn.execute("SELECT id FROM company WHERE id = ?", (company_id,)).fetchone()
+    q = Q.from_(_t_company).select(_t_company.id).where(_t_company.id == P())
+    company = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not company:
         err(f"Company {company_id} not found")
 
@@ -943,9 +954,9 @@ def add_recurring_template(conn, args):
         err(str(e))
 
     # Validate accounts exist
+    q_acct = Q.from_(_t_account).select(_t_account.id).where(_t_account.id == P())
     for i, line in enumerate(lines):
-        acct = conn.execute("SELECT id FROM account WHERE id = ?",
-                            (line["account_id"],)).fetchone()
+        acct = conn.execute(q_acct.get_sql(), (line["account_id"],)).fetchone()
         if not acct:
             err(f"Line {i+1}: account {line['account_id']} not found")
 
@@ -982,9 +993,8 @@ def update_recurring_template(conn, args):
     if not template_id:
         err("--template-id is required")
 
-    row = conn.execute(
-        "SELECT * FROM recurring_journal_template WHERE id = ?", (template_id,)
-    ).fetchone()
+    q = Q.from_(_t_rjt).select(_t_rjt.star).where(_t_rjt.id == P())
+    row = conn.execute(q.get_sql(), (template_id,)).fetchone()
     if not row:
         err(f"Recurring template {template_id} not found")
     tmpl = row_to_dict(row)
@@ -1038,9 +1048,9 @@ def update_recurring_template(conn, args):
             _validate_lines(lines)
         except ValueError as e:
             err(str(e))
+        q_acct = Q.from_(_t_account).select(_t_account.id).where(_t_account.id == P())
         for i, line in enumerate(lines):
-            acct = conn.execute("SELECT id FROM account WHERE id = ?",
-                                (line["account_id"],)).fetchone()
+            acct = conn.execute(q_acct.get_sql(), (line["account_id"],)).fetchone()
             if not acct:
                 err(f"Line {i+1}: account {line['account_id']} not found")
         conn.execute("UPDATE recurring_journal_template SET lines = ?, updated_at = datetime('now') WHERE id = ?",
@@ -1074,33 +1084,31 @@ def list_recurring_templates(conn, args):
     """List recurring journal templates for a company."""
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
-    conditions = ["company_id = ?"]
+    rjt = Table("recurring_journal_template")
     params = [company_id]
 
+    base = Q.from_(rjt).where(rjt.company_id == P())
+
     if args.template_status:
-        conditions.append("status = ?")
+        base = base.where(rjt.status == P())
         params.append(args.template_status)
 
-    where = " AND ".join(conditions)
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
 
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM recurring_journal_template WHERE {where}", params
-    ).fetchone()
+    q_count = base.select(fn.Count("*"))
+    count_row = conn.execute(q_count.get_sql(), params).fetchone()
     total_count = count_row[0]
 
-    params.extend([limit, offset])
-    rows = conn.execute(
-        f"""SELECT id, naming_series, name, frequency, start_date, end_date,
-               next_run_date, last_generated_date, entry_type, auto_submit,
-               remark, status
-           FROM recurring_journal_template
-           WHERE {where}
-           ORDER BY next_run_date ASC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    list_params = params + [limit, offset]
+    q_list = (base.select(
+                  rjt.id, rjt.naming_series, rjt.name, rjt.frequency,
+                  rjt.start_date, rjt.end_date, rjt.next_run_date,
+                  rjt.last_generated_date, rjt.entry_type, rjt.auto_submit,
+                  rjt.remark, rjt.status)
+              .orderby(rjt.next_run_date, order=Order.asc)
+              .limit(P()).offset(P()))
+    rows = conn.execute(q_list.get_sql(), list_params).fetchall()
 
     templates = [row_to_dict(r) for r in rows]
     ok({"templates": templates, "total_count": total_count,
@@ -1118,9 +1126,8 @@ def get_recurring_template(conn, args):
     if not template_id:
         err("--template-id is required")
 
-    row = conn.execute(
-        "SELECT * FROM recurring_journal_template WHERE id = ?", (template_id,)
-    ).fetchone()
+    q = Q.from_(_t_rjt).select(_t_rjt.star).where(_t_rjt.id == P())
+    row = conn.execute(q.get_sql(), (template_id,)).fetchone()
     if not row:
         err(f"Recurring template {template_id} not found")
 
@@ -1152,12 +1159,12 @@ def process_recurring(conn, args):
     as_of_date_str = args.as_of_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # Find all due templates
-    due_templates = conn.execute(
-        """SELECT * FROM recurring_journal_template
-           WHERE company_id = ? AND status = 'active' AND next_run_date <= ?
-           ORDER BY next_run_date ASC""",
-        (company_id, as_of_date_str),
-    ).fetchall()
+    q_due = (Q.from_(_t_rjt).select(_t_rjt.star)
+             .where(_t_rjt.company_id == P())
+             .where(_t_rjt.status == "active")
+             .where(_t_rjt.next_run_date <= P())
+             .orderby(_t_rjt.next_run_date, order=Order.asc))
+    due_templates = conn.execute(q_due.get_sql(), (company_id, as_of_date_str)).fetchall()
 
     results = []
 
@@ -1269,13 +1276,13 @@ def delete_recurring_template(conn, args):
     if not template_id:
         err("--template-id is required")
 
-    row = conn.execute(
-        "SELECT * FROM recurring_journal_template WHERE id = ?", (template_id,)
-    ).fetchone()
+    q = Q.from_(_t_rjt).select(_t_rjt.star).where(_t_rjt.id == P())
+    row = conn.execute(q.get_sql(), (template_id,)).fetchone()
     if not row:
         err(f"Recurring template {template_id} not found")
 
-    conn.execute("DELETE FROM recurring_journal_template WHERE id = ?", (template_id,))
+    q_del = Q.from_(_t_rjt).delete().where(_t_rjt.id == P())
+    conn.execute(q_del.get_sql(), (template_id,))
 
     audit(conn, "erpclaw-journals", "delete-recurring-template",
           "recurring_journal_template", template_id)
@@ -1292,11 +1299,11 @@ def status(conn, args):
     """Show journal entry counts by status."""
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
-    rows = conn.execute(
-        """SELECT status, COUNT(*) AS cnt FROM journal_entry
-           WHERE company_id = ? GROUP BY status""",
-        (company_id,),
-    ).fetchall()
+    q_je = (Q.from_(_t_je)
+            .select(_t_je.status, fn.Count("*").as_("cnt"))
+            .where(_t_je.company_id == P())
+            .groupby(_t_je.status))
+    rows = conn.execute(q_je.get_sql(), (company_id,)).fetchall()
 
     counts = {"total": 0, "draft": 0, "submitted": 0, "cancelled": 0, "amended": 0}
     for row in rows:
@@ -1304,11 +1311,11 @@ def status(conn, args):
         counts["total"] += row["cnt"]
 
     # Recurring template counts
-    tmpl_rows = conn.execute(
-        """SELECT status, COUNT(*) AS cnt FROM recurring_journal_template
-           WHERE company_id = ? GROUP BY status""",
-        (company_id,),
-    ).fetchall()
+    q_rjt = (Q.from_(_t_rjt)
+             .select(_t_rjt.status, fn.Count("*").as_("cnt"))
+             .where(_t_rjt.company_id == P())
+             .groupby(_t_rjt.status))
+    tmpl_rows = conn.execute(q_rjt.get_sql(), (company_id,)).fetchall()
     recurring = {"active": 0, "paused": 0, "completed": 0}
     for r in tmpl_rows:
         recurring[r["status"]] = r["cnt"]

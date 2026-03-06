@@ -84,7 +84,7 @@ class TestCRMScenario:
                               company_id=cid,
                               lead_name="Alice Johnson",
                               company_name="TechStart Inc",
-                              email="alice@example.com",
+                              email="alice@techstart.com",
                               phone="555-0101",
                               source="website",
                               territory="United States",
@@ -207,7 +207,7 @@ class TestCRMScenario:
                               company_id=cid,
                               lead_name="Bob Martinez",
                               company_name="GlobalTrade LLC",
-                              email="bob@example.com",
+                              email="bob@globaltrade.com",
                               phone="555-0202",
                               source="referral",
                               territory="United States",
@@ -217,7 +217,7 @@ class TestCRMScenario:
 
         assert lead["lead_name"] == "Bob Martinez"
         assert lead["company_name"] == "GlobalTrade LLC"
-        assert lead["email"] == "bob@example.com"
+        assert lead["email"] == "bob@globaltrade.com"
         assert lead["phone"] == "555-0202"
         assert lead["source"] == "referral"
         assert lead["status"] == "new"
@@ -300,7 +300,7 @@ class TestCRMScenario:
                               company_id=cid,
                               lead_name="Diana Ross",
                               company_name="StellarTech",
-                              email="diana@example.com",
+                              email="diana@stellartech.com",
                               source="trade_show")
         lead_id = result["lead"]["id"]
 

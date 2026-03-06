@@ -4,7 +4,7 @@ version: 1.0.0
 description: Usage-based and metered billing for ERPClaw — meters, readings, rate plans, bill runs, prepaid credits
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-billing
 tier: 5
 category: billing
 requires: [erpclaw-setup, erpclaw-selling]

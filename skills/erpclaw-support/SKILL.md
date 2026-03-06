@@ -4,7 +4,7 @@ version: 1.0.0
 description: Support issues, SLAs, warranty claims, and maintenance scheduling for ERPClaw
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-support
 tier: 5
 category: support
 requires: [erpclaw-setup]

@@ -36,10 +36,16 @@ try:
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
     from erpclaw_lib.query_helpers import resolve_company_id
+    from erpclaw_lib.query import Q, P, Table, Field, fn, DecimalSum, DecimalAbs
+    from erpclaw_lib.vendor.pypika import Order
+    from erpclaw_lib.vendor.pypika.terms import LiteralValue
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
     sys.exit(1)
+
+# Convenience alias for datetime('now') SQLite expression
+_NOW = LiteralValue("datetime('now')")
 
 REQUIRED_TABLES = ["company"]
 
@@ -86,10 +92,12 @@ def _get_fiscal_year(conn, posting_date: str) -> str | None:
 
 def _get_cost_center(conn, company_id: str) -> str | None:
     """Return the first non-group cost center for a company, or None."""
-    cc = conn.execute(
-        "SELECT id FROM cost_center WHERE company_id = ? AND is_group = 0 LIMIT 1",
-        (company_id,),
-    ).fetchone()
+    t = Table("cost_center")
+    q = (Q.from_(t).select(t.id)
+         .where(t.company_id == P())
+         .where(t.is_group == 0)
+         .limit(1))
+    cc = conn.execute(q.get_sql(), (company_id,)).fetchone()
     return cc["id"] if cc else None
 
 
@@ -114,8 +122,10 @@ def add_item(conn, args):
 
     # Validate item group if provided (accept id or name)
     if args.item_group:
-        ig = conn.execute("SELECT id FROM item_group WHERE id = ? OR name = ?",
-                          (args.item_group, args.item_group)).fetchone()
+        ig_t = Table("item_group")
+        ig_q = (Q.from_(ig_t).select(ig_t.id)
+                .where((ig_t.id == P()) | (ig_t.name == P())))
+        ig = conn.execute(ig_q.get_sql(), (args.item_group, args.item_group)).fetchone()
         if not ig:
             err(f"Item group {args.item_group} not found")
         args.item_group = ig[0]  # normalize to id
@@ -126,13 +136,15 @@ def add_item(conn, args):
     standard_rate = str(round_currency(to_decimal(args.standard_rate or "0")))
 
     item_id = str(uuid.uuid4())
+    t = Table("item")
+    q = Q.into(t).columns(
+        "id", "item_code", "item_name", "item_group_id", "item_type", "stock_uom",
+        "valuation_method", "is_stock_item", "has_batch", "has_serial",
+        "standard_rate", "status",
+    ).insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), "active")
     try:
         conn.execute(
-            """INSERT INTO item
-               (id, item_code, item_name, item_group_id, item_type, stock_uom,
-                valuation_method, is_stock_item, has_batch, has_serial,
-                standard_rate, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')""",
+            q.get_sql(),
             (item_id, args.item_code, args.item_name, args.item_group,
              item_type, args.stock_uom or "Nos",
              valuation_method, is_stock_item, has_batch, has_serial,
@@ -158,8 +170,9 @@ def update_item(conn, args):
     if not args.item_id:
         err("--item-id is required")
 
-    item = conn.execute("SELECT * FROM item WHERE id = ?",
-                        (args.item_id,)).fetchone()
+    t = Table("item")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    item = conn.execute(q.get_sql(), (args.item_id,)).fetchone()
     if not item:
         err(f"Item {args.item_id} not found",
              suggestion="Use 'list items' to see available items.")
@@ -214,19 +227,21 @@ def get_item(conn, args):
     if not args.item_id:
         err("--item-id is required")
 
-    item = conn.execute("SELECT * FROM item WHERE id = ?",
-                        (args.item_id,)).fetchone()
+    t = Table("item")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    item = conn.execute(q.get_sql(), (args.item_id,)).fetchone()
     if not item:
         err(f"Item {args.item_id} not found")
 
     data = row_to_dict(item)
 
     # Stock balances per warehouse
-    warehouses = conn.execute(
-        """SELECT DISTINCT warehouse_id FROM stock_ledger_entry
-           WHERE item_id = ? AND is_cancelled = 0""",
-        (args.item_id,),
-    ).fetchall()
+    sle = Table("stock_ledger_entry")
+    wh_q = (Q.from_(sle)
+            .select(sle.warehouse_id).distinct()
+            .where(sle.item_id == P())
+            .where(sle.is_cancelled == 0))
+    warehouses = conn.execute(wh_q.get_sql(), (args.item_id,)).fetchall()
 
     stock_balances = []
     total_qty = Decimal("0")
@@ -237,8 +252,9 @@ def get_item(conn, args):
         qty = to_decimal(balance["qty"])
         val = to_decimal(balance["stock_value"])
         if qty != 0 or val != 0:
-            wh = conn.execute("SELECT name FROM warehouse WHERE id = ?",
-                              (wh_id,)).fetchone()
+            wh_t = Table("warehouse")
+            wh_q2 = Q.from_(wh_t).select(wh_t.name).where(wh_t.id == P())
+            wh = conn.execute(wh_q2.get_sql(), (wh_id,)).fetchone()
             stock_balances.append({
                 "warehouse_id": wh_id,
                 "warehouse_name": wh["name"] if wh else wh_id,
@@ -261,39 +277,75 @@ def get_item(conn, args):
 
 def list_items(conn, args):
     """Query items with filtering."""
-    conditions = ["1=1"]
-    params = []
+    i = Table("item").as_("i")
 
+    # Warehouse filter: items that have stock in a specific warehouse
+    warehouse_id = getattr(args, "warehouse_id", None)
+
+    # Build count query
+    count_q = Q.from_(i).select(fn.Count("*"))
+    if warehouse_id:
+        sle = Table("stock_ledger_entry")
+        sub = (Q.from_(sle).select(sle.item_id).distinct()
+               .where(sle.warehouse_id == P()).where(sle.is_cancelled == 0))
+        count_q = count_q.where(i.id.isin(sub))
     if args.item_group:
-        conditions.append("i.item_group_id = ?")
-        params.append(args.item_group)
+        count_q = count_q.where(i.item_group_id == P())
     if args.item_type:
-        conditions.append("i.item_type = ?")
-        params.append(args.item_type)
+        count_q = count_q.where(i.item_type == P())
     if args.search:
-        conditions.append("(i.item_name LIKE ? OR i.item_code LIKE ?)")
-        params.extend([f"%{args.search}%", f"%{args.search}%"])
+        count_q = count_q.where(
+            (i.item_name.like(P())) | (i.item_code.like(P()))
+        )
 
-    where = " AND ".join(conditions)
+    count_params = []
+    if warehouse_id:
+        count_params.append(warehouse_id)
+    if args.item_group:
+        count_params.append(args.item_group)
+    if args.item_type:
+        count_params.append(args.item_type)
+    if args.search:
+        count_params.extend([f"%{args.search}%", f"%{args.search}%"])
 
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM item i WHERE {where}", params
-    ).fetchone()
+    count_row = conn.execute(count_q.get_sql(), count_params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"""SELECT i.id, i.item_code, i.item_name, i.item_group_id,
-               i.item_type, i.stock_uom, i.standard_rate, i.status,
-               i.has_batch, i.has_serial
-           FROM item i WHERE {where}
-           ORDER BY i.item_name
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    rows_q = (Q.from_(i)
+              .select(i.id, i.item_code, i.item_name, i.item_group_id,
+                      i.item_type, i.stock_uom, i.standard_rate, i.status,
+                      i.has_batch, i.has_serial)
+              .orderby(i.item_name)
+              .limit(P()).offset(P()))
+    if warehouse_id:
+        sle = Table("stock_ledger_entry")
+        sub = (Q.from_(sle).select(sle.item_id).distinct()
+               .where(sle.warehouse_id == P()).where(sle.is_cancelled == 0))
+        rows_q = rows_q.where(i.id.isin(sub))
+    if args.item_group:
+        rows_q = rows_q.where(i.item_group_id == P())
+    if args.item_type:
+        rows_q = rows_q.where(i.item_type == P())
+    if args.search:
+        rows_q = rows_q.where(
+            (i.item_name.like(P())) | (i.item_code.like(P()))
+        )
+
+    row_params = []
+    if warehouse_id:
+        row_params.append(warehouse_id)
+    if args.item_group:
+        row_params.append(args.item_group)
+    if args.item_type:
+        row_params.append(args.item_type)
+    if args.search:
+        row_params.extend([f"%{args.search}%", f"%{args.search}%"])
+    row_params.extend([limit, offset])
+
+    rows = conn.execute(rows_q.get_sql(), row_params).fetchall()
 
     ok({"items": [row_to_dict(r) for r in rows], "total_count": total_count,
          "limit": limit, "offset": offset, "has_more": offset + limit < total_count})
@@ -309,17 +361,17 @@ def add_item_group(conn, args):
         err("--name is required")
 
     if args.parent_id:
-        parent = conn.execute("SELECT id FROM item_group WHERE id = ?",
-                              (args.parent_id,)).fetchone()
+        ig_t = Table("item_group")
+        parent_q = Q.from_(ig_t).select(ig_t.id).where(ig_t.id == P())
+        parent = conn.execute(parent_q.get_sql(), (args.parent_id,)).fetchone()
         if not parent:
             err(f"Parent item group {args.parent_id} not found")
 
     ig_id = str(uuid.uuid4())
+    t = Table("item_group")
+    q = Q.into(t).columns("id", "name", "parent_id").insert(P(), P(), P())
     try:
-        conn.execute(
-            "INSERT INTO item_group (id, name, parent_id) VALUES (?, ?, ?)",
-            (ig_id, args.name, args.parent_id),
-        )
+        conn.execute(q.get_sql(), (ig_id, args.name, args.parent_id))
     except sqlite3.IntegrityError as e:
         sys.stderr.write(f"[erpclaw-inventory] {e}\n")
         err("Item group creation failed — check for duplicates or invalid data")
@@ -336,28 +388,34 @@ def add_item_group(conn, args):
 
 def list_item_groups(conn, args):
     """List item groups."""
-    conditions = ["1=1"]
-    params = []
+    t = Table("item_group")
 
+    count_q = Q.from_(t).select(fn.Count("*"))
     if args.parent_id:
-        conditions.append("parent_id = ?")
-        params.append(args.parent_id)
+        count_q = count_q.where(t.parent_id == P())
 
-    where = " AND ".join(conditions)
+    count_params = []
+    if args.parent_id:
+        count_params.append(args.parent_id)
 
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM item_group WHERE {where}", params
-    ).fetchone()
+    count_row = conn.execute(count_q.get_sql(), count_params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"SELECT * FROM item_group WHERE {where} ORDER BY name LIMIT ? OFFSET ?",
-        params,
-    ).fetchall()
+    rows_q = (Q.from_(t).select(t.star)
+              .orderby(t.name)
+              .limit(P()).offset(P()))
+    if args.parent_id:
+        rows_q = rows_q.where(t.parent_id == P())
+
+    row_params = []
+    if args.parent_id:
+        row_params.append(args.parent_id)
+    row_params.extend([limit, offset])
+
+    rows = conn.execute(rows_q.get_sql(), row_params).fetchall()
 
     ok({"item_groups": [row_to_dict(r) for r in rows], "total_count": total_count,
          "limit": limit, "offset": offset, "has_more": offset + limit < total_count})
@@ -374,8 +432,9 @@ def add_warehouse(conn, args):
     if not args.company_id:
         err("--company-id is required")
 
-    if not conn.execute("SELECT id FROM company WHERE id = ?",
-                        (args.company_id,)).fetchone():
+    co_t = Table("company")
+    co_q = Q.from_(co_t).select(co_t.id).where(co_t.id == P())
+    if not conn.execute(co_q.get_sql(), (args.company_id,)).fetchone():
         err(f"Company {args.company_id} not found")
 
     wh_type = args.warehouse_type or "stores"
@@ -383,23 +442,28 @@ def add_warehouse(conn, args):
         err(f"--warehouse-type must be one of: {', '.join(VALID_WAREHOUSE_TYPES)}")
 
     if args.parent_id:
-        parent = conn.execute("SELECT id FROM warehouse WHERE id = ?",
-                              (args.parent_id,)).fetchone()
+        wh_t = Table("warehouse")
+        parent_q = Q.from_(wh_t).select(wh_t.id).where(wh_t.id == P())
+        parent = conn.execute(parent_q.get_sql(), (args.parent_id,)).fetchone()
         if not parent:
             err(f"Parent warehouse {args.parent_id} not found")
 
     if args.account_id:
-        acct = conn.execute("SELECT id FROM account WHERE id = ?",
-                            (args.account_id,)).fetchone()
+        acct_t = Table("account")
+        acct_q = Q.from_(acct_t).select(acct_t.id).where(acct_t.id == P())
+        acct = conn.execute(acct_q.get_sql(), (args.account_id,)).fetchone()
         if not acct:
             err(f"Account {args.account_id} not found")
 
     is_group = int(args.is_group) if args.is_group else 0
     wh_id = str(uuid.uuid4())
+    t = Table("warehouse")
+    q = Q.into(t).columns(
+        "id", "name", "parent_id", "warehouse_type",
+        "company_id", "account_id", "is_group",
+    ).insert(P(), P(), P(), P(), P(), P(), P())
     conn.execute(
-        """INSERT INTO warehouse (id, name, parent_id, warehouse_type,
-           company_id, account_id, is_group)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        q.get_sql(),
         (wh_id, args.name, args.parent_id, wh_type,
          args.company_id, args.account_id, is_group),
     )
@@ -419,8 +483,10 @@ def update_warehouse(conn, args):
     if not args.warehouse_id:
         err("--warehouse-id is required")
 
-    wh = conn.execute("SELECT * FROM warehouse WHERE id = ? OR name = ?",
-                      (args.warehouse_id, args.warehouse_id)).fetchone()
+    wh_t = Table("warehouse")
+    wh_q = (Q.from_(wh_t).select(wh_t.star)
+            .where((wh_t.id == P()) | (wh_t.name == P())))
+    wh = conn.execute(wh_q.get_sql(), (args.warehouse_id, args.warehouse_id)).fetchone()
     if not wh:
         err(f"Warehouse {args.warehouse_id} not found")
     args.warehouse_id = wh["id"]  # normalize to id
@@ -432,8 +498,9 @@ def update_warehouse(conn, args):
         params.append(args.name)
         updated_fields.append("name")
     if args.account_id is not None:
-        acct = conn.execute("SELECT id FROM account WHERE id = ?",
-                            (args.account_id,)).fetchone()
+        acct_t = Table("account")
+        acct_q = Q.from_(acct_t).select(acct_t.id).where(acct_t.id == P())
+        acct = conn.execute(acct_q.get_sql(), (args.account_id,)).fetchone()
         if not acct:
             err(f"Account {args.account_id} not found")
         updates.append("account_id = ?")
@@ -462,31 +529,43 @@ def list_warehouses(conn, args):
     """List warehouses for a company."""
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
-    conditions = ["w.company_id = ?"]
-    params = [company_id]
+    w = Table("warehouse").as_("w")
 
+    count_q = Q.from_(w).select(fn.Count("*")).where(w.company_id == P())
     if args.parent_id:
-        conditions.append("w.parent_id = ?")
-        params.append(args.parent_id)
+        count_q = count_q.where(w.parent_id == P())
     if args.warehouse_type:
-        conditions.append("w.warehouse_type = ?")
-        params.append(args.warehouse_type)
+        count_q = count_q.where(w.warehouse_type == P())
 
-    where = " AND ".join(conditions)
+    count_params = [company_id]
+    if args.parent_id:
+        count_params.append(args.parent_id)
+    if args.warehouse_type:
+        count_params.append(args.warehouse_type)
 
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM warehouse w WHERE {where}", params
-    ).fetchone()
+    count_row = conn.execute(count_q.get_sql(), count_params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"SELECT * FROM warehouse w WHERE {where} ORDER BY w.name LIMIT ? OFFSET ?",
-        params,
-    ).fetchall()
+    rows_q = (Q.from_(w).select(w.star)
+              .where(w.company_id == P())
+              .orderby(w.name)
+              .limit(P()).offset(P()))
+    if args.parent_id:
+        rows_q = rows_q.where(w.parent_id == P())
+    if args.warehouse_type:
+        rows_q = rows_q.where(w.warehouse_type == P())
+
+    row_params = [company_id]
+    if args.parent_id:
+        row_params.append(args.parent_id)
+    if args.warehouse_type:
+        row_params.append(args.warehouse_type)
+    row_params.extend([limit, offset])
+
+    rows = conn.execute(rows_q.get_sql(), row_params).fetchall()
 
     ok({"warehouses": [row_to_dict(r) for r in rows], "total_count": total_count,
          "limit": limit, "offset": offset, "has_more": offset + limit < total_count})
@@ -511,8 +590,9 @@ def add_stock_entry(conn, args):
     if not args.items:
         err("--items is required (JSON array)")
 
-    if not conn.execute("SELECT id FROM company WHERE id = ?",
-                        (args.company_id,)).fetchone():
+    co_t = Table("company")
+    co_q = Q.from_(co_t).select(co_t.id).where(co_t.id == P())
+    if not conn.execute(co_q.get_sql(), (args.company_id,)).fetchone():
         err(f"Company {args.company_id} not found")
 
     items = _parse_json_arg(args.items, "items")
@@ -533,8 +613,11 @@ def add_stock_entry(conn, args):
             err(f"Item {i}: item_id is required")
 
         # Validate item exists
-        item_row = conn.execute("SELECT id, standard_rate FROM item WHERE id = ?",
-                                (item_id,)).fetchone()
+        item_t = Table("item")
+        item_q = (Q.from_(item_t)
+                  .select(item_t.id, item_t.standard_rate)
+                  .where(item_t.id == P()))
+        item_row = conn.execute(item_q.get_sql(), (item_id,)).fetchone()
         if not item_row:
             err(f"Item {i}: item {item_id} not found")
 
@@ -586,12 +669,14 @@ def add_stock_entry(conn, args):
     value_diff = round_currency(total_incoming - total_outgoing)
 
     # Insert parent stock_entry first (FK target for stock_entry_item)
+    se_t = Table("stock_entry")
+    se_q = Q.into(se_t).columns(
+        "id", "naming_series", "stock_entry_type", "posting_date",
+        "total_incoming_value", "total_outgoing_value", "value_difference",
+        "status", "company_id",
+    ).insert(P(), P(), P(), P(), P(), P(), P(), "draft", P())
     conn.execute(
-        """INSERT INTO stock_entry
-           (id, naming_series, stock_entry_type, posting_date,
-            total_incoming_value, total_outgoing_value, value_difference,
-            status, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?)""",
+        se_q.get_sql(),
         (se_id, naming, entry_type, args.posting_date,
          str(round_currency(total_incoming)),
          str(round_currency(total_outgoing)),
@@ -599,14 +684,13 @@ def add_stock_entry(conn, args):
     )
 
     # Now insert child stock_entry_item rows
+    sei_t = Table("stock_entry_item")
+    sei_q = Q.into(sei_t).columns(
+        "id", "stock_entry_id", "item_id", "quantity", "from_warehouse_id",
+        "to_warehouse_id", "valuation_rate", "amount", "batch_id", "serial_numbers",
+    ).insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P())
     for row_params in item_rows_to_insert:
-        conn.execute(
-            """INSERT INTO stock_entry_item
-               (id, stock_entry_id, item_id, quantity, from_warehouse_id,
-                to_warehouse_id, valuation_rate, amount, batch_id, serial_numbers)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            row_params,
-        )
+        conn.execute(sei_q.get_sql(), row_params)
 
     audit(conn, "erpclaw-inventory", "add-stock-entry", "stock_entry", se_id,
            new_values={"naming_series": naming, "type": entry_type,
@@ -627,21 +711,22 @@ def get_stock_entry(conn, args):
     if not args.stock_entry_id:
         err("--stock-entry-id is required")
 
-    se = conn.execute("SELECT * FROM stock_entry WHERE id = ?",
-                      (args.stock_entry_id,)).fetchone()
+    se_t = Table("stock_entry")
+    se_q = Q.from_(se_t).select(se_t.star).where(se_t.id == P())
+    se = conn.execute(se_q.get_sql(), (args.stock_entry_id,)).fetchone()
     if not se:
         err(f"Stock entry {args.stock_entry_id} not found")
 
     data = row_to_dict(se)
 
-    items = conn.execute(
-        """SELECT sei.*, i.item_code, i.item_name
-           FROM stock_entry_item sei
-           LEFT JOIN item i ON i.id = sei.item_id
-           WHERE sei.stock_entry_id = ?
-           ORDER BY sei.rowid""",
-        (args.stock_entry_id,),
-    ).fetchall()
+    sei = Table("stock_entry_item").as_("sei")
+    i = Table("item").as_("i")
+    items_q = (Q.from_(sei)
+               .left_join(i).on(i.id == sei.item_id)
+               .select(sei.star, i.item_code, i.item_name)
+               .where(sei.stock_entry_id == P())
+               .orderby(sei.field("rowid")))
+    items = conn.execute(items_q.get_sql(), (args.stock_entry_id,)).fetchall()
     data["items"] = [row_to_dict(r) for r in items]
     ok(data)
 
@@ -652,46 +737,71 @@ def get_stock_entry(conn, args):
 
 def list_stock_entries(conn, args):
     """List stock entries with filtering."""
-    conditions = ["1=1"]
-    params = []
+    se = Table("stock_entry").as_("se")
 
+    count_q = Q.from_(se).select(fn.Count("*"))
     if args.company_id:
-        conditions.append("se.company_id = ?")
-        params.append(args.company_id)
+        count_q = count_q.where(se.company_id == P())
     if args.entry_type:
         mapped = ENTRY_TYPE_MAP.get(args.entry_type, args.entry_type)
-        conditions.append("se.stock_entry_type = ?")
-        params.append(mapped)
+        count_q = count_q.where(se.stock_entry_type == P())
     if args.se_status:
-        conditions.append("se.status = ?")
-        params.append(args.se_status)
+        count_q = count_q.where(se.status == P())
     if args.from_date:
-        conditions.append("se.posting_date >= ?")
-        params.append(args.from_date)
+        count_q = count_q.where(se.posting_date >= P())
     if args.to_date:
-        conditions.append("se.posting_date <= ?")
-        params.append(args.to_date)
+        count_q = count_q.where(se.posting_date <= P())
 
-    where = " AND ".join(conditions)
+    count_params = []
+    if args.company_id:
+        count_params.append(args.company_id)
+    if args.entry_type:
+        count_params.append(ENTRY_TYPE_MAP.get(args.entry_type, args.entry_type))
+    if args.se_status:
+        count_params.append(args.se_status)
+    if args.from_date:
+        count_params.append(args.from_date)
+    if args.to_date:
+        count_params.append(args.to_date)
 
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM stock_entry se WHERE {where}", params
-    ).fetchone()
+    count_row = conn.execute(count_q.get_sql(), count_params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"""SELECT se.id, se.naming_series, se.stock_entry_type, se.posting_date,
-               se.total_incoming_value, se.total_outgoing_value,
-               se.value_difference, se.status, se.company_id
-           FROM stock_entry se WHERE {where}
-           ORDER BY se.posting_date DESC, se.created_at DESC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    rows_q = (Q.from_(se)
+              .select(se.id, se.naming_series, se.stock_entry_type, se.posting_date,
+                      se.total_incoming_value, se.total_outgoing_value,
+                      se.value_difference, se.status, se.company_id)
+              .orderby(se.posting_date, order=Order.desc)
+              .orderby(se.created_at, order=Order.desc)
+              .limit(P()).offset(P()))
+    if args.company_id:
+        rows_q = rows_q.where(se.company_id == P())
+    if args.entry_type:
+        rows_q = rows_q.where(se.stock_entry_type == P())
+    if args.se_status:
+        rows_q = rows_q.where(se.status == P())
+    if args.from_date:
+        rows_q = rows_q.where(se.posting_date >= P())
+    if args.to_date:
+        rows_q = rows_q.where(se.posting_date <= P())
+
+    row_params = []
+    if args.company_id:
+        row_params.append(args.company_id)
+    if args.entry_type:
+        row_params.append(ENTRY_TYPE_MAP.get(args.entry_type, args.entry_type))
+    if args.se_status:
+        row_params.append(args.se_status)
+    if args.from_date:
+        row_params.append(args.from_date)
+    if args.to_date:
+        row_params.append(args.to_date)
+    row_params.extend([limit, offset])
+
+    rows = conn.execute(rows_q.get_sql(), row_params).fetchall()
 
     ok({"stock_entries": [row_to_dict(r) for r in rows],
          "total_count": total_count, "limit": limit, "offset": offset,
@@ -707,8 +817,9 @@ def submit_stock_entry(conn, args):
     if not args.stock_entry_id:
         err("--stock-entry-id is required")
 
-    se = conn.execute("SELECT * FROM stock_entry WHERE id = ?",
-                      (args.stock_entry_id,)).fetchone()
+    se_t = Table("stock_entry")
+    se_q = Q.from_(se_t).select(se_t.star).where(se_t.id == P())
+    se = conn.execute(se_q.get_sql(), (args.stock_entry_id,)).fetchone()
     if not se:
         err(f"Stock entry {args.stock_entry_id} not found")
     if se["status"] != "draft":
@@ -720,10 +831,11 @@ def submit_stock_entry(conn, args):
     entry_type = se_dict["stock_entry_type"]
 
     # Fetch items
-    items = conn.execute(
-        "SELECT * FROM stock_entry_item WHERE stock_entry_id = ? ORDER BY rowid",
-        (args.stock_entry_id,),
-    ).fetchall()
+    sei_t = Table("stock_entry_item")
+    sei_q = (Q.from_(sei_t).select(sei_t.star)
+             .where(sei_t.stock_entry_id == P())
+             .orderby(Field("rowid")))
+    items = conn.execute(sei_q.get_sql(), (args.stock_entry_id,)).fetchall()
     if not items:
         err("Stock entry has no items")
 
@@ -821,11 +933,12 @@ def submit_stock_entry(conn, args):
         err(f"SLE posting failed: {e}")
 
     # Build SLE dicts with stock_value_difference for GL generation
-    sle_rows = conn.execute(
-        """SELECT * FROM stock_ledger_entry
-           WHERE voucher_type = 'stock_entry' AND voucher_id = ? AND is_cancelled = 0""",
-        (args.stock_entry_id,),
-    ).fetchall()
+    sle_t = Table("stock_ledger_entry")
+    sle_q = (Q.from_(sle_t).select(sle_t.star)
+             .where(sle_t.voucher_type == "stock_entry")
+             .where(sle_t.voucher_id == P())
+             .where(sle_t.is_cancelled == 0))
+    sle_rows = conn.execute(sle_q.get_sql(), (args.stock_entry_id,)).fetchall()
     sle_dicts = [row_to_dict(r) for r in sle_rows]
 
     # Create perpetual inventory GL entries
@@ -858,8 +971,7 @@ def submit_stock_entry(conn, args):
 
     # Update status
     conn.execute(
-        """UPDATE stock_entry SET status = 'submitted',
-           updated_at = datetime('now') WHERE id = ?""",
+        "UPDATE stock_entry SET status = 'submitted', updated_at = datetime('now') WHERE id = ?",
         (args.stock_entry_id,),
     )
 
@@ -881,8 +993,9 @@ def cancel_stock_entry(conn, args):
     if not args.stock_entry_id:
         err("--stock-entry-id is required")
 
-    se = conn.execute("SELECT * FROM stock_entry WHERE id = ?",
-                      (args.stock_entry_id,)).fetchone()
+    se_t = Table("stock_entry")
+    se_q = Q.from_(se_t).select(se_t.star).where(se_t.id == P())
+    se = conn.execute(se_q.get_sql(), (args.stock_entry_id,)).fetchone()
     if not se:
         err(f"Stock entry {args.stock_entry_id} not found")
     if se["status"] != "submitted":
@@ -917,8 +1030,7 @@ def cancel_stock_entry(conn, args):
 
     # Update status
     conn.execute(
-        """UPDATE stock_entry SET status = 'cancelled',
-           updated_at = datetime('now') WHERE id = ?""",
+        "UPDATE stock_entry SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?",
         (args.stock_entry_id,),
     )
 
@@ -1035,6 +1147,9 @@ def stock_balance_report(conn, args):
     """All items stock summary for a company."""
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
+    # This query uses decimal_sum() aggregate and a correlated subquery for
+    # valuation_rate — kept as raw SQL due to complexity of correlated subquery
+    # and HAVING clause with decimal_sum()
     conditions = [
         "sle.is_cancelled = 0",
         "w.company_id = ?",
@@ -1096,38 +1211,38 @@ def stock_balance_report(conn, args):
 
 def stock_ledger_report(conn, args):
     """Stock ledger entry detail report."""
-    conditions = ["sle.is_cancelled = 0"]
-    params = []
+    sle = Table("stock_ledger_entry").as_("sle")
+    i = Table("item").as_("i")
+    w = Table("warehouse").as_("w")
 
+    rows_q = (Q.from_(sle)
+              .left_join(i).on(i.id == sle.item_id)
+              .left_join(w).on(w.id == sle.warehouse_id)
+              .select(sle.star, i.item_code, i.item_name, w.name.as_("warehouse_name"))
+              .where(sle.is_cancelled == 0)
+              .orderby(sle.posting_date, order=Order.desc)
+              .orderby(sle.created_at, order=Order.desc)
+              .limit(P()).offset(P()))
+
+    params = []
     if args.item_id:
-        conditions.append("sle.item_id = ?")
+        rows_q = rows_q.where(sle.item_id == P())
         params.append(args.item_id)
     if args.warehouse_id:
-        conditions.append("sle.warehouse_id = ?")
+        rows_q = rows_q.where(sle.warehouse_id == P())
         params.append(args.warehouse_id)
     if args.from_date:
-        conditions.append("sle.posting_date >= ?")
+        rows_q = rows_q.where(sle.posting_date >= P())
         params.append(args.from_date)
     if args.to_date:
-        conditions.append("sle.posting_date <= ?")
+        rows_q = rows_q.where(sle.posting_date <= P())
         params.append(args.to_date)
-
-    where = " AND ".join(conditions)
 
     limit = int(args.limit) if args.limit else 100
     offset = int(args.offset) if args.offset else 0
     params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"""SELECT sle.*, i.item_code, i.item_name, w.name AS warehouse_name
-           FROM stock_ledger_entry sle
-           LEFT JOIN item i ON i.id = sle.item_id
-           LEFT JOIN warehouse w ON w.id = sle.warehouse_id
-           WHERE {where}
-           ORDER BY sle.posting_date DESC, sle.created_at DESC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    rows = conn.execute(rows_q.get_sql(), params).fetchall()
 
     ok({"entries": [row_to_dict(r) for r in rows], "count": len(rows)})
 
@@ -1143,17 +1258,22 @@ def add_batch(conn, args):
     if not args.batch_name:
         err("--batch-name is required")
 
-    item = conn.execute("SELECT id, has_batch FROM item WHERE id = ?",
-                        (args.item_id,)).fetchone()
+    item_t = Table("item")
+    item_q = (Q.from_(item_t)
+              .select(item_t.id, item_t.has_batch)
+              .where(item_t.id == P()))
+    item = conn.execute(item_q.get_sql(), (args.item_id,)).fetchone()
     if not item:
         err(f"Item {args.item_id} not found")
 
     batch_id = str(uuid.uuid4())
+    t = Table("batch")
+    q = Q.into(t).columns(
+        "id", "batch_name", "item_id", "manufacturing_date", "expiry_date",
+    ).insert(P(), P(), P(), P(), P())
     try:
         conn.execute(
-            """INSERT INTO batch
-               (id, batch_name, item_id, manufacturing_date, expiry_date)
-               VALUES (?, ?, ?, ?, ?)""",
+            q.get_sql(),
             (batch_id, args.batch_name, args.item_id,
              args.manufacturing_date, args.expiry_date),
         )
@@ -1173,20 +1293,19 @@ def add_batch(conn, args):
 
 def list_batches(conn, args):
     """List batches with optional filters."""
-    conditions = ["1=1"]
-    params = []
-
-    if args.item_id:
-        conditions.append("b.item_id = ?")
-        params.append(args.item_id)
-
-    where = " AND ".join(conditions)
-
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
 
     if args.warehouse_id:
-        # Count for warehouse-filtered batches
+        # Filter by batches that have stock in the specified warehouse
+        # Uses decimal_sum() HAVING — kept as raw SQL
+        conditions = ["1=1"]
+        params = []
+        if args.item_id:
+            conditions.append("b.item_id = ?")
+            params.append(args.item_id)
+        where = " AND ".join(conditions)
+
         count_row = conn.execute(
             f"""SELECT COUNT(*) FROM (
                    SELECT b.id
@@ -1200,7 +1319,6 @@ def list_batches(conn, args):
         ).fetchone()
         total_count = count_row[0]
 
-        # Filter by batches that have stock in the specified warehouse
         rows = conn.execute(
             f"""SELECT DISTINCT b.*
                FROM batch b
@@ -1213,15 +1331,31 @@ def list_batches(conn, args):
             params + [args.warehouse_id, limit, offset],
         ).fetchall()
     else:
-        count_row = conn.execute(
-            f"SELECT COUNT(*) FROM batch b WHERE {where}", params
-        ).fetchone()
+        b = Table("batch").as_("b")
+
+        count_q = Q.from_(b).select(fn.Count("*"))
+        if args.item_id:
+            count_q = count_q.where(b.item_id == P())
+
+        count_params = []
+        if args.item_id:
+            count_params.append(args.item_id)
+
+        count_row = conn.execute(count_q.get_sql(), count_params).fetchone()
         total_count = count_row[0]
 
-        rows = conn.execute(
-            f"SELECT * FROM batch b WHERE {where} ORDER BY b.batch_name LIMIT ? OFFSET ?",
-            params + [limit, offset],
-        ).fetchall()
+        rows_q = (Q.from_(b).select(b.star)
+                  .orderby(b.batch_name)
+                  .limit(P()).offset(P()))
+        if args.item_id:
+            rows_q = rows_q.where(b.item_id == P())
+
+        row_params = []
+        if args.item_id:
+            row_params.append(args.item_id)
+        row_params.extend([limit, offset])
+
+        rows = conn.execute(rows_q.get_sql(), row_params).fetchall()
 
     ok({"batches": [row_to_dict(r) for r in rows], "total_count": total_count,
          "limit": limit, "offset": offset, "has_more": offset + limit < total_count})
@@ -1238,17 +1372,20 @@ def add_serial_number(conn, args):
     if not args.serial_no:
         err("--serial-no is required")
 
-    item = conn.execute("SELECT id FROM item WHERE id = ?",
-                        (args.item_id,)).fetchone()
+    item_t = Table("item")
+    item_q = Q.from_(item_t).select(item_t.id).where(item_t.id == P())
+    item = conn.execute(item_q.get_sql(), (args.item_id,)).fetchone()
     if not item:
         err(f"Item {args.item_id} not found")
 
     sn_id = str(uuid.uuid4())
+    t = Table("serial_number")
+    q = Q.into(t).columns(
+        "id", "serial_no", "item_id", "warehouse_id", "batch_id", "status",
+    ).insert(P(), P(), P(), P(), P(), "active")
     try:
         conn.execute(
-            """INSERT INTO serial_number
-               (id, serial_no, item_id, warehouse_id, batch_id, status)
-               VALUES (?, ?, ?, ?, ?, 'active')""",
+            q.get_sql(),
             (sn_id, args.serial_no, args.item_id,
              args.warehouse_id, args.batch_id),
         )
@@ -1268,41 +1405,55 @@ def add_serial_number(conn, args):
 
 def list_serial_numbers(conn, args):
     """List serial numbers with optional filters."""
-    conditions = ["1=1"]
-    params = []
+    sn = Table("serial_number").as_("sn")
+    i = Table("item").as_("i")
 
+    count_q = Q.from_(sn).select(fn.Count("*"))
     if args.item_id:
-        conditions.append("sn.item_id = ?")
-        params.append(args.item_id)
+        count_q = count_q.where(sn.item_id == P())
     if args.warehouse_id:
-        conditions.append("sn.warehouse_id = ?")
-        params.append(args.warehouse_id)
+        count_q = count_q.where(sn.warehouse_id == P())
     if args.sn_status:
         if args.sn_status not in VALID_SERIAL_STATUSES:
             err(f"--status must be one of: {', '.join(VALID_SERIAL_STATUSES)}")
-        conditions.append("sn.status = ?")
-        params.append(args.sn_status)
+        count_q = count_q.where(sn.status == P())
 
-    where = " AND ".join(conditions)
+    count_params = []
+    if args.item_id:
+        count_params.append(args.item_id)
+    if args.warehouse_id:
+        count_params.append(args.warehouse_id)
+    if args.sn_status:
+        count_params.append(args.sn_status)
 
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM serial_number sn WHERE {where}", params
-    ).fetchone()
+    count_row = conn.execute(count_q.get_sql(), count_params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"""SELECT sn.*, i.item_code, i.item_name
-           FROM serial_number sn
-           LEFT JOIN item i ON i.id = sn.item_id
-           WHERE {where}
-           ORDER BY sn.serial_no
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    rows_q = (Q.from_(sn)
+              .left_join(i).on(i.id == sn.item_id)
+              .select(sn.star, i.item_code, i.item_name)
+              .orderby(sn.serial_no)
+              .limit(P()).offset(P()))
+    if args.item_id:
+        rows_q = rows_q.where(sn.item_id == P())
+    if args.warehouse_id:
+        rows_q = rows_q.where(sn.warehouse_id == P())
+    if args.sn_status:
+        rows_q = rows_q.where(sn.status == P())
+
+    row_params = []
+    if args.item_id:
+        row_params.append(args.item_id)
+    if args.warehouse_id:
+        row_params.append(args.warehouse_id)
+    if args.sn_status:
+        row_params.append(args.sn_status)
+    row_params.extend([limit, offset])
+
+    rows = conn.execute(rows_q.get_sql(), row_params).fetchall()
 
     ok({"serial_numbers": [row_to_dict(r) for r in rows], "total_count": total_count,
          "limit": limit, "offset": offset, "has_more": offset + limit < total_count})
@@ -1322,12 +1473,10 @@ def add_price_list(conn, args):
     is_buying = int(args.is_buying) if args.is_buying else 0
     is_selling = int(args.is_selling) if args.is_selling else 0
 
+    t = Table("price_list")
+    q = Q.into(t).columns("id", "name", "currency", "buying", "selling").insert(P(), P(), P(), P(), P())
     try:
-        conn.execute(
-            """INSERT INTO price_list (id, name, currency, buying, selling)
-               VALUES (?, ?, ?, ?, ?)""",
-            (pl_id, args.name, currency, is_buying, is_selling),
-        )
+        conn.execute(q.get_sql(), (pl_id, args.name, currency, is_buying, is_selling))
     except sqlite3.IntegrityError as e:
         sys.stderr.write(f"[erpclaw-inventory] {e}\n")
         err("Price list creation failed — check for duplicates or invalid data")
@@ -1352,21 +1501,26 @@ def add_item_price(conn, args):
         err("--rate is required")
 
     # Validate references
-    if not conn.execute("SELECT id FROM item WHERE id = ?",
-                        (args.item_id,)).fetchone():
+    item_t = Table("item")
+    item_q = Q.from_(item_t).select(item_t.id).where(item_t.id == P())
+    if not conn.execute(item_q.get_sql(), (args.item_id,)).fetchone():
         err(f"Item {args.item_id} not found")
-    if not conn.execute("SELECT id FROM price_list WHERE id = ?",
-                        (args.price_list_id,)).fetchone():
+
+    pl_t = Table("price_list")
+    pl_q = Q.from_(pl_t).select(pl_t.id).where(pl_t.id == P())
+    if not conn.execute(pl_q.get_sql(), (args.price_list_id,)).fetchone():
         err(f"Price list {args.price_list_id} not found")
 
     rate = round_currency(to_decimal(args.rate))
     min_qty = str(to_decimal(args.min_qty or "0"))
 
     ip_id = str(uuid.uuid4())
+    t = Table("item_price")
+    q = Q.into(t).columns(
+        "id", "item_id", "price_list_id", "rate", "min_qty", "valid_from", "valid_to",
+    ).insert(P(), P(), P(), P(), P(), P(), P())
     conn.execute(
-        """INSERT INTO item_price
-           (id, item_id, price_list_id, rate, min_qty, valid_from, valid_to)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        q.get_sql(),
         (ip_id, args.item_id, args.price_list_id, str(rate),
          min_qty, args.valid_from, args.valid_to),
     )
@@ -1393,6 +1547,7 @@ def get_item_price(conn, args):
 
     # Find best matching price: valid date range, min_qty <= requested qty
     # Order by min_qty DESC to get the most specific tier first
+    # This query uses IS NULL comparisons — kept as raw SQL (rule 16)
     rows = conn.execute(
         """SELECT * FROM item_price
            WHERE item_id = ? AND price_list_id = ?
@@ -1406,10 +1561,14 @@ def get_item_price(conn, args):
 
     if not rows:
         # Fallback: any price for this item/price list (ignoring date/qty)
+        ip_t = Table("item_price")
+        fallback_q = (Q.from_(ip_t).select(ip_t.star)
+                      .where(ip_t.item_id == P())
+                      .where(ip_t.price_list_id == P())
+                      .orderby(ip_t.created_at, order=Order.desc)
+                      .limit(1))
         rows = conn.execute(
-            """SELECT * FROM item_price
-               WHERE item_id = ? AND price_list_id = ?
-               ORDER BY created_at DESC LIMIT 1""",
+            fallback_q.get_sql(),
             (args.item_id, args.price_list_id),
         ).fetchone()
 
@@ -1436,11 +1595,13 @@ def add_pricing_rule(conn, args):
         err("--company-id is required")
 
     pr_id = str(uuid.uuid4())
+    t = Table("pricing_rule")
+    q = Q.into(t).columns(
+        "id", "name", "applies_to", "entity_id", "discount_percentage", "rate",
+        "min_qty", "max_qty", "valid_from", "valid_to", "priority", "company_id",
+    ).insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P())
     conn.execute(
-        """INSERT INTO pricing_rule
-           (id, name, applies_to, entity_id, discount_percentage, rate,
-            min_qty, max_qty, valid_from, valid_to, priority, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        q.get_sql(),
         (pr_id, args.name, args.applies_to, args.entity_id,
          args.discount_percentage, args.pr_rate,
          args.min_qty, args.max_qty,
@@ -1467,8 +1628,9 @@ def add_stock_reconciliation(conn, args):
     if not args.company_id:
         err("--company-id is required")
 
-    if not conn.execute("SELECT id FROM company WHERE id = ?",
-                        (args.company_id,)).fetchone():
+    co_t = Table("company")
+    co_q = Q.from_(co_t).select(co_t.id).where(co_t.id == P())
+    if not conn.execute(co_q.get_sql(), (args.company_id,)).fetchone():
         err(f"Company {args.company_id} not found")
 
     items = _parse_json_arg(args.items, "items")
@@ -1513,25 +1675,26 @@ def add_stock_reconciliation(conn, args):
         ))
 
     # Insert parent stock_reconciliation first (FK target for items)
+    sr_t = Table("stock_reconciliation")
+    sr_q = Q.into(sr_t).columns(
+        "id", "naming_series", "posting_date", "difference_amount",
+        "status", "company_id",
+    ).insert(P(), P(), P(), P(), "draft", P())
     conn.execute(
-        """INSERT INTO stock_reconciliation
-           (id, naming_series, posting_date, difference_amount,
-            status, company_id)
-           VALUES (?, ?, ?, ?, 'draft', ?)""",
+        sr_q.get_sql(),
         (sr_id, naming, args.posting_date,
          str(round_currency(total_diff_amount)), args.company_id),
     )
 
     # Now insert child stock_reconciliation_item rows
+    sri_t = Table("stock_reconciliation_item")
+    sri_q = Q.into(sri_t).columns(
+        "id", "stock_reconciliation_id", "item_id", "warehouse_id",
+        "current_qty", "current_valuation_rate", "qty", "valuation_rate",
+        "quantity_difference", "amount_difference",
+    ).insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P())
     for row_params in item_rows_to_insert:
-        conn.execute(
-            """INSERT INTO stock_reconciliation_item
-               (id, stock_reconciliation_id, item_id, warehouse_id,
-                current_qty, current_valuation_rate, qty, valuation_rate,
-                quantity_difference, amount_difference)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            row_params,
-        )
+        conn.execute(sri_q.get_sql(), row_params)
 
     audit(conn, "erpclaw-inventory", "add-stock-reconciliation", "stock_reconciliation", sr_id,
            new_values={"naming_series": naming, "item_count": len(items),
@@ -1551,8 +1714,9 @@ def submit_stock_reconciliation(conn, args):
     if not args.stock_reconciliation_id:
         err("--stock-reconciliation-id is required")
 
-    sr = conn.execute("SELECT * FROM stock_reconciliation WHERE id = ?",
-                      (args.stock_reconciliation_id,)).fetchone()
+    sr_t = Table("stock_reconciliation")
+    sr_q = Q.from_(sr_t).select(sr_t.star).where(sr_t.id == P())
+    sr = conn.execute(sr_q.get_sql(), (args.stock_reconciliation_id,)).fetchone()
     if not sr:
         err(f"Stock reconciliation {args.stock_reconciliation_id} not found")
     if sr["status"] != "draft":
@@ -1563,10 +1727,10 @@ def submit_stock_reconciliation(conn, args):
     posting_date = sr_dict["posting_date"]
 
     # Fetch reconciliation items
-    sri_rows = conn.execute(
-        "SELECT * FROM stock_reconciliation_item WHERE stock_reconciliation_id = ?",
-        (args.stock_reconciliation_id,),
-    ).fetchall()
+    sri_t = Table("stock_reconciliation_item")
+    sri_q = (Q.from_(sri_t).select(sri_t.star)
+             .where(sri_t.stock_reconciliation_id == P()))
+    sri_rows = conn.execute(sri_q.get_sql(), (args.stock_reconciliation_id,)).fetchall()
     if not sri_rows:
         err("Stock reconciliation has no items")
 
@@ -1607,20 +1771,23 @@ def submit_stock_reconciliation(conn, args):
     # Build GL entries for value adjustments
     gl_ids = []
     if sle_ids:
-        sle_rows = conn.execute(
-            """SELECT * FROM stock_ledger_entry
-               WHERE voucher_type = 'stock_reconciliation' AND voucher_id = ?
-                 AND is_cancelled = 0""",
-            (args.stock_reconciliation_id,),
-        ).fetchall()
+        sle_rows_t = Table("stock_ledger_entry")
+        sle_rows_q = (Q.from_(sle_rows_t).select(sle_rows_t.star)
+                      .where(sle_rows_t.voucher_type == "stock_reconciliation")
+                      .where(sle_rows_t.voucher_id == P())
+                      .where(sle_rows_t.is_cancelled == 0))
+        sle_rows = conn.execute(sle_rows_q.get_sql(), (args.stock_reconciliation_id,)).fetchall()
         sle_dicts = [row_to_dict(r) for r in sle_rows]
 
         # Find stock adjustment account as contra for reconciliation
-        stock_adj_acct = conn.execute(
-            "SELECT id FROM account WHERE account_type = 'stock_adjustment' "
-            "AND company_id = ? AND is_group = 0 LIMIT 1",
-            (company_id,),
-        ).fetchone()
+        # Uses account_type filter — kept as PyPika
+        acct_t = Table("account")
+        acct_q = (Q.from_(acct_t).select(acct_t.id)
+                  .where(acct_t.account_type == "stock_adjustment")
+                  .where(acct_t.company_id == P())
+                  .where(acct_t.is_group == 0)
+                  .limit(1))
+        stock_adj_acct = conn.execute(acct_q.get_sql(), (company_id,)).fetchone()
         expense_account_id = stock_adj_acct["id"] if stock_adj_acct else None
 
         gl_entries = create_perpetual_inventory_gl(
@@ -1651,8 +1818,7 @@ def submit_stock_reconciliation(conn, args):
 
     # Update status
     conn.execute(
-        """UPDATE stock_reconciliation SET status = 'submitted',
-           updated_at = datetime('now') WHERE id = ?""",
+        "UPDATE stock_reconciliation SET status = 'submitted', updated_at = datetime('now') WHERE id = ?",
         (args.stock_reconciliation_id,),
     )
 
@@ -1704,20 +1870,22 @@ def revalue_stock(conn, args):
         err("--new-rate must be non-negative")
 
     # Validate item exists and is a stock item
-    item_row = conn.execute(
-        "SELECT id, item_code, item_name, is_stock_item FROM item WHERE id = ?",
-        (item_id,),
-    ).fetchone()
+    item_t = Table("item")
+    item_q = (Q.from_(item_t)
+              .select(item_t.id, item_t.item_code, item_t.item_name, item_t.is_stock_item)
+              .where(item_t.id == P()))
+    item_row = conn.execute(item_q.get_sql(), (item_id,)).fetchone()
     if not item_row:
         err(f"Item {item_id} not found")
     if not item_row["is_stock_item"]:
         err(f"Item {item_row['item_name']} is not a stock item")
 
     # Validate warehouse
-    wh_row = conn.execute(
-        "SELECT id, name, company_id, account_id FROM warehouse WHERE id = ?",
-        (warehouse_id,),
-    ).fetchone()
+    wh_t = Table("warehouse")
+    wh_q = (Q.from_(wh_t)
+            .select(wh_t.id, wh_t.name, wh_t.company_id, wh_t.account_id)
+            .where(wh_t.id == P()))
+    wh_row = conn.execute(wh_q.get_sql(), (warehouse_id,)).fetchone()
     if not wh_row:
         err(f"Warehouse {warehouse_id} not found")
     company_id = wh_row["company_id"]
@@ -1752,6 +1920,8 @@ def revalue_stock(conn, args):
     # --- Single atomic transaction ---
 
     # 1. Insert SLE with actual_qty=0 but new valuation and value difference
+    # Uses datetime('now') as LiteralValue and mixed literal/param values
+    # Kept as raw SQL for clarity with the mixed NULL/literal/param pattern
     conn.execute(
         """
         INSERT INTO stock_ledger_entry (
@@ -1780,19 +1950,23 @@ def revalue_stock(conn, args):
         # Stock-in-Hand account (from warehouse)
         warehouse_account_id = wh_row["account_id"]
         if not warehouse_account_id:
-            stock_acct = conn.execute(
-                "SELECT id FROM account WHERE account_type = 'stock' "
-                "AND company_id = ? AND is_group = 0 LIMIT 1",
-                (company_id,),
-            ).fetchone()
+            stock_acct_t = Table("account")
+            stock_acct_q = (Q.from_(stock_acct_t).select(stock_acct_t.id)
+                            .where(stock_acct_t.account_type == "stock")
+                            .where(stock_acct_t.company_id == P())
+                            .where(stock_acct_t.is_group == 0)
+                            .limit(1))
+            stock_acct = conn.execute(stock_acct_q.get_sql(), (company_id,)).fetchone()
             warehouse_account_id = stock_acct["id"] if stock_acct else None
 
         # Stock Adjustment account (contra)
-        stock_adj_acct = conn.execute(
-            "SELECT id FROM account WHERE account_type = 'stock_adjustment' "
-            "AND company_id = ? AND is_group = 0 LIMIT 1",
-            (company_id,),
-        ).fetchone()
+        adj_acct_t = Table("account")
+        adj_acct_q = (Q.from_(adj_acct_t).select(adj_acct_t.id)
+                      .where(adj_acct_t.account_type == "stock_adjustment")
+                      .where(adj_acct_t.company_id == P())
+                      .where(adj_acct_t.is_group == 0)
+                      .limit(1))
+        stock_adj_acct = conn.execute(adj_acct_q.get_sql(), (company_id,)).fetchone()
         stock_adj_account_id = stock_adj_acct["id"] if stock_adj_acct else None
 
         if warehouse_account_id and stock_adj_account_id:
@@ -1843,6 +2017,7 @@ def revalue_stock(conn, args):
                 err(f"GL posting failed: {e}")
 
     # 3. Insert stock_revaluation record
+    # Uses datetime('now') for created_at and updated_at — kept as raw SQL
     conn.execute(
         """INSERT INTO stock_revaluation (
             id, naming_series, company_id, item_id, warehouse_id,
@@ -1894,21 +2069,25 @@ def list_stock_revaluations(conn, args):
     limit = int(args.limit or "20")
     offset = int(args.offset or "0")
 
-    rows = conn.execute(
-        """SELECT sr.*, i.item_code, i.item_name, w.name AS warehouse_name
-           FROM stock_revaluation sr
-           JOIN item i ON i.id = sr.item_id
-           JOIN warehouse w ON w.id = sr.warehouse_id
-           WHERE sr.company_id = ?
-           ORDER BY sr.created_at DESC
-           LIMIT ? OFFSET ?""",
-        (company_id, limit, offset),
-    ).fetchall()
+    sr = Table("stock_revaluation").as_("sr")
+    i = Table("item").as_("i")
+    w = Table("warehouse").as_("w")
 
-    total = conn.execute(
-        "SELECT COUNT(*) as cnt FROM stock_revaluation WHERE company_id = ?",
-        (company_id,),
-    ).fetchone()["cnt"]
+    rows_q = (Q.from_(sr)
+              .join(i).on(i.id == sr.item_id)
+              .join(w).on(w.id == sr.warehouse_id)
+              .select(sr.star, i.item_code, i.item_name, w.name.as_("warehouse_name"))
+              .where(sr.company_id == P())
+              .orderby(sr.created_at, order=Order.desc)
+              .limit(P()).offset(P()))
+
+    rows = conn.execute(rows_q.get_sql(), (company_id, limit, offset)).fetchall()
+
+    total_t = Table("stock_revaluation")
+    total_q = (Q.from_(total_t)
+               .select(fn.Count("*").as_("cnt"))
+               .where(total_t.company_id == P()))
+    total = conn.execute(total_q.get_sql(), (company_id,)).fetchone()["cnt"]
 
     ok({
         "revaluations": [row_to_dict(r) for r in rows],
@@ -1928,33 +2107,35 @@ def get_stock_revaluation(conn, args):
     if not reval_id:
         err("--revaluation-id is required")
 
-    row = conn.execute(
-        """SELECT sr.*, i.item_code, i.item_name, w.name AS warehouse_name
-           FROM stock_revaluation sr
-           JOIN item i ON i.id = sr.item_id
-           JOIN warehouse w ON w.id = sr.warehouse_id
-           WHERE sr.id = ?""",
-        (reval_id,),
-    ).fetchone()
+    sr = Table("stock_revaluation").as_("sr")
+    i = Table("item").as_("i")
+    w = Table("warehouse").as_("w")
+
+    row_q = (Q.from_(sr)
+             .join(i).on(i.id == sr.item_id)
+             .join(w).on(w.id == sr.warehouse_id)
+             .select(sr.star, i.item_code, i.item_name, w.name.as_("warehouse_name"))
+             .where(sr.id == P()))
+    row = conn.execute(row_q.get_sql(), (reval_id,)).fetchone()
     if not row:
         err(f"Stock revaluation {reval_id} not found")
 
     result = row_to_dict(row)
 
     # Include SLE entries
-    sle_rows = conn.execute(
-        """SELECT * FROM stock_ledger_entry
-           WHERE voucher_type = 'stock_revaluation' AND voucher_id = ?""",
-        (reval_id,),
-    ).fetchall()
+    sle_t = Table("stock_ledger_entry")
+    sle_q = (Q.from_(sle_t).select(sle_t.star)
+             .where(sle_t.voucher_type == "stock_revaluation")
+             .where(sle_t.voucher_id == P()))
+    sle_rows = conn.execute(sle_q.get_sql(), (reval_id,)).fetchall()
     result["sle_entries"] = [row_to_dict(r) for r in sle_rows]
 
     # Include GL entries
-    gl_rows = conn.execute(
-        """SELECT * FROM gl_entry
-           WHERE voucher_type = 'stock_revaluation' AND voucher_id = ?""",
-        (reval_id,),
-    ).fetchall()
+    gl_t = Table("gl_entry")
+    gl_q = (Q.from_(gl_t).select(gl_t.star)
+            .where(gl_t.voucher_type == "stock_revaluation")
+            .where(gl_t.voucher_id == P()))
+    gl_rows = conn.execute(gl_q.get_sql(), (reval_id,)).fetchall()
     result["gl_entries"] = [row_to_dict(r) for r in gl_rows]
 
     ok(result)
@@ -1970,9 +2151,9 @@ def cancel_stock_revaluation(conn, args):
     if not reval_id:
         err("--revaluation-id is required")
 
-    row = conn.execute(
-        "SELECT * FROM stock_revaluation WHERE id = ?", (reval_id,),
-    ).fetchone()
+    sr_t = Table("stock_revaluation")
+    sr_q = Q.from_(sr_t).select(sr_t.star).where(sr_t.id == P())
+    row = conn.execute(sr_q.get_sql(), (reval_id,)).fetchone()
     if not row:
         err(f"Stock revaluation {reval_id} not found")
     if row["status"] != "submitted":
@@ -2007,8 +2188,7 @@ def cancel_stock_revaluation(conn, args):
 
     # Update status
     conn.execute(
-        """UPDATE stock_revaluation SET status = 'cancelled',
-           updated_at = datetime('now') WHERE id = ?""",
+        "UPDATE stock_revaluation SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?",
         (reval_id,),
     )
 
@@ -2032,39 +2212,29 @@ def status_action(conn, args):
     """Inventory summary for a company."""
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
-    items_count = conn.execute(
-        "SELECT COUNT(*) as cnt FROM item"
-    ).fetchone()["cnt"]
+    item_t = Table("item")
+    items_q = Q.from_(item_t).select(fn.Count("*").as_("cnt"))
+    items_count = conn.execute(items_q.get_sql()).fetchone()["cnt"]
 
-    warehouses_count = conn.execute(
-        "SELECT COUNT(*) as cnt FROM warehouse WHERE company_id = ?",
-        (company_id,),
-    ).fetchone()["cnt"]
+    wh_t = Table("warehouse")
+    wh_q = (Q.from_(wh_t).select(fn.Count("*").as_("cnt"))
+            .where(wh_t.company_id == P()))
+    warehouses_count = conn.execute(wh_q.get_sql(), (company_id,)).fetchone()["cnt"]
 
     # Stock entries by status
-    se_rows = conn.execute(
-        """SELECT status, COUNT(*) as cnt FROM stock_entry
-           WHERE company_id = ? GROUP BY status""",
-        (company_id,),
-    ).fetchall()
+    se_t = Table("stock_entry")
+    se_q = (Q.from_(se_t)
+            .select(se_t.status, fn.Count("*").as_("cnt"))
+            .where(se_t.company_id == P())
+            .groupby(se_t.status))
+    se_rows = conn.execute(se_q.get_sql(), (company_id,)).fetchall()
     se_counts = {"draft": 0, "submitted": 0, "cancelled": 0}
     for row in se_rows:
         se_counts[row["status"]] = row["cnt"]
     se_counts["total"] = sum(se_counts.values())
 
-    # Total stock value
-    value_row = conn.execute(
-        """SELECT COALESCE(SUM(
-               (sle.actual_qty + 0) *
-               (sle.valuation_rate + 0)
-           ), 0) as total_value
-           FROM stock_ledger_entry sle
-           JOIN warehouse w ON w.id = sle.warehouse_id
-           WHERE sle.is_cancelled = 0 AND w.company_id = ?""",
-        (company_id,),
-    ).fetchone()
-
-    # More accurate: sum stock_value_difference
+    # Total stock value using decimal_sum() aggregate
+    # JOIN with warehouse for company filter — kept as raw SQL for aggregate
     sv_row = conn.execute(
         """SELECT COALESCE(decimal_sum(sle.stock_value_difference), '0') as total_value
            FROM stock_ledger_entry sle
@@ -2083,7 +2253,7 @@ def status_action(conn, args):
 
 
 # ---------------------------------------------------------------------------
-# 31. check-reorder
+# 35. check-reorder
 # ---------------------------------------------------------------------------
 
 def check_reorder(conn, args):
@@ -2091,6 +2261,7 @@ def check_reorder(conn, args):
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
     # Get items with a meaningful reorder_level set
+    # Uses IS NULL / IS NOT NULL comparisons — kept as raw SQL (rule 16)
     items = conn.execute(
         """SELECT id, item_code, item_name, reorder_level, reorder_qty
            FROM item
@@ -2108,6 +2279,7 @@ def check_reorder(conn, args):
         reorder_qty = to_decimal(str(item["reorder_qty"])) if item["reorder_qty"] else Decimal("0")
 
         # Calculate current stock across all warehouses for this company
+        # Uses decimal_sum() aggregate with JOIN — kept as raw SQL
         stock_row = conn.execute(
             """SELECT COALESCE(decimal_sum(sle.actual_qty), '0') AS total_qty
                FROM stock_ledger_entry sle
@@ -2179,10 +2351,9 @@ def import_items(conn, args):
         uom = row.get("uom", "Nos")
 
         # Check for duplicate (item_code is globally unique)
-        existing = conn.execute(
-            "SELECT id FROM item WHERE item_code = ?",
-            (item_code,),
-        ).fetchone()
+        item_t = Table("item")
+        dup_q = Q.from_(item_t).select(item_t.id).where(item_t.item_code == P())
+        existing = conn.execute(dup_q.get_sql(), (item_code,)).fetchone()
         if existing:
             skipped += 1
             continue
@@ -2191,17 +2362,20 @@ def import_items(conn, args):
         group_name = row.get("group")
         group_id = None
         if group_name:
-            grp = conn.execute(
-                "SELECT id FROM item_group WHERE name = ?", (group_name,)
-            ).fetchone()
+            ig_t = Table("item_group")
+            grp_q = Q.from_(ig_t).select(ig_t.id).where(ig_t.name == P())
+            grp = conn.execute(grp_q.get_sql(), (group_name,)).fetchone()
             if grp:
                 group_id = grp["id"]
 
         item_id = str(uuid.uuid4())
+        ins_t = Table("item")
+        ins_q = Q.into(ins_t).columns(
+            "id", "item_code", "item_name", "item_group_id",
+            "stock_uom", "valuation_method", "description", "status",
+        ).insert(P(), P(), P(), P(), P(), P(), P(), "active")
         conn.execute(
-            """INSERT INTO item (id, item_code, item_name, item_group_id,
-               stock_uom, valuation_method, description, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'active')""",
+            ins_q.get_sql(),
             (item_id, item_code, name, group_id, uom,
              row.get("valuation_method", "moving_average").lower(),
              row.get("description")),

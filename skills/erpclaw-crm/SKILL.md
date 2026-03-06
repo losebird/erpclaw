@@ -4,7 +4,7 @@ version: 1.0.0
 description: Lead management, opportunity pipeline, campaigns, and activity tracking for ERPClaw
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-crm
 tier: 5
 category: crm
 requires: [erpclaw-setup, erpclaw-selling]

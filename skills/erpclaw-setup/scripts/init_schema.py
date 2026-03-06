@@ -495,6 +495,36 @@ CREATE TABLE IF NOT EXISTS journal_entry_line (
 
 CREATE INDEX IF NOT EXISTS idx_jel_journal ON journal_entry_line(journal_entry_id);
 CREATE INDEX IF NOT EXISTS idx_jel_account ON journal_entry_line(account_id);
+
+CREATE TABLE IF NOT EXISTS recurring_journal_template (
+    id              TEXT PRIMARY KEY,
+    naming_series   TEXT,
+    company_id      TEXT NOT NULL REFERENCES company(id) ON DELETE RESTRICT,
+    name            TEXT NOT NULL,
+    frequency       TEXT NOT NULL DEFAULT 'monthly'
+                    CHECK(frequency IN ('daily','weekly','monthly','quarterly','annual')),
+    start_date      TEXT NOT NULL,
+    end_date        TEXT,
+    next_run_date   TEXT NOT NULL,
+    last_generated_date TEXT,
+    entry_type      TEXT NOT NULL DEFAULT 'journal'
+                    CHECK(entry_type IN (
+                        'journal','opening','closing','depreciation',
+                        'write_off','exchange_rate_revaluation',
+                        'inter_company','credit_note','debit_note'
+                    )),
+    lines           TEXT NOT NULL,
+    auto_submit     INTEGER NOT NULL DEFAULT 0,
+    remark          TEXT,
+    status          TEXT NOT NULL DEFAULT 'active'
+                    CHECK(status IN ('active','paused','completed')),
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_rjt_company ON recurring_journal_template(company_id);
+CREATE INDEX IF NOT EXISTS idx_rjt_status ON recurring_journal_template(status);
+CREATE INDEX IF NOT EXISTS idx_rjt_next_run ON recurring_journal_template(next_run_date);
 """
 
 

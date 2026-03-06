@@ -186,6 +186,17 @@ def validate_gl_entries(
                 f"'{account['name']}' (root_type={root_type}). Use balance sheet accounts only"
             )
 
+        # Step 7b: Project ID Validation
+        proj_id = entry.get("project_id")
+        if proj_id:
+            proj = conn.execute(
+                "SELECT id FROM project WHERE id = ?", (proj_id,)
+            ).fetchone()
+            if proj is None:
+                raise ValueError(
+                    f"GL Validation Failed: Project {proj_id} does not exist"
+                )
+
         # Step 8: Cost Center Validation
         cc_id = entry.get("cost_center_id")
         if cc_id:
@@ -440,8 +451,9 @@ def insert_gl_entries(
                 debit, credit, debit_base, credit_base,
                 currency, exchange_rate,
                 voucher_type, voucher_id, entry_set, cost_center_id, project_id,
+                dimensions_json,
                 remarks, fiscal_year, is_cancelled, gl_checksum, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, datetime('now'))
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, datetime('now'))
             """,
             (
                 entry_id,
@@ -460,6 +472,7 @@ def insert_gl_entries(
                 entry_set,
                 entry.get("cost_center_id"),
                 entry.get("project_id"),
+                entry.get("dimensions_json", "{}"),
                 remarks,
                 entry.get("fiscal_year"),
                 checksum,
@@ -517,8 +530,9 @@ def reverse_gl_entries(
                 debit, credit, debit_base, credit_base,
                 currency, exchange_rate,
                 voucher_type, voucher_id, entry_set, cost_center_id, project_id,
+                dimensions_json,
                 remarks, fiscal_year, is_cancelled, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, datetime('now'))
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, datetime('now'))
             """,
             (
                 reversal_id,
@@ -537,6 +551,7 @@ def reverse_gl_entries(
                 orig["entry_set"],  # preserve entry_set from original
                 orig["cost_center_id"],
                 orig["project_id"],
+                orig["dimensions_json"] if "dimensions_json" in orig.keys() else "{}",
                 f"Reversal of {orig['id']}",
                 orig["fiscal_year"],
             ),

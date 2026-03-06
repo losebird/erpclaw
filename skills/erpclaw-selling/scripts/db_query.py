@@ -36,6 +36,8 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
+    from erpclaw_lib.query import Q, P, Table, Field, fn, Case, Order, Criterion, Not, NULL, DecimalSum, DecimalAbs
+    from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
@@ -46,6 +48,36 @@ REQUIRED_TABLES = ["company", "account", "item"]
 VALID_CUSTOMER_TYPES = ("company", "individual")
 VALID_FREQUENCIES = ("weekly", "monthly", "quarterly", "semi_annually", "annually")
 
+# ---------------------------------------------------------------------------
+# PyPika table references
+# ---------------------------------------------------------------------------
+_t_company = Table("company")
+_t_customer = Table("customer")
+_t_account = Table("account")
+_t_cost_center = Table("cost_center")
+_t_fiscal_year = Table("fiscal_year")
+_t_warehouse = Table("warehouse")
+_t_item = Table("item")
+_t_quotation = Table("quotation")
+_t_quotation_item = Table("quotation_item")
+_t_sales_order = Table("sales_order")
+_t_sales_order_item = Table("sales_order_item")
+_t_delivery_note = Table("delivery_note")
+_t_delivery_note_item = Table("delivery_note_item")
+_t_sales_invoice = Table("sales_invoice")
+_t_sales_invoice_item = Table("sales_invoice_item")
+_t_sales_partner = Table("sales_partner")
+_t_recurring_template = Table("recurring_invoice_template")
+_t_recurring_template_item = Table("recurring_invoice_template_item")
+_t_payment_ledger = Table("payment_ledger_entry")
+_t_payment_terms = Table("payment_terms")
+_t_tax_template_line = Table("tax_template_line")
+_t_stock_ledger = Table("stock_ledger_entry")
+_t_pricing_rule = Table("pricing_rule")
+_t_ic_account_map = Table("intercompany_account_map")
+_t_purchase_invoice = Table("purchase_invoice")
+_t_purchase_invoice_item = Table("purchase_invoice_item")
+_t_supplier = Table("supplier")
 
 
 # ---------------------------------------------------------------------------
@@ -63,77 +95,90 @@ def _parse_json_arg(value, name):
 
 def _get_fiscal_year(conn, posting_date: str) -> str | None:
     """Return the fiscal year name for a posting date, or None."""
-    fy = conn.execute(
-        "SELECT name FROM fiscal_year WHERE start_date <= ? AND end_date >= ? AND is_closed = 0",
-        (posting_date, posting_date),
-    ).fetchone()
+    q = (Q.from_(_t_fiscal_year)
+         .select(_t_fiscal_year.name)
+         .where(_t_fiscal_year.start_date <= P())
+         .where(_t_fiscal_year.end_date >= P())
+         .where(_t_fiscal_year.is_closed == 0))
+    fy = conn.execute(q.get_sql(), (posting_date, posting_date)).fetchone()
     return fy["name"] if fy else None
 
 
 def _get_cost_center(conn, company_id: str) -> str | None:
     """Return the first non-group cost center for a company, or None."""
-    cc = conn.execute(
-        "SELECT id FROM cost_center WHERE company_id = ? AND is_group = 0 LIMIT 1",
-        (company_id,),
-    ).fetchone()
+    q = (Q.from_(_t_cost_center)
+         .select(_t_cost_center.id)
+         .where(_t_cost_center.company_id == P())
+         .where(_t_cost_center.is_group == 0)
+         .limit(1))
+    cc = conn.execute(q.get_sql(), (company_id,)).fetchone()
     return cc["id"] if cc else None
 
 
 def _get_receivable_account(conn, company_id: str) -> str | None:
     """Return the default receivable account for a company."""
-    company = conn.execute(
-        "SELECT default_receivable_account_id FROM company WHERE id = ?",
-        (company_id,),
-    ).fetchone()
+    q = (Q.from_(_t_company)
+         .select(_t_company.default_receivable_account_id)
+         .where(_t_company.id == P()))
+    company = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if company and company["default_receivable_account_id"]:
         return company["default_receivable_account_id"]
-    acct = conn.execute(
-        "SELECT id FROM account WHERE account_type = 'receivable' "
-        "AND company_id = ? AND is_group = 0 LIMIT 1",
-        (company_id,),
-    ).fetchone()
+    q2 = (Q.from_(_t_account)
+          .select(_t_account.id)
+          .where(_t_account.account_type == ValueWrapper("receivable"))
+          .where(_t_account.company_id == P())
+          .where(_t_account.is_group == 0)
+          .limit(1))
+    acct = conn.execute(q2.get_sql(), (company_id,)).fetchone()
     return acct["id"] if acct else None
 
 
 def _get_income_account(conn, company_id: str) -> str | None:
     """Return the default income account for a company."""
-    company = conn.execute(
-        "SELECT default_income_account_id FROM company WHERE id = ?",
-        (company_id,),
-    ).fetchone()
+    q = (Q.from_(_t_company)
+         .select(_t_company.default_income_account_id)
+         .where(_t_company.id == P()))
+    company = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if company and company["default_income_account_id"]:
         return company["default_income_account_id"]
-    acct = conn.execute(
-        "SELECT id FROM account WHERE root_type = 'income' "
-        "AND company_id = ? AND is_group = 0 LIMIT 1",
-        (company_id,),
-    ).fetchone()
+    q2 = (Q.from_(_t_account)
+          .select(_t_account.id)
+          .where(_t_account.root_type == ValueWrapper("income"))
+          .where(_t_account.company_id == P())
+          .where(_t_account.is_group == 0)
+          .limit(1))
+    acct = conn.execute(q2.get_sql(), (company_id,)).fetchone()
     return acct["id"] if acct else None
 
 
 def _get_cogs_account(conn, company_id: str) -> str | None:
     """Return the COGS account for a company."""
-    acct = conn.execute(
-        "SELECT id FROM account WHERE account_type = 'cost_of_goods_sold' "
-        "AND company_id = ? AND is_group = 0 LIMIT 1",
-        (company_id,),
-    ).fetchone()
+    q = (Q.from_(_t_account)
+         .select(_t_account.id)
+         .where(_t_account.account_type == ValueWrapper("cost_of_goods_sold"))
+         .where(_t_account.company_id == P())
+         .where(_t_account.is_group == 0)
+         .limit(1))
+    acct = conn.execute(q.get_sql(), (company_id,)).fetchone()
     return acct["id"] if acct else None
 
 
 def _get_stock_in_hand_account(conn, company_id: str, warehouse_id: str = None) -> str | None:
     """Return the stock-in-hand account for a warehouse or company default."""
     if warehouse_id:
-        wh = conn.execute(
-            "SELECT account_id FROM warehouse WHERE id = ?", (warehouse_id,)
-        ).fetchone()
+        q = (Q.from_(_t_warehouse)
+             .select(_t_warehouse.account_id)
+             .where(_t_warehouse.id == P()))
+        wh = conn.execute(q.get_sql(), (warehouse_id,)).fetchone()
         if wh and wh["account_id"]:
             return wh["account_id"]
-    acct = conn.execute(
-        "SELECT id FROM account WHERE account_type = 'stock' "
-        "AND company_id = ? AND is_group = 0 LIMIT 1",
-        (company_id,),
-    ).fetchone()
+    q2 = (Q.from_(_t_account)
+          .select(_t_account.id)
+          .where(_t_account.account_type == ValueWrapper("stock"))
+          .where(_t_account.company_id == P())
+          .where(_t_account.is_group == 0)
+          .limit(1))
+    acct = conn.execute(q2.get_sql(), (company_id,)).fetchone()
     return acct["id"] if acct else None
 
 
@@ -146,14 +191,14 @@ def _calculate_tax(conn, subtotal: Decimal, tax_template_id: str) -> tuple:
     if not tax_template_id:
         return Decimal("0"), []
 
-    lines = conn.execute(
-        """SELECT ttl.*, a.name as account_name
-           FROM tax_template_line ttl
-           LEFT JOIN account a ON a.id = ttl.tax_account_id
-           WHERE ttl.tax_template_id = ?
-           ORDER BY ttl.row_order""",
-        (tax_template_id,),
-    ).fetchall()
+    ttl = _t_tax_template_line.as_("ttl")
+    a = _t_account.as_("a")
+    q = (Q.from_(ttl)
+         .left_join(a).on(a.id == ttl.tax_account_id)
+         .select(ttl.star, a.name.as_("account_name"))
+         .where(ttl.tax_template_id == P())
+         .orderby(ttl.row_order))
+    lines = conn.execute(q.get_sql(), (tax_template_id,)).fetchall()
 
     total_tax = Decimal("0")
     tax_lines = []
@@ -197,6 +242,7 @@ def _apply_pricing_rule(conn, item_id: str, customer_id: str,
                         qty: Decimal, posting_date: str,
                         company_id: str) -> dict | None:
     """Find and return the best applicable pricing rule for an item."""
+    # raw SQL — complex OR conditions, NULL+arithmetic comparisons, COALESCE+arithmetic ORDER BY
     row = conn.execute(
         """SELECT * FROM pricing_rule
            WHERE active = 1 AND company_id = ?
@@ -236,8 +282,10 @@ def _calculate_line_items(conn, items_json, company_id: str,
         if not item_id:
             err(f"Item {i}: item_id is required")
 
-        item_row = conn.execute("SELECT id, item_name, stock_uom FROM item WHERE id = ?",
-                                (item_id,)).fetchone()
+        q = (Q.from_(_t_item)
+             .select(_t_item.id, _t_item.item_name, _t_item.stock_uom)
+             .where(_t_item.id == P()))
+        item_row = conn.execute(q.get_sql(), (item_id,)).fetchone()
         if not item_row:
             err(f"Item {i}: item {item_id} not found")
 
@@ -327,8 +375,8 @@ def add_customer(conn, args):
     if not args.company_id:
         err("--company-id is required")
 
-    if not conn.execute("SELECT id FROM company WHERE id = ?",
-                        (args.company_id,)).fetchone():
+    q = Q.from_(_t_company).select(_t_company.id).where(_t_company.id == P())
+    if not conn.execute(q.get_sql(), (args.company_id,)).fetchone():
         err(f"Company {args.company_id} not found")
 
     customer_type = args.customer_type or "company"
@@ -336,8 +384,8 @@ def add_customer(conn, args):
         err(f"--customer-type must be one of: {', '.join(VALID_CUSTOMER_TYPES)}")
 
     if args.payment_terms_id:
-        if not conn.execute("SELECT id FROM payment_terms WHERE id = ?",
-                            (args.payment_terms_id,)).fetchone():
+        q = Q.from_(_t_payment_terms).select(_t_payment_terms.id).where(_t_payment_terms.id == P())
+        if not conn.execute(q.get_sql(), (args.payment_terms_id,)).fetchone():
             err(f"Payment terms {args.payment_terms_id} not found")
 
     credit_limit = str(round_currency(to_decimal(args.credit_limit or "0")))
@@ -348,12 +396,14 @@ def add_customer(conn, args):
 
     cust_id = str(uuid.uuid4())
     try:
-        conn.execute(
-            """INSERT INTO customer
-               (id, name, customer_type, customer_group, payment_terms_id,
-                credit_limit, tax_id, exempt_from_sales_tax,
-                primary_address, primary_contact, status, company_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
+        q = (Q.into(_t_customer)
+             .columns("id", "name", "customer_type", "customer_group",
+                       "payment_terms_id", "credit_limit", "tax_id",
+                       "exempt_from_sales_tax", "primary_address",
+                       "primary_contact", "status", "company_id")
+             .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(),
+                     ValueWrapper("active"), P()))
+        conn.execute(q.get_sql(),
             (cust_id, args.name, customer_type, args.customer_group,
              args.payment_terms_id, credit_limit, args.tax_id, exempt,
              primary_address, primary_contact, args.company_id),
@@ -378,13 +428,17 @@ def update_customer(conn, args):
     if not args.customer_id:
         err("--customer-id is required")
 
-    cust = conn.execute("SELECT * FROM customer WHERE id = ? OR name = ?",
+    q = (Q.from_(_t_customer)
+         .select(_t_customer.star)
+         .where((_t_customer.id == P()) | (_t_customer.name == P())))
+    cust = conn.execute(q.get_sql(),
                         (args.customer_id, args.customer_id)).fetchone()
     if not cust:
         err(f"Customer {args.customer_id} not found",
              suggestion="Use 'list customers' to see available customers.")
     args.customer_id = cust["id"]  # normalize to id
 
+    # raw SQL — dynamic column building at runtime
     updates, params, updated_fields = [], [], []
 
     if args.name is not None:
@@ -432,7 +486,10 @@ def get_customer(conn, args):
     if not args.customer_id:
         err("--customer-id is required")
 
-    cust = conn.execute("SELECT * FROM customer WHERE id = ? OR name = ?",
+    q = (Q.from_(_t_customer)
+         .select(_t_customer.star)
+         .where((_t_customer.id == P()) | (_t_customer.name == P())))
+    cust = conn.execute(q.get_sql(),
                         (args.customer_id, args.customer_id)).fetchone()
     if not cust:
         err(f"Customer {args.customer_id} not found",
@@ -441,6 +498,7 @@ def get_customer(conn, args):
     data = row_to_dict(cust)
 
     # Outstanding summary from sales invoices
+    # raw SQL — decimal_sum with COALESCE and arithmetic comparison on TEXT column
     outstanding_row = conn.execute(
         """SELECT COALESCE(decimal_sum(outstanding_amount), '0') as total_outstanding,
                   COUNT(*) as invoice_count
@@ -463,38 +521,40 @@ def get_customer(conn, args):
 
 def list_customers(conn, args):
     """Query customers with filtering."""
-    conditions = ["1=1"]
+    c = _t_customer.as_("c")
     params = []
 
+    base = Q.from_(c)
+    crit = None
+
     if args.company_id:
-        conditions.append("c.company_id = ?")
+        crit = Criterion.all([crit, c.company_id == P()]) if crit else (c.company_id == P())
         params.append(args.company_id)
     if args.customer_group:
-        conditions.append("c.customer_group = ?")
+        cond = c.customer_group == P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.customer_group)
     if args.search:
-        conditions.append("(c.name LIKE ? OR c.tax_id LIKE ?)")
+        cond = (c.name.like(P()) | c.tax_id.like(P()))
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.extend([f"%{args.search}%", f"%{args.search}%"])
 
-    where = " AND ".join(conditions)
-
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM customer c WHERE {where}", params
-    ).fetchone()
+    count_q = base.select(fn.Count("*"))
+    if crit:
+        count_q = count_q.where(crit)
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"""SELECT c.id, c.name, c.customer_type, c.customer_group,
-               c.credit_limit, c.status, c.company_id
-           FROM customer c WHERE {where}
-           ORDER BY c.name
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    list_q = (base.select(c.id, c.name, c.customer_type, c.customer_group,
+                           c.credit_limit, c.status, c.company_id)
+              .orderby(c.name)
+              .limit(P()).offset(P()))
+    if crit:
+        list_q = list_q.where(crit)
+    rows = conn.execute(list_q.get_sql(), params + [limit, offset]).fetchall()
 
     ok({"customers": [row_to_dict(r) for r in rows], "total_count": total_count,
          "limit": limit, "offset": offset, "has_more": offset + limit < total_count})
@@ -515,14 +575,16 @@ def add_quotation(conn, args):
     if not args.company_id:
         err("--company-id is required")
 
-    cust_row = conn.execute(
-        "SELECT id FROM customer WHERE (id = ? OR name = ?) AND status = 'active'",
+    q = (Q.from_(_t_customer).select(_t_customer.id)
+         .where((_t_customer.id == P()) | (_t_customer.name == P()))
+         .where(_t_customer.status == ValueWrapper("active")))
+    cust_row = conn.execute(q.get_sql(),
         (args.customer_id, args.customer_id)).fetchone()
     if not cust_row:
         err(f"Active customer {args.customer_id} not found")
     args.customer_id = cust_row["id"]  # normalize to id
-    if not conn.execute("SELECT id FROM company WHERE id = ?",
-                        (args.company_id,)).fetchone():
+    q2 = Q.from_(_t_company).select(_t_company.id).where(_t_company.id == P())
+    if not conn.execute(q2.get_sql(), (args.company_id,)).fetchone():
         err(f"Company {args.company_id} not found")
 
     items = _parse_json_arg(args.items, "items")
@@ -535,23 +597,27 @@ def add_quotation(conn, args):
     q_id = str(uuid.uuid4())
 
     # Insert parent quotation first
-    conn.execute(
-        """INSERT INTO quotation
-           (id, customer_id, quotation_date, valid_until, total_amount,
-            tax_amount, grand_total, tax_template_id, status, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)""",
+    qi = (Q.into(_t_quotation)
+          .columns("id", "customer_id", "quotation_date", "valid_until",
+                    "total_amount", "tax_amount", "grand_total",
+                    "tax_template_id", "status", "company_id")
+          .insert(P(), P(), P(), P(), P(), P(), P(), P(),
+                  ValueWrapper("draft"), P()))
+    conn.execute(qi.get_sql(),
         (q_id, args.customer_id, args.posting_date, args.valid_till,
          str(total_amount), str(tax_amount), str(grand_total),
          args.tax_template_id, args.company_id),
     )
 
     # Insert child quotation_item rows
+    qi_item = (Q.into(_t_quotation_item)
+               .columns("id", "quotation_id", "item_id", "quantity", "uom",
+                         "rate", "amount", "discount_percentage",
+                         "net_amount", "description")
+               .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+    qi_item_sql = qi_item.get_sql()
     for row in item_rows:
-        conn.execute(
-            """INSERT INTO quotation_item
-               (id, quotation_id, item_id, quantity, uom, rate, amount,
-                discount_percentage, net_amount, description)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        conn.execute(qi_item_sql,
             (str(uuid.uuid4()), q_id, row["item_id"], row["qty"],
              row["uom"], row["rate"], row["amount"],
              row["discount_percentage"], row["net_amount"],
@@ -574,8 +640,9 @@ def update_quotation(conn, args):
     if not args.quotation_id:
         err("--quotation-id is required")
 
-    q = conn.execute("SELECT * FROM quotation WHERE id = ?",
-                     (args.quotation_id,)).fetchone()
+    qq = (Q.from_(_t_quotation).select(_t_quotation.star)
+          .where(_t_quotation.id == P()))
+    q = conn.execute(qq.get_sql(), (args.quotation_id,)).fetchone()
     if not q:
         err(f"Quotation {args.quotation_id} not found")
     if q["status"] != "draft":
@@ -585,8 +652,11 @@ def update_quotation(conn, args):
     updated_fields = []
 
     if args.valid_till is not None:
-        conn.execute("UPDATE quotation SET valid_until = ?, updated_at = datetime('now') WHERE id = ?",
-                     (args.valid_till, args.quotation_id))
+        uq = (Q.update(_t_quotation)
+              .set("valid_until", P())
+              .set("updated_at", LiteralValue("datetime('now')"))
+              .where(_t_quotation.id == P()))
+        conn.execute(uq.get_sql(), (args.valid_till, args.quotation_id))
         updated_fields.append("valid_until")
 
     if args.items:
@@ -598,23 +668,29 @@ def update_quotation(conn, args):
         grand_total = round_currency(total_amount + tax_amount)
 
         # Delete old items, insert new
-        conn.execute("DELETE FROM quotation_item WHERE quotation_id = ?",
-                     (args.quotation_id,))
+        dq = Q.from_(_t_quotation_item).delete().where(_t_quotation_item.quotation_id == P())
+        conn.execute(dq.get_sql(), (args.quotation_id,))
+        qi_item = (Q.into(_t_quotation_item)
+                   .columns("id", "quotation_id", "item_id", "quantity", "uom",
+                             "rate", "amount", "discount_percentage",
+                             "net_amount", "description")
+                   .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+        qi_item_sql = qi_item.get_sql()
         for row in item_rows:
-            conn.execute(
-                """INSERT INTO quotation_item
-                   (id, quotation_id, item_id, quantity, uom, rate, amount,
-                    discount_percentage, net_amount, description)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            conn.execute(qi_item_sql,
                 (str(uuid.uuid4()), args.quotation_id, row["item_id"],
                  row["qty"], row["uom"], row["rate"], row["amount"],
                  row["discount_percentage"], row["net_amount"],
                  row["description"]),
             )
 
-        conn.execute(
-            """UPDATE quotation SET total_amount = ?, tax_amount = ?,
-               grand_total = ?, updated_at = datetime('now') WHERE id = ?""",
+        uq2 = (Q.update(_t_quotation)
+               .set("total_amount", P())
+               .set("tax_amount", P())
+               .set("grand_total", P())
+               .set("updated_at", LiteralValue("datetime('now')"))
+               .where(_t_quotation.id == P()))
+        conn.execute(uq2.get_sql(),
             (str(total_amount), str(tax_amount), str(grand_total),
              args.quotation_id),
         )
@@ -638,20 +714,21 @@ def get_quotation(conn, args):
     if not args.quotation_id:
         err("--quotation-id is required")
 
-    q = conn.execute("SELECT * FROM quotation WHERE id = ?",
-                     (args.quotation_id,)).fetchone()
+    qq = (Q.from_(_t_quotation).select(_t_quotation.star)
+          .where(_t_quotation.id == P()))
+    q = conn.execute(qq.get_sql(), (args.quotation_id,)).fetchone()
     if not q:
         err(f"Quotation {args.quotation_id} not found")
 
     data = row_to_dict(q)
-    items = conn.execute(
-        """SELECT qi.*, i.item_name
-           FROM quotation_item qi
-           LEFT JOIN item i ON i.id = qi.item_id
-           WHERE qi.quotation_id = ?
-           ORDER BY qi.rowid""",
-        (args.quotation_id,),
-    ).fetchall()
+    qi = _t_quotation_item.as_("qi")
+    i = _t_item.as_("i")
+    items_q = (Q.from_(qi)
+               .left_join(i).on(i.id == qi.item_id)
+               .select(qi.star, i.item_name)
+               .where(qi.quotation_id == P())
+               .orderby(qi.rowid))
+    items = conn.execute(items_q.get_sql(), (args.quotation_id,)).fetchall()
     data["items"] = [row_to_dict(r) for r in items]
     ok(data)
 
@@ -662,44 +739,48 @@ def get_quotation(conn, args):
 
 def list_quotations(conn, args):
     """Query quotations with filtering."""
-    conditions = ["1=1"]
+    q = _t_quotation.as_("q")
     params = []
+    crit = None
 
     if args.company_id:
-        conditions.append("q.company_id = ?")
+        crit = (q.company_id == P())
         params.append(args.company_id)
     if args.customer_id:
-        conditions.append("q.customer_id = ?")
+        cond = q.customer_id == P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.customer_id)
     if args.doc_status:
-        conditions.append("q.status = ?")
+        cond = q.status == P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.doc_status)
     if args.from_date:
-        conditions.append("q.quotation_date >= ?")
+        cond = q.quotation_date >= P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.from_date)
     if args.to_date:
-        conditions.append("q.quotation_date <= ?")
+        cond = q.quotation_date <= P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.to_date)
 
-    where = " AND ".join(conditions)
-
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM quotation q WHERE {where}", params
-    ).fetchone()
+    count_q = Q.from_(q).select(fn.Count("*"))
+    if crit:
+        count_q = count_q.where(crit)
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"""SELECT q.id, q.naming_series, q.customer_id, q.quotation_date,
-               q.grand_total, q.status, q.company_id
-           FROM quotation q WHERE {where}
-           ORDER BY q.quotation_date DESC, q.created_at DESC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    list_q = (Q.from_(q)
+              .select(q.id, q.naming_series, q.customer_id, q.quotation_date,
+                      q.grand_total, q.status, q.company_id)
+              .orderby(q.quotation_date, order=Order.desc)
+              .orderby(q.created_at, order=Order.desc)
+              .limit(P()).offset(P()))
+    if crit:
+        list_q = list_q.where(crit)
+    rows = conn.execute(list_q.get_sql(), params + [limit, offset]).fetchall()
 
     ok({"quotations": [row_to_dict(r) for r in rows], "total_count": total_count,
          "limit": limit, "offset": offset, "has_more": offset + limit < total_count})
@@ -714,8 +795,9 @@ def submit_quotation(conn, args):
     if not args.quotation_id:
         err("--quotation-id is required")
 
-    q = conn.execute("SELECT * FROM quotation WHERE id = ?",
-                     (args.quotation_id,)).fetchone()
+    qq = (Q.from_(_t_quotation).select(_t_quotation.star)
+          .where(_t_quotation.id == P()))
+    q = conn.execute(qq.get_sql(), (args.quotation_id,)).fetchone()
     if not q:
         err(f"Quotation {args.quotation_id} not found")
     if q["status"] != "draft":
@@ -724,11 +806,12 @@ def submit_quotation(conn, args):
     # Generate naming series
     naming = get_next_name(conn, "quotation", company_id=q["company_id"])
 
-    conn.execute(
-        """UPDATE quotation SET status = 'open', naming_series = ?,
-           updated_at = datetime('now') WHERE id = ?""",
-        (naming, args.quotation_id),
-    )
+    uq = (Q.update(_t_quotation)
+          .set("status", ValueWrapper("open"))
+          .set("naming_series", P())
+          .set("updated_at", LiteralValue("datetime('now')"))
+          .where(_t_quotation.id == P()))
+    conn.execute(uq.get_sql(), (naming, args.quotation_id))
 
     audit(conn, "erpclaw-selling", "submit-quotation", "quotation", args.quotation_id,
            new_values={"status": "open", "naming_series": naming})
@@ -746,8 +829,9 @@ def convert_quotation_to_so(conn, args):
     if not args.quotation_id:
         err("--quotation-id is required")
 
-    q = conn.execute("SELECT * FROM quotation WHERE id = ?",
-                     (args.quotation_id,)).fetchone()
+    qq = (Q.from_(_t_quotation).select(_t_quotation.star)
+          .where(_t_quotation.id == P()))
+    q = conn.execute(qq.get_sql(), (args.quotation_id,)).fetchone()
     if not q:
         err(f"Quotation {args.quotation_id} not found")
     if q["status"] not in ("open", "draft"):
@@ -756,10 +840,10 @@ def convert_quotation_to_so(conn, args):
     q_dict = row_to_dict(q)
 
     # Fetch quotation items
-    q_items = conn.execute(
-        "SELECT * FROM quotation_item WHERE quotation_id = ? ORDER BY rowid",
-        (args.quotation_id,),
-    ).fetchall()
+    qi_q = (Q.from_(_t_quotation_item).select(_t_quotation_item.star)
+            .where(_t_quotation_item.quotation_id == P())
+            .orderby(_t_quotation_item.rowid))
+    q_items = conn.execute(qi_q.get_sql(), (args.quotation_id,)).fetchall()
     if not q_items:
         err("Quotation has no items")
 
@@ -767,12 +851,14 @@ def convert_quotation_to_so(conn, args):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # Insert parent sales_order first
-    conn.execute(
-        """INSERT INTO sales_order
-           (id, customer_id, order_date, delivery_date, currency, exchange_rate,
-            total_amount, tax_amount, grand_total, tax_template_id,
-            payment_terms_id, status, quotation_id, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)""",
+    so_ins = (Q.into(_t_sales_order)
+              .columns("id", "customer_id", "order_date", "delivery_date",
+                        "currency", "exchange_rate", "total_amount",
+                        "tax_amount", "grand_total", "tax_template_id",
+                        "payment_terms_id", "status", "quotation_id", "company_id")
+              .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(),
+                      ValueWrapper("draft"), P(), P()))
+    conn.execute(so_ins.get_sql(),
         (so_id, q_dict["customer_id"], today, args.delivery_date,
          q_dict["currency"], q_dict["exchange_rate"],
          q_dict["total_amount"], q_dict["tax_amount"], q_dict["grand_total"],
@@ -781,13 +867,15 @@ def convert_quotation_to_so(conn, args):
     )
 
     # Insert child sales_order_item rows from quotation items
+    soi_ins = (Q.into(_t_sales_order_item)
+               .columns("id", "sales_order_id", "item_id", "quantity", "uom",
+                         "rate", "amount", "discount_percentage",
+                         "net_amount", "warehouse_id")
+               .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+    soi_ins_sql = soi_ins.get_sql()
     for qi in q_items:
         qi_dict = row_to_dict(qi)
-        conn.execute(
-            """INSERT INTO sales_order_item
-               (id, sales_order_id, item_id, quantity, uom, rate, amount,
-                discount_percentage, net_amount, warehouse_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        conn.execute(soi_ins_sql,
             (str(uuid.uuid4()), so_id, qi_dict["item_id"],
              qi_dict["quantity"], qi_dict["uom"], qi_dict["rate"],
              qi_dict["amount"], qi_dict["discount_percentage"],
@@ -795,11 +883,12 @@ def convert_quotation_to_so(conn, args):
         )
 
     # Update quotation status to ordered
-    conn.execute(
-        """UPDATE quotation SET status = 'ordered', converted_to = ?,
-           updated_at = datetime('now') WHERE id = ?""",
-        (so_id, args.quotation_id),
-    )
+    uq = (Q.update(_t_quotation)
+          .set("status", ValueWrapper("ordered"))
+          .set("converted_to", P())
+          .set("updated_at", LiteralValue("datetime('now')"))
+          .where(_t_quotation.id == P()))
+    conn.execute(uq.get_sql(), (so_id, args.quotation_id))
 
     audit(conn, "erpclaw-selling", "convert-quotation-to-so", "quotation", args.quotation_id,
            new_values={"sales_order_id": so_id})
@@ -823,13 +912,16 @@ def add_sales_order(conn, args):
     if not args.company_id:
         err("--company-id is required")
 
-    cust = conn.execute("SELECT * FROM customer WHERE (id = ? OR name = ?) AND status = 'active'",
+    cq = (Q.from_(_t_customer).select(_t_customer.star)
+          .where((_t_customer.id == P()) | (_t_customer.name == P()))
+          .where(_t_customer.status == ValueWrapper("active")))
+    cust = conn.execute(cq.get_sql(),
                         (args.customer_id, args.customer_id)).fetchone()
     if not cust:
         err(f"Active customer {args.customer_id} not found")
     args.customer_id = cust["id"]  # normalize to id
-    if not conn.execute("SELECT id FROM company WHERE id = ?",
-                        (args.company_id,)).fetchone():
+    cq2 = Q.from_(_t_company).select(_t_company.id).where(_t_company.id == P())
+    if not conn.execute(cq2.get_sql(), (args.company_id,)).fetchone():
         err(f"Company {args.company_id} not found")
 
     items = _parse_json_arg(args.items, "items")
@@ -843,23 +935,27 @@ def add_sales_order(conn, args):
     so_id = str(uuid.uuid4())
 
     # Insert parent sales_order first
-    conn.execute(
-        """INSERT INTO sales_order
-           (id, customer_id, order_date, delivery_date, total_amount,
-            tax_amount, grand_total, tax_template_id, status, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)""",
+    so_ins = (Q.into(_t_sales_order)
+              .columns("id", "customer_id", "order_date", "delivery_date",
+                        "total_amount", "tax_amount", "grand_total",
+                        "tax_template_id", "status", "company_id")
+              .insert(P(), P(), P(), P(), P(), P(), P(), P(),
+                      ValueWrapper("draft"), P()))
+    conn.execute(so_ins.get_sql(),
         (so_id, args.customer_id, args.posting_date, args.delivery_date,
          str(total_amount), str(tax_amount), str(grand_total),
          args.tax_template_id, args.company_id),
     )
 
     # Insert child sales_order_item rows
+    soi_ins = (Q.into(_t_sales_order_item)
+               .columns("id", "sales_order_id", "item_id", "quantity", "uom",
+                         "rate", "amount", "discount_percentage",
+                         "net_amount", "warehouse_id")
+               .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+    soi_ins_sql = soi_ins.get_sql()
     for row in item_rows:
-        conn.execute(
-            """INSERT INTO sales_order_item
-               (id, sales_order_id, item_id, quantity, uom, rate, amount,
-                discount_percentage, net_amount, warehouse_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        conn.execute(soi_ins_sql,
             (str(uuid.uuid4()), so_id, row["item_id"], row["qty"],
              row["uom"], row["rate"], row["amount"],
              row["discount_percentage"], row["net_amount"],
@@ -882,8 +978,9 @@ def update_sales_order(conn, args):
     if not args.sales_order_id:
         err("--sales-order-id is required")
 
-    so = conn.execute("SELECT * FROM sales_order WHERE id = ?",
-                      (args.sales_order_id,)).fetchone()
+    soq = (Q.from_(_t_sales_order).select(_t_sales_order.star)
+           .where(_t_sales_order.id == P()))
+    so = conn.execute(soq.get_sql(), (args.sales_order_id,)).fetchone()
     if not so:
         err(f"Sales order {args.sales_order_id} not found")
     if so["status"] != "draft":
@@ -893,9 +990,11 @@ def update_sales_order(conn, args):
     updated_fields = []
 
     if args.delivery_date is not None:
-        conn.execute(
-            "UPDATE sales_order SET delivery_date = ?, updated_at = datetime('now') WHERE id = ?",
-            (args.delivery_date, args.sales_order_id))
+        uq = (Q.update(_t_sales_order)
+              .set("delivery_date", P())
+              .set("updated_at", LiteralValue("datetime('now')"))
+              .where(_t_sales_order.id == P()))
+        conn.execute(uq.get_sql(), (args.delivery_date, args.sales_order_id))
         updated_fields.append("delivery_date")
 
     if args.items:
@@ -908,23 +1007,29 @@ def update_sales_order(conn, args):
         grand_total = round_currency(total_amount + tax_amount)
 
         # Delete old items, insert new
-        conn.execute("DELETE FROM sales_order_item WHERE sales_order_id = ?",
-                     (args.sales_order_id,))
+        dq = Q.from_(_t_sales_order_item).delete().where(_t_sales_order_item.sales_order_id == P())
+        conn.execute(dq.get_sql(), (args.sales_order_id,))
+        soi_ins = (Q.into(_t_sales_order_item)
+                   .columns("id", "sales_order_id", "item_id", "quantity", "uom",
+                             "rate", "amount", "discount_percentage",
+                             "net_amount", "warehouse_id")
+                   .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+        soi_ins_sql = soi_ins.get_sql()
         for row in item_rows:
-            conn.execute(
-                """INSERT INTO sales_order_item
-                   (id, sales_order_id, item_id, quantity, uom, rate, amount,
-                    discount_percentage, net_amount, warehouse_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            conn.execute(soi_ins_sql,
                 (str(uuid.uuid4()), args.sales_order_id, row["item_id"],
                  row["qty"], row["uom"], row["rate"], row["amount"],
                  row["discount_percentage"], row["net_amount"],
                  row["warehouse_id"]),
             )
 
-        conn.execute(
-            """UPDATE sales_order SET total_amount = ?, tax_amount = ?,
-               grand_total = ?, updated_at = datetime('now') WHERE id = ?""",
+        uq2 = (Q.update(_t_sales_order)
+               .set("total_amount", P())
+               .set("tax_amount", P())
+               .set("grand_total", P())
+               .set("updated_at", LiteralValue("datetime('now')"))
+               .where(_t_sales_order.id == P()))
+        conn.execute(uq2.get_sql(),
             (str(total_amount), str(tax_amount), str(grand_total),
              args.sales_order_id),
         )
@@ -948,37 +1053,41 @@ def get_sales_order(conn, args):
     if not args.sales_order_id:
         err("--sales-order-id is required")
 
-    so = conn.execute("SELECT * FROM sales_order WHERE id = ?",
-                      (args.sales_order_id,)).fetchone()
+    soq = (Q.from_(_t_sales_order).select(_t_sales_order.star)
+           .where(_t_sales_order.id == P()))
+    so = conn.execute(soq.get_sql(), (args.sales_order_id,)).fetchone()
     if not so:
         err(f"Sales order {args.sales_order_id} not found")
 
     data = row_to_dict(so)
 
-    items = conn.execute(
-        """SELECT soi.*, i.item_name, i.item_code
-           FROM sales_order_item soi
-           LEFT JOIN item i ON i.id = soi.item_id
-           WHERE soi.sales_order_id = ?
-           ORDER BY soi.rowid""",
-        (args.sales_order_id,),
-    ).fetchall()
+    soi = _t_sales_order_item.as_("soi")
+    i = _t_item.as_("i")
+    items_q = (Q.from_(soi)
+               .left_join(i).on(i.id == soi.item_id)
+               .select(soi.star, i.item_name, i.item_code)
+               .where(soi.sales_order_id == P())
+               .orderby(soi.rowid))
+    items = conn.execute(items_q.get_sql(), (args.sales_order_id,)).fetchall()
     data["items"] = [row_to_dict(r) for r in items]
 
     # Delivery note summary
-    dn_rows = conn.execute(
-        """SELECT id, naming_series, status, posting_date
-           FROM delivery_note WHERE sales_order_id = ? AND status != 'cancelled'""",
-        (args.sales_order_id,),
-    ).fetchall()
+    dnq = (Q.from_(_t_delivery_note)
+           .select(_t_delivery_note.id, _t_delivery_note.naming_series,
+                   _t_delivery_note.status, _t_delivery_note.posting_date)
+           .where(_t_delivery_note.sales_order_id == P())
+           .where(_t_delivery_note.status != ValueWrapper("cancelled")))
+    dn_rows = conn.execute(dnq.get_sql(), (args.sales_order_id,)).fetchall()
     data["delivery_notes"] = [row_to_dict(r) for r in dn_rows]
 
     # Invoice summary
-    si_rows = conn.execute(
-        """SELECT id, naming_series, status, posting_date, grand_total, outstanding_amount
-           FROM sales_invoice WHERE sales_order_id = ? AND status != 'cancelled'""",
-        (args.sales_order_id,),
-    ).fetchall()
+    siq = (Q.from_(_t_sales_invoice)
+           .select(_t_sales_invoice.id, _t_sales_invoice.naming_series,
+                   _t_sales_invoice.status, _t_sales_invoice.posting_date,
+                   _t_sales_invoice.grand_total, _t_sales_invoice.outstanding_amount)
+           .where(_t_sales_invoice.sales_order_id == P())
+           .where(_t_sales_invoice.status != ValueWrapper("cancelled")))
+    si_rows = conn.execute(siq.get_sql(), (args.sales_order_id,)).fetchall()
     data["sales_invoices"] = [row_to_dict(r) for r in si_rows]
 
     ok(data)
@@ -990,45 +1099,49 @@ def get_sales_order(conn, args):
 
 def list_sales_orders(conn, args):
     """Query sales orders with filtering."""
-    conditions = ["1=1"]
+    so = _t_sales_order.as_("so")
     params = []
+    crit = None
 
     if args.company_id:
-        conditions.append("so.company_id = ?")
+        crit = (so.company_id == P())
         params.append(args.company_id)
     if args.customer_id:
-        conditions.append("so.customer_id = ?")
+        cond = so.customer_id == P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.customer_id)
     if args.doc_status:
-        conditions.append("so.status = ?")
+        cond = so.status == P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.doc_status)
     if args.from_date:
-        conditions.append("so.order_date >= ?")
+        cond = so.order_date >= P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.from_date)
     if args.to_date:
-        conditions.append("so.order_date <= ?")
+        cond = so.order_date <= P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.to_date)
 
-    where = " AND ".join(conditions)
-
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM sales_order so WHERE {where}", params
-    ).fetchone()
+    count_q = Q.from_(so).select(fn.Count("*"))
+    if crit:
+        count_q = count_q.where(crit)
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"""SELECT so.id, so.naming_series, so.customer_id, so.order_date,
-               so.delivery_date, so.grand_total, so.status, so.per_delivered,
-               so.per_invoiced, so.company_id
-           FROM sales_order so WHERE {where}
-           ORDER BY so.order_date DESC, so.created_at DESC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    list_q = (Q.from_(so)
+              .select(so.id, so.naming_series, so.customer_id, so.order_date,
+                      so.delivery_date, so.grand_total, so.status,
+                      so.per_delivered, so.per_invoiced, so.company_id)
+              .orderby(so.order_date, order=Order.desc)
+              .orderby(so.created_at, order=Order.desc)
+              .limit(P()).offset(P()))
+    if crit:
+        list_q = list_q.where(crit)
+    rows = conn.execute(list_q.get_sql(), params + [limit, offset]).fetchall()
 
     ok({"sales_orders": [row_to_dict(r) for r in rows], "total_count": total_count,
          "limit": limit, "offset": offset, "has_more": offset + limit < total_count})
@@ -1043,8 +1156,9 @@ def submit_sales_order(conn, args):
     if not args.sales_order_id:
         err("--sales-order-id is required")
 
-    so = conn.execute("SELECT * FROM sales_order WHERE id = ?",
-                      (args.sales_order_id,)).fetchone()
+    soq = (Q.from_(_t_sales_order).select(_t_sales_order.star)
+           .where(_t_sales_order.id == P()))
+    so = conn.execute(soq.get_sql(), (args.sales_order_id,)).fetchone()
     if not so:
         err(f"Sales order {args.sales_order_id} not found")
     if so["status"] != "draft":
@@ -1056,18 +1170,18 @@ def submit_sales_order(conn, args):
     this_grand_total = to_decimal(so_dict["grand_total"])
 
     # Verify customer is active
-    cust = conn.execute("SELECT * FROM customer WHERE id = ?",
-                        (customer_id,)).fetchone()
+    cq = (Q.from_(_t_customer).select(_t_customer.star)
+          .where(_t_customer.id == P()))
+    cust = conn.execute(cq.get_sql(), (customer_id,)).fetchone()
     if not cust:
         err(f"Customer {customer_id} not found")
     if cust["status"] != "active":
         err(f"Customer is '{cust['status']}', cannot confirm order")
 
     # Verify items have qty > 0 and rate > 0
-    so_items = conn.execute(
-        "SELECT * FROM sales_order_item WHERE sales_order_id = ?",
-        (args.sales_order_id,),
-    ).fetchall()
+    soiq = (Q.from_(_t_sales_order_item).select(_t_sales_order_item.star)
+            .where(_t_sales_order_item.sales_order_id == P()))
+    so_items = conn.execute(soiq.get_sql(), (args.sales_order_id,)).fetchall()
     if not so_items:
         err("Sales order has no items")
     for item in so_items:
@@ -1079,7 +1193,7 @@ def submit_sales_order(conn, args):
     # Credit limit check
     credit_limit = to_decimal(cust["credit_limit"] or "0")
     if credit_limit > 0:
-        # Outstanding invoices
+        # raw SQL — decimal_sum with COALESCE and IN clause with arithmetic comparison
         outstanding_row = conn.execute(
             """SELECT COALESCE(decimal_sum(outstanding_amount), '0') as total
                FROM sales_invoice
@@ -1089,7 +1203,7 @@ def submit_sales_order(conn, args):
         ).fetchone()
         outstanding = to_decimal(str(outstanding_row["total"]))
 
-        # Unbilled confirmed orders (excluding this one)
+        # raw SQL — decimal_sum with COALESCE
         unbilled_row = conn.execute(
             """SELECT COALESCE(decimal_sum(grand_total), '0') as total
                FROM sales_order
@@ -1112,11 +1226,12 @@ def submit_sales_order(conn, args):
     # Generate naming series
     naming = get_next_name(conn, "sales_order", company_id=company_id)
 
-    conn.execute(
-        """UPDATE sales_order SET status = 'confirmed', naming_series = ?,
-           updated_at = datetime('now') WHERE id = ?""",
-        (naming, args.sales_order_id),
-    )
+    uq = (Q.update(_t_sales_order)
+          .set("status", ValueWrapper("confirmed"))
+          .set("naming_series", P())
+          .set("updated_at", LiteralValue("datetime('now')"))
+          .where(_t_sales_order.id == P()))
+    conn.execute(uq.get_sql(), (naming, args.sales_order_id))
 
     audit(conn, "erpclaw-selling", "submit-sales-order", "sales_order", args.sales_order_id,
            new_values={"status": "confirmed", "naming_series": naming})
@@ -1134,36 +1249,37 @@ def cancel_sales_order(conn, args):
     if not args.sales_order_id:
         err("--sales-order-id is required")
 
-    so = conn.execute("SELECT * FROM sales_order WHERE id = ?",
-                      (args.sales_order_id,)).fetchone()
+    soq = (Q.from_(_t_sales_order).select(_t_sales_order.star)
+           .where(_t_sales_order.id == P()))
+    so = conn.execute(soq.get_sql(), (args.sales_order_id,)).fetchone()
     if not so:
         err(f"Sales order {args.sales_order_id} not found")
     if so["status"] == "cancelled":
         err("Sales order is already cancelled")
 
     # Check for linked delivery notes
-    dn_count = conn.execute(
-        """SELECT COUNT(*) as cnt FROM delivery_note
-           WHERE sales_order_id = ? AND status != 'cancelled'""",
-        (args.sales_order_id,),
-    ).fetchone()["cnt"]
+    dnc = (Q.from_(_t_delivery_note)
+           .select(fn.Count("*").as_("cnt"))
+           .where(_t_delivery_note.sales_order_id == P())
+           .where(_t_delivery_note.status != ValueWrapper("cancelled")))
+    dn_count = conn.execute(dnc.get_sql(), (args.sales_order_id,)).fetchone()["cnt"]
     if dn_count > 0:
         err(f"Cannot cancel: {dn_count} active delivery note(s) linked to this order")
 
     # Check for linked invoices
-    si_count = conn.execute(
-        """SELECT COUNT(*) as cnt FROM sales_invoice
-           WHERE sales_order_id = ? AND status != 'cancelled'""",
-        (args.sales_order_id,),
-    ).fetchone()["cnt"]
+    sic = (Q.from_(_t_sales_invoice)
+           .select(fn.Count("*").as_("cnt"))
+           .where(_t_sales_invoice.sales_order_id == P())
+           .where(_t_sales_invoice.status != ValueWrapper("cancelled")))
+    si_count = conn.execute(sic.get_sql(), (args.sales_order_id,)).fetchone()["cnt"]
     if si_count > 0:
         err(f"Cannot cancel: {si_count} active sales invoice(s) linked to this order")
 
-    conn.execute(
-        """UPDATE sales_order SET status = 'cancelled',
-           updated_at = datetime('now') WHERE id = ?""",
-        (args.sales_order_id,),
-    )
+    uq = (Q.update(_t_sales_order)
+          .set("status", ValueWrapper("cancelled"))
+          .set("updated_at", LiteralValue("datetime('now')"))
+          .where(_t_sales_order.id == P()))
+    conn.execute(uq.get_sql(), (args.sales_order_id,))
 
     audit(conn, "erpclaw-selling", "cancel-sales-order", "sales_order", args.sales_order_id,
            new_values={"status": "cancelled"})
@@ -1180,8 +1296,9 @@ def create_delivery_note(conn, args):
     if not args.sales_order_id:
         err("--sales-order-id is required")
 
-    so = conn.execute("SELECT * FROM sales_order WHERE id = ?",
-                      (args.sales_order_id,)).fetchone()
+    soq = (Q.from_(_t_sales_order).select(_t_sales_order.star)
+           .where(_t_sales_order.id == P()))
+    so = conn.execute(soq.get_sql(), (args.sales_order_id,)).fetchone()
     if not so:
         err(f"Sales order {args.sales_order_id} not found")
     if so["status"] not in ("confirmed", "partially_delivered"):
@@ -1191,10 +1308,10 @@ def create_delivery_note(conn, args):
     posting_date = args.posting_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # Fetch SO items
-    so_items = conn.execute(
-        "SELECT * FROM sales_order_item WHERE sales_order_id = ? ORDER BY rowid",
-        (args.sales_order_id,),
-    ).fetchall()
+    soiq = (Q.from_(_t_sales_order_item).select(_t_sales_order_item.star)
+            .where(_t_sales_order_item.sales_order_id == P())
+            .orderby(_t_sales_order_item.rowid))
+    so_items = conn.execute(soiq.get_sql(), (args.sales_order_id,)).fetchall()
     if not so_items:
         err("Sales order has no items")
 
@@ -1259,25 +1376,26 @@ def create_delivery_note(conn, args):
     dn_id = str(uuid.uuid4())
 
     # Insert parent delivery_note first
-    conn.execute(
-        """INSERT INTO delivery_note
-           (id, customer_id, posting_date, sales_order_id, status,
-            total_qty, company_id)
-           VALUES (?, ?, ?, ?, 'draft', ?, ?)""",
+    dn_ins = (Q.into(_t_delivery_note)
+              .columns("id", "customer_id", "posting_date", "sales_order_id",
+                        "status", "total_qty", "company_id")
+              .insert(P(), P(), P(), P(), ValueWrapper("draft"), P(), P()))
+    conn.execute(dn_ins.get_sql(),
         (dn_id, so_dict["customer_id"], posting_date,
          args.sales_order_id, str(round_currency(total_qty)),
          so_dict["company_id"]),
     )
 
     # Insert child delivery_note_item rows
+    dni_ins = (Q.into(_t_delivery_note_item)
+               .columns("id", "delivery_note_id", "item_id", "quantity", "uom",
+                         "sales_order_item_id", "warehouse_id", "batch_id",
+                         "serial_numbers", "rate", "amount")
+               .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+    dni_ins_sql = dni_ins.get_sql()
     for item in items_to_deliver:
         soi = item["so_item"]
-        conn.execute(
-            """INSERT INTO delivery_note_item
-               (id, delivery_note_id, item_id, quantity, uom,
-                sales_order_item_id, warehouse_id, batch_id,
-                serial_numbers, rate, amount)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        conn.execute(dni_ins_sql,
             (str(uuid.uuid4()), dn_id, soi["item_id"],
              str(round_currency(item["qty"])), soi.get("uom"),
              soi["id"], item["warehouse_id"], item["batch_id"],
@@ -1303,21 +1421,22 @@ def get_delivery_note(conn, args):
     if not args.delivery_note_id:
         err("--delivery-note-id is required")
 
-    dn = conn.execute("SELECT * FROM delivery_note WHERE id = ?",
-                      (args.delivery_note_id,)).fetchone()
+    dnq = (Q.from_(_t_delivery_note).select(_t_delivery_note.star)
+           .where(_t_delivery_note.id == P()))
+    dn = conn.execute(dnq.get_sql(), (args.delivery_note_id,)).fetchone()
     if not dn:
         err(f"Delivery note {args.delivery_note_id} not found")
 
     data = row_to_dict(dn)
 
-    items = conn.execute(
-        """SELECT dni.*, i.item_name, i.item_code
-           FROM delivery_note_item dni
-           LEFT JOIN item i ON i.id = dni.item_id
-           WHERE dni.delivery_note_id = ?
-           ORDER BY dni.rowid""",
-        (args.delivery_note_id,),
-    ).fetchall()
+    dni = _t_delivery_note_item.as_("dni")
+    i = _t_item.as_("i")
+    items_q = (Q.from_(dni)
+               .left_join(i).on(i.id == dni.item_id)
+               .select(dni.star, i.item_name, i.item_code)
+               .where(dni.delivery_note_id == P())
+               .orderby(dni.rowid))
+    items = conn.execute(items_q.get_sql(), (args.delivery_note_id,)).fetchall()
     data["items"] = [row_to_dict(r) for r in items]
     ok(data)
 
@@ -1328,44 +1447,48 @@ def get_delivery_note(conn, args):
 
 def list_delivery_notes(conn, args):
     """Query delivery notes with filtering."""
-    conditions = ["1=1"]
+    dn = _t_delivery_note.as_("dn")
     params = []
+    crit = None
 
     if args.company_id:
-        conditions.append("dn.company_id = ?")
+        crit = (dn.company_id == P())
         params.append(args.company_id)
     if args.customer_id:
-        conditions.append("dn.customer_id = ?")
+        cond = dn.customer_id == P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.customer_id)
     if args.doc_status:
-        conditions.append("dn.status = ?")
+        cond = dn.status == P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.doc_status)
     if args.from_date:
-        conditions.append("dn.posting_date >= ?")
+        cond = dn.posting_date >= P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.from_date)
     if args.to_date:
-        conditions.append("dn.posting_date <= ?")
+        cond = dn.posting_date <= P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.to_date)
 
-    where = " AND ".join(conditions)
-
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM delivery_note dn WHERE {where}", params
-    ).fetchone()
+    count_q = Q.from_(dn).select(fn.Count("*"))
+    if crit:
+        count_q = count_q.where(crit)
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"""SELECT dn.id, dn.naming_series, dn.customer_id, dn.posting_date,
-               dn.sales_order_id, dn.status, dn.total_qty, dn.company_id
-           FROM delivery_note dn WHERE {where}
-           ORDER BY dn.posting_date DESC, dn.created_at DESC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    list_q = (Q.from_(dn)
+              .select(dn.id, dn.naming_series, dn.customer_id, dn.posting_date,
+                      dn.sales_order_id, dn.status, dn.total_qty, dn.company_id)
+              .orderby(dn.posting_date, order=Order.desc)
+              .orderby(dn.created_at, order=Order.desc)
+              .limit(P()).offset(P()))
+    if crit:
+        list_q = list_q.where(crit)
+    rows = conn.execute(list_q.get_sql(), params + [limit, offset]).fetchall()
 
     ok({"delivery_notes": [row_to_dict(r) for r in rows], "total_count": total_count,
          "limit": limit, "offset": offset, "has_more": offset + limit < total_count})
@@ -1380,8 +1503,9 @@ def submit_delivery_note(conn, args):
     if not args.delivery_note_id:
         err("--delivery-note-id is required")
 
-    dn = conn.execute("SELECT * FROM delivery_note WHERE id = ?",
-                      (args.delivery_note_id,)).fetchone()
+    dnq = (Q.from_(_t_delivery_note).select(_t_delivery_note.star)
+           .where(_t_delivery_note.id == P()))
+    dn = conn.execute(dnq.get_sql(), (args.delivery_note_id,)).fetchone()
     if not dn:
         err(f"Delivery note {args.delivery_note_id} not found")
     if dn["status"] != "draft":
@@ -1393,16 +1517,17 @@ def submit_delivery_note(conn, args):
 
     # Verify linked SO is not cancelled
     if dn_dict.get("sales_order_id"):
-        so = conn.execute("SELECT status FROM sales_order WHERE id = ?",
-                          (dn_dict["sales_order_id"],)).fetchone()
+        soq = (Q.from_(_t_sales_order).select(_t_sales_order.status)
+               .where(_t_sales_order.id == P()))
+        so = conn.execute(soq.get_sql(), (dn_dict["sales_order_id"],)).fetchone()
         if so and so["status"] == "cancelled":
             err("Cannot submit: linked sales order is cancelled")
 
     # Fetch DN items
-    dn_items = conn.execute(
-        "SELECT * FROM delivery_note_item WHERE delivery_note_id = ? ORDER BY rowid",
-        (args.delivery_note_id,),
-    ).fetchall()
+    dniq = (Q.from_(_t_delivery_note_item).select(_t_delivery_note_item.star)
+            .where(_t_delivery_note_item.delivery_note_id == P())
+            .orderby(_t_delivery_note_item.rowid))
+    dn_items = conn.execute(dniq.get_sql(), (args.delivery_note_id,)).fetchall()
     if not dn_items:
         err("Delivery note has no items")
 
@@ -1418,8 +1543,9 @@ def submit_delivery_note(conn, args):
         warehouse_id = dni_dict.get("warehouse_id")
         if not warehouse_id:
             # Try to get default warehouse from company
-            comp = conn.execute("SELECT default_warehouse_id FROM company WHERE id = ?",
-                                (company_id,)).fetchone()
+            cwq = (Q.from_(_t_company).select(_t_company.default_warehouse_id)
+                   .where(_t_company.id == P()))
+            comp = conn.execute(cwq.get_sql(), (company_id,)).fetchone()
             warehouse_id = comp["default_warehouse_id"] if comp else None
         if not warehouse_id:
             err(f"No warehouse specified for item {dni_dict['item_id']} and no default warehouse")
@@ -1448,12 +1574,11 @@ def submit_delivery_note(conn, args):
         err(f"SLE posting failed: {e}")
 
     # Build COGS GL entries from SLE data
-    sle_rows = conn.execute(
-        """SELECT * FROM stock_ledger_entry
-           WHERE voucher_type = 'delivery_note' AND voucher_id = ?
-             AND is_cancelled = 0""",
-        (args.delivery_note_id,),
-    ).fetchall()
+    sleq = (Q.from_(_t_stock_ledger).select(_t_stock_ledger.star)
+            .where(_t_stock_ledger.voucher_type == ValueWrapper("delivery_note"))
+            .where(_t_stock_ledger.voucher_id == P())
+            .where(_t_stock_ledger.is_cancelled == 0))
+    sle_rows = conn.execute(sleq.get_sql(), (args.delivery_note_id,)).fetchall()
     sle_dicts = [row_to_dict(r) for r in sle_rows]
 
     gl_entries = create_perpetual_inventory_gl(
@@ -1487,17 +1612,19 @@ def submit_delivery_note(conn, args):
     naming = get_next_name(conn, "delivery_note", company_id=company_id)
 
     # Update DN status
-    conn.execute(
-        """UPDATE delivery_note SET status = 'submitted', naming_series = ?,
-           updated_at = datetime('now') WHERE id = ?""",
-        (naming, args.delivery_note_id),
-    )
+    uq = (Q.update(_t_delivery_note)
+          .set("status", ValueWrapper("submitted"))
+          .set("naming_series", P())
+          .set("updated_at", LiteralValue("datetime('now')"))
+          .where(_t_delivery_note.id == P()))
+    conn.execute(uq.get_sql(), (naming, args.delivery_note_id))
 
     # Update SO delivered_qty
     if dn_dict.get("sales_order_id"):
         for dni in dn_items:
             dni_dict = row_to_dict(dni)
             if dni_dict.get("sales_order_item_id"):
+                # raw SQL — CAST with arithmetic on TEXT column
                 conn.execute(
                     """UPDATE sales_order_item
                        SET delivered_qty = CAST(
@@ -1521,10 +1648,10 @@ def submit_delivery_note(conn, args):
 
 def _update_so_delivery_status(conn, sales_order_id: str):
     """Recalculate SO per_delivered and update status accordingly."""
-    items = conn.execute(
-        "SELECT quantity, delivered_qty FROM sales_order_item WHERE sales_order_id = ?",
-        (sales_order_id,),
-    ).fetchall()
+    q = (Q.from_(_t_sales_order_item)
+         .select(_t_sales_order_item.quantity, _t_sales_order_item.delivered_qty)
+         .where(_t_sales_order_item.sales_order_id == P()))
+    items = conn.execute(q.get_sql(), (sales_order_id,)).fetchall()
 
     total_qty = Decimal("0")
     total_delivered = Decimal("0")
@@ -1544,10 +1671,12 @@ def _update_so_delivery_status(conn, sales_order_id: str):
     else:
         return  # No change needed
 
-    conn.execute(
-        "UPDATE sales_order SET per_delivered = ?, status = ?, updated_at = datetime('now') WHERE id = ?",
-        (str(per_delivered), new_status, sales_order_id),
-    )
+    uq = (Q.update(_t_sales_order)
+          .set("per_delivered", P())
+          .set("status", P())
+          .set("updated_at", LiteralValue("datetime('now')"))
+          .where(_t_sales_order.id == P()))
+    conn.execute(uq.get_sql(), (str(per_delivered), new_status, sales_order_id))
 
 
 # ---------------------------------------------------------------------------
@@ -1559,8 +1688,9 @@ def cancel_delivery_note(conn, args):
     if not args.delivery_note_id:
         err("--delivery-note-id is required")
 
-    dn = conn.execute("SELECT * FROM delivery_note WHERE id = ?",
-                      (args.delivery_note_id,)).fetchone()
+    dnq = (Q.from_(_t_delivery_note).select(_t_delivery_note.star)
+           .where(_t_delivery_note.id == P()))
+    dn = conn.execute(dnq.get_sql(), (args.delivery_note_id,)).fetchone()
     if not dn:
         err(f"Delivery note {args.delivery_note_id} not found")
     if dn["status"] != "submitted":
@@ -1570,11 +1700,11 @@ def cancel_delivery_note(conn, args):
     posting_date = dn_dict["posting_date"]
 
     # Check no invoices reference this DN
-    si_count = conn.execute(
-        """SELECT COUNT(*) as cnt FROM sales_invoice
-           WHERE delivery_note_id = ? AND status != 'cancelled'""",
-        (args.delivery_note_id,),
-    ).fetchone()["cnt"]
+    sic = (Q.from_(_t_sales_invoice)
+           .select(fn.Count("*").as_("cnt"))
+           .where(_t_sales_invoice.delivery_note_id == P())
+           .where(_t_sales_invoice.status != ValueWrapper("cancelled")))
+    si_count = conn.execute(sic.get_sql(), (args.delivery_note_id,)).fetchone()["cnt"]
     if si_count > 0:
         err(f"Cannot cancel: {si_count} active invoice(s) reference this delivery note")
 
@@ -1603,21 +1733,21 @@ def cancel_delivery_note(conn, args):
         reversal_gl_ids = []
 
     # Update DN status
-    conn.execute(
-        """UPDATE delivery_note SET status = 'cancelled',
-           updated_at = datetime('now') WHERE id = ?""",
-        (args.delivery_note_id,),
-    )
+    uq = (Q.update(_t_delivery_note)
+          .set("status", ValueWrapper("cancelled"))
+          .set("updated_at", LiteralValue("datetime('now')"))
+          .where(_t_delivery_note.id == P()))
+    conn.execute(uq.get_sql(), (args.delivery_note_id,))
 
     # Reverse SO delivered_qty
     if dn_dict.get("sales_order_id"):
-        dn_items = conn.execute(
-            "SELECT * FROM delivery_note_item WHERE delivery_note_id = ?",
-            (args.delivery_note_id,),
-        ).fetchall()
+        dniq = (Q.from_(_t_delivery_note_item).select(_t_delivery_note_item.star)
+                .where(_t_delivery_note_item.delivery_note_id == P()))
+        dn_items = conn.execute(dniq.get_sql(), (args.delivery_note_id,)).fetchall()
         for dni in dn_items:
             dni_dict = row_to_dict(dni)
             if dni_dict.get("sales_order_item_id"):
+                # raw SQL — CAST with MAX and arithmetic on TEXT column
                 conn.execute(
                     """UPDATE sales_order_item
                        SET delivered_qty = CAST(
@@ -1640,10 +1770,10 @@ def cancel_delivery_note(conn, args):
 
 def _update_so_delivery_status_after_cancel(conn, sales_order_id: str):
     """Recalculate SO delivery status after a DN cancellation."""
-    items = conn.execute(
-        "SELECT quantity, delivered_qty FROM sales_order_item WHERE sales_order_id = ?",
-        (sales_order_id,),
-    ).fetchall()
+    q = (Q.from_(_t_sales_order_item)
+         .select(_t_sales_order_item.quantity, _t_sales_order_item.delivered_qty)
+         .where(_t_sales_order_item.sales_order_id == P()))
+    items = conn.execute(q.get_sql(), (sales_order_id,)).fetchall()
 
     total_qty = Decimal("0")
     total_delivered = Decimal("0")
@@ -1663,10 +1793,12 @@ def _update_so_delivery_status_after_cancel(conn, sales_order_id: str):
     else:
         new_status = "confirmed"
 
-    conn.execute(
-        "UPDATE sales_order SET per_delivered = ?, status = ?, updated_at = datetime('now') WHERE id = ?",
-        (str(per_delivered), new_status, sales_order_id),
-    )
+    uq = (Q.update(_t_sales_order)
+          .set("per_delivered", P())
+          .set("status", P())
+          .set("updated_at", LiteralValue("datetime('now')"))
+          .where(_t_sales_order.id == P()))
+    conn.execute(uq.get_sql(), (str(per_delivered), new_status, sales_order_id))
 
 
 # ---------------------------------------------------------------------------
@@ -1685,8 +1817,9 @@ def create_sales_invoice(conn, args):
 
     if sales_order_id:
         # Create from Sales Order
-        so = conn.execute("SELECT * FROM sales_order WHERE id = ?",
-                          (sales_order_id,)).fetchone()
+        soq = (Q.from_(_t_sales_order).select(_t_sales_order.star)
+               .where(_t_sales_order.id == P()))
+        so = conn.execute(soq.get_sql(), (sales_order_id,)).fetchone()
         if not so:
             err(f"Sales order {sales_order_id} not found")
         if so["status"] not in ("confirmed", "partially_delivered", "fully_delivered",
@@ -1700,17 +1833,18 @@ def create_sales_invoice(conn, args):
         payment_terms_id = so_dict.get("payment_terms_id")
 
         # If SO has delivery notes, set update_stock=0 (stock already moved)
-        dn_count = conn.execute(
-            "SELECT COUNT(*) as cnt FROM delivery_note WHERE sales_order_id = ? AND status = 'submitted'",
-            (sales_order_id,),
-        ).fetchone()["cnt"]
+        dnc = (Q.from_(_t_delivery_note)
+               .select(fn.Count("*").as_("cnt"))
+               .where(_t_delivery_note.sales_order_id == P())
+               .where(_t_delivery_note.status == ValueWrapper("submitted")))
+        dn_count = conn.execute(dnc.get_sql(), (sales_order_id,)).fetchone()["cnt"]
         if dn_count > 0:
             update_stock = 0
 
-        so_items = conn.execute(
-            "SELECT * FROM sales_order_item WHERE sales_order_id = ? ORDER BY rowid",
-            (sales_order_id,),
-        ).fetchall()
+        soiq = (Q.from_(_t_sales_order_item).select(_t_sales_order_item.star)
+                .where(_t_sales_order_item.sales_order_id == P())
+                .orderby(_t_sales_order_item.rowid))
+        so_items = conn.execute(soiq.get_sql(), (sales_order_id,)).fetchall()
 
         si_items_data = []
         total_amount = Decimal("0")
@@ -1738,8 +1872,9 @@ def create_sales_invoice(conn, args):
 
     elif delivery_note_id:
         # Create from Delivery Note
-        dn = conn.execute("SELECT * FROM delivery_note WHERE id = ?",
-                          (delivery_note_id,)).fetchone()
+        dnq = (Q.from_(_t_delivery_note).select(_t_delivery_note.star)
+               .where(_t_delivery_note.id == P()))
+        dn = conn.execute(dnq.get_sql(), (delivery_note_id,)).fetchone()
         if not dn:
             err(f"Delivery note {delivery_note_id} not found")
         if dn["status"] != "submitted":
@@ -1751,10 +1886,10 @@ def create_sales_invoice(conn, args):
         sales_order_id = dn_dict.get("sales_order_id")
         update_stock = 0  # Stock already moved by DN
 
-        dn_items = conn.execute(
-            "SELECT * FROM delivery_note_item WHERE delivery_note_id = ? ORDER BY rowid",
-            (delivery_note_id,),
-        ).fetchall()
+        dniq = (Q.from_(_t_delivery_note_item).select(_t_delivery_note_item.star)
+                .where(_t_delivery_note_item.delivery_note_id == P())
+                .orderby(_t_delivery_note_item.rowid))
+        dn_items = conn.execute(dniq.get_sql(), (delivery_note_id,)).fetchall()
 
         si_items_data = []
         total_amount = Decimal("0")
@@ -1786,9 +1921,10 @@ def create_sales_invoice(conn, args):
         if not company_id:
             err("--company-id is required for standalone invoices")
 
-        cust_chk = conn.execute(
-            "SELECT id FROM customer WHERE (id = ? OR name = ?) AND status = 'active'",
-            (customer_id, customer_id)).fetchone()
+        cchk = (Q.from_(_t_customer).select(_t_customer.id)
+                .where((_t_customer.id == P()) | (_t_customer.name == P()))
+                .where(_t_customer.status == ValueWrapper("active")))
+        cust_chk = conn.execute(cchk.get_sql(), (customer_id, customer_id)).fetchone()
         if not cust_chk:
             err(f"Active customer {customer_id} not found")
         customer_id = cust_chk["id"]  # normalize to id
@@ -1823,10 +1959,9 @@ def create_sales_invoice(conn, args):
     except NameError:
         payment_terms_id = getattr(args, 'payment_terms_id', None)
         if not payment_terms_id and customer_id:
-            cust = conn.execute(
-                "SELECT payment_terms_id FROM customer WHERE id = ?",
-                (customer_id,),
-            ).fetchone()
+            cpq = (Q.from_(_t_customer).select(_t_customer.payment_terms_id)
+                   .where(_t_customer.id == P()))
+            cust = conn.execute(cpq.get_sql(), (customer_id,)).fetchone()
             if cust:
                 payment_terms_id = cust["payment_terms_id"]
 
@@ -1835,10 +1970,9 @@ def create_sales_invoice(conn, args):
     if not due_date:
         due_days = 30
         if payment_terms_id:
-            pt = conn.execute(
-                "SELECT due_days FROM payment_terms WHERE id = ?",
-                (payment_terms_id,),
-            ).fetchone()
+            ptq = (Q.from_(_t_payment_terms).select(_t_payment_terms.due_days)
+                   .where(_t_payment_terms.id == P()))
+            pt = conn.execute(ptq.get_sql(), (payment_terms_id,)).fetchone()
             if pt and pt["due_days"]:
                 due_days = pt["due_days"]
         parts = posting_date.split("-")
@@ -1848,12 +1982,15 @@ def create_sales_invoice(conn, args):
     si_id = str(uuid.uuid4())
 
     # Insert parent sales_invoice first
-    conn.execute(
-        """INSERT INTO sales_invoice
-           (id, customer_id, posting_date, due_date, total_amount, tax_amount,
-            grand_total, outstanding_amount, tax_template_id, payment_terms_id,
-            status, sales_order_id, delivery_note_id, update_stock, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)""",
+    si_ins = (Q.into(_t_sales_invoice)
+              .columns("id", "customer_id", "posting_date", "due_date",
+                        "total_amount", "tax_amount", "grand_total",
+                        "outstanding_amount", "tax_template_id",
+                        "payment_terms_id", "status", "sales_order_id",
+                        "delivery_note_id", "update_stock", "company_id")
+              .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(),
+                      ValueWrapper("draft"), P(), P(), P(), P()))
+    conn.execute(si_ins.get_sql(),
         (si_id, customer_id, posting_date, due_date,
          str(total_amount), str(tax_amount), str(grand_total), str(grand_total),
          tax_template_id, payment_terms_id, sales_order_id, delivery_note_id,
@@ -1861,13 +1998,14 @@ def create_sales_invoice(conn, args):
     )
 
     # Insert child sales_invoice_item rows
+    sii_ins = (Q.into(_t_sales_invoice_item)
+               .columns("id", "sales_invoice_id", "item_id", "quantity", "uom",
+                         "rate", "amount", "discount_percentage", "net_amount",
+                         "sales_order_item_id", "delivery_note_item_id")
+               .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+    sii_ins_sql = sii_ins.get_sql()
     for row in si_items_data:
-        conn.execute(
-            """INSERT INTO sales_invoice_item
-               (id, sales_invoice_id, item_id, quantity, uom, rate, amount,
-                discount_percentage, net_amount, sales_order_item_id,
-                delivery_note_item_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        conn.execute(sii_ins_sql,
             (str(uuid.uuid4()), si_id, row["item_id"], row["qty"],
              row["uom"], row["rate"], row["amount"],
              row["discount_percentage"], row["net_amount"],
@@ -1892,8 +2030,9 @@ def update_sales_invoice(conn, args):
     if not args.sales_invoice_id:
         err("--sales-invoice-id is required")
 
-    si = conn.execute("SELECT * FROM sales_invoice WHERE id = ?",
-                      (args.sales_invoice_id,)).fetchone()
+    siq = (Q.from_(_t_sales_invoice).select(_t_sales_invoice.star)
+           .where(_t_sales_invoice.id == P()))
+    si = conn.execute(siq.get_sql(), (args.sales_invoice_id,)).fetchone()
     if not si:
         err(f"Sales invoice {args.sales_invoice_id} not found")
     if si["status"] != "draft":
@@ -1903,9 +2042,11 @@ def update_sales_invoice(conn, args):
     updated_fields = []
 
     if args.due_date is not None:
-        conn.execute(
-            "UPDATE sales_invoice SET due_date = ?, updated_at = datetime('now') WHERE id = ?",
-            (args.due_date, args.sales_invoice_id))
+        uq = (Q.update(_t_sales_invoice)
+              .set("due_date", P())
+              .set("updated_at", LiteralValue("datetime('now')"))
+              .where(_t_sales_invoice.id == P()))
+        conn.execute(uq.get_sql(), (args.due_date, args.sales_invoice_id))
         updated_fields.append("due_date")
 
     if args.items:
@@ -1916,23 +2057,29 @@ def update_sales_invoice(conn, args):
         tax_amount, _ = _calculate_tax(conn, total_amount, si["tax_template_id"])
         grand_total = round_currency(total_amount + tax_amount)
 
-        conn.execute("DELETE FROM sales_invoice_item WHERE sales_invoice_id = ?",
-                     (args.sales_invoice_id,))
+        dq = Q.from_(_t_sales_invoice_item).delete().where(_t_sales_invoice_item.sales_invoice_id == P())
+        conn.execute(dq.get_sql(), (args.sales_invoice_id,))
+        sii_ins = (Q.into(_t_sales_invoice_item)
+                   .columns("id", "sales_invoice_id", "item_id", "quantity",
+                             "uom", "rate", "amount", "discount_percentage",
+                             "net_amount")
+                   .insert(P(), P(), P(), P(), P(), P(), P(), P(), P()))
+        sii_ins_sql = sii_ins.get_sql()
         for row in item_rows:
-            conn.execute(
-                """INSERT INTO sales_invoice_item
-                   (id, sales_invoice_id, item_id, quantity, uom, rate, amount,
-                    discount_percentage, net_amount)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            conn.execute(sii_ins_sql,
                 (str(uuid.uuid4()), args.sales_invoice_id, row["item_id"],
                  row["qty"], row["uom"], row["rate"], row["amount"],
                  row["discount_percentage"], row["net_amount"]),
             )
 
-        conn.execute(
-            """UPDATE sales_invoice SET total_amount = ?, tax_amount = ?,
-               grand_total = ?, outstanding_amount = ?,
-               updated_at = datetime('now') WHERE id = ?""",
+        uq2 = (Q.update(_t_sales_invoice)
+               .set("total_amount", P())
+               .set("tax_amount", P())
+               .set("grand_total", P())
+               .set("outstanding_amount", P())
+               .set("updated_at", LiteralValue("datetime('now')"))
+               .where(_t_sales_invoice.id == P()))
+        conn.execute(uq2.get_sql(),
             (str(total_amount), str(tax_amount), str(grand_total),
              str(grand_total), args.sales_invoice_id),
         )
@@ -1957,30 +2104,30 @@ def get_sales_invoice(conn, args):
     if not args.sales_invoice_id:
         err("--sales-invoice-id is required")
 
-    si = conn.execute("SELECT * FROM sales_invoice WHERE id = ?",
-                      (args.sales_invoice_id,)).fetchone()
+    siq = (Q.from_(_t_sales_invoice).select(_t_sales_invoice.star)
+           .where(_t_sales_invoice.id == P()))
+    si = conn.execute(siq.get_sql(), (args.sales_invoice_id,)).fetchone()
     if not si:
         err(f"Sales invoice {args.sales_invoice_id} not found")
 
     data = row_to_dict(si)
 
-    items = conn.execute(
-        """SELECT sii.*, i.item_name, i.item_code
-           FROM sales_invoice_item sii
-           LEFT JOIN item i ON i.id = sii.item_id
-           WHERE sii.sales_invoice_id = ?
-           ORDER BY sii.rowid""",
-        (args.sales_invoice_id,),
-    ).fetchall()
+    sii = _t_sales_invoice_item.as_("sii")
+    i = _t_item.as_("i")
+    items_q = (Q.from_(sii)
+               .left_join(i).on(i.id == sii.item_id)
+               .select(sii.star, i.item_name, i.item_code)
+               .where(sii.sales_invoice_id == P())
+               .orderby(sii.rowid))
+    items = conn.execute(items_q.get_sql(), (args.sales_invoice_id,)).fetchall()
     data["items"] = [row_to_dict(r) for r in items]
 
     # Payment ledger entries (match both sales_invoice and credit_note voucher types)
-    ple_rows = conn.execute(
-        """SELECT * FROM payment_ledger_entry
-           WHERE against_voucher_type IN ('sales_invoice', 'credit_note')
-             AND against_voucher_id = ?""",
-        (args.sales_invoice_id,),
-    ).fetchall()
+    pleq = (Q.from_(_t_payment_ledger).select(_t_payment_ledger.star)
+            .where(_t_payment_ledger.against_voucher_type.isin([
+                ValueWrapper("sales_invoice"), ValueWrapper("credit_note")]))
+            .where(_t_payment_ledger.against_voucher_id == P()))
+    ple_rows = conn.execute(pleq.get_sql(), (args.sales_invoice_id,)).fetchall()
     data["payments"] = [row_to_dict(r) for r in ple_rows]
 
     ok(data)
@@ -1992,45 +2139,49 @@ def get_sales_invoice(conn, args):
 
 def list_sales_invoices(conn, args):
     """Query sales invoices with filtering."""
-    conditions = ["1=1"]
+    si = _t_sales_invoice.as_("si")
     params = []
+    crit = None
 
     if args.company_id:
-        conditions.append("si.company_id = ?")
+        crit = (si.company_id == P())
         params.append(args.company_id)
     if args.customer_id:
-        conditions.append("si.customer_id = ?")
+        cond = si.customer_id == P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.customer_id)
     if args.doc_status:
-        conditions.append("si.status = ?")
+        cond = si.status == P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.doc_status)
     if args.from_date:
-        conditions.append("si.posting_date >= ?")
+        cond = si.posting_date >= P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.from_date)
     if args.to_date:
-        conditions.append("si.posting_date <= ?")
+        cond = si.posting_date <= P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.to_date)
 
-    where = " AND ".join(conditions)
-
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM sales_invoice si WHERE {where}", params
-    ).fetchone()
+    count_q = Q.from_(si).select(fn.Count("*"))
+    if crit:
+        count_q = count_q.where(crit)
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"""SELECT si.id, si.naming_series, si.customer_id, si.posting_date,
-               si.due_date, si.grand_total, si.outstanding_amount,
-               si.status, si.is_return, si.company_id
-           FROM sales_invoice si WHERE {where}
-           ORDER BY si.posting_date DESC, si.created_at DESC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    list_q = (Q.from_(si)
+              .select(si.id, si.naming_series, si.customer_id, si.posting_date,
+                      si.due_date, si.grand_total, si.outstanding_amount,
+                      si.status, si.is_return, si.company_id)
+              .orderby(si.posting_date, order=Order.desc)
+              .orderby(si.created_at, order=Order.desc)
+              .limit(P()).offset(P()))
+    if crit:
+        list_q = list_q.where(crit)
+    rows = conn.execute(list_q.get_sql(), params + [limit, offset]).fetchall()
 
     ok({"sales_invoices": [row_to_dict(r) for r in rows],
          "total_count": total_count, "limit": limit, "offset": offset,
@@ -2046,8 +2197,9 @@ def submit_sales_invoice(conn, args):
     if not args.sales_invoice_id:
         err("--sales-invoice-id is required")
 
-    si = conn.execute("SELECT * FROM sales_invoice WHERE id = ?",
-                      (args.sales_invoice_id,)).fetchone()
+    siq = (Q.from_(_t_sales_invoice).select(_t_sales_invoice.star)
+           .where(_t_sales_invoice.id == P()))
+    si = conn.execute(siq.get_sql(), (args.sales_invoice_id,)).fetchone()
     if not si:
         err(f"Sales invoice {args.sales_invoice_id} not found")
     if si["status"] != "draft":
@@ -2063,18 +2215,18 @@ def submit_sales_invoice(conn, args):
     update_stock = si_dict.get("update_stock", 1)
 
     # Verify customer is active
-    cust = conn.execute("SELECT * FROM customer WHERE id = ?",
-                        (customer_id,)).fetchone()
+    cq = (Q.from_(_t_customer).select(_t_customer.star)
+          .where(_t_customer.id == P()))
+    cust = conn.execute(cq.get_sql(), (customer_id,)).fetchone()
     if not cust:
         err(f"Customer {customer_id} not found")
     if cust["status"] != "active":
         err(f"Customer is '{cust['status']}', cannot submit invoice")
 
     # Verify items
-    si_items = conn.execute(
-        "SELECT * FROM sales_invoice_item WHERE sales_invoice_id = ?",
-        (args.sales_invoice_id,),
-    ).fetchall()
+    siiq = (Q.from_(_t_sales_invoice_item).select(_t_sales_invoice_item.star)
+            .where(_t_sales_invoice_item.sales_invoice_id == P()))
+    si_items = conn.execute(siiq.get_sql(), (args.sales_invoice_id,)).fetchall()
     if not si_items:
         err("Sales invoice has no items")
 
@@ -2193,27 +2345,28 @@ def submit_sales_invoice(conn, args):
             # Determine warehouse
             warehouse_id = None
             if sii_dict.get("sales_order_item_id"):
-                soi = conn.execute(
-                    "SELECT warehouse_id FROM sales_order_item WHERE id = ?",
-                    (sii_dict["sales_order_item_id"],),
-                ).fetchone()
+                soiwq = (Q.from_(_t_sales_order_item)
+                         .select(_t_sales_order_item.warehouse_id)
+                         .where(_t_sales_order_item.id == P()))
+                soi = conn.execute(soiwq.get_sql(),
+                    (sii_dict["sales_order_item_id"],)).fetchone()
                 if soi and soi["warehouse_id"]:
                     warehouse_id = soi["warehouse_id"]
             if not warehouse_id:
-                comp = conn.execute(
-                    "SELECT default_warehouse_id FROM company WHERE id = ?",
-                    (company_id,),
-                ).fetchone()
+                cwq = (Q.from_(_t_company)
+                       .select(_t_company.default_warehouse_id)
+                       .where(_t_company.id == P()))
+                comp = conn.execute(cwq.get_sql(), (company_id,)).fetchone()
                 warehouse_id = comp["default_warehouse_id"] if comp else None
 
             if not warehouse_id:
                 continue
 
             # Check if item is a stock item
-            item_row = conn.execute(
-                "SELECT is_stock_item FROM item WHERE id = ?",
-                (sii_dict["item_id"],),
-            ).fetchone()
+            itq = (Q.from_(_t_item).select(_t_item.is_stock_item)
+                   .where(_t_item.id == P()))
+            item_row = conn.execute(itq.get_sql(),
+                (sii_dict["item_id"],)).fetchone()
             if not item_row or not item_row["is_stock_item"]:
                 continue
 
@@ -2239,12 +2392,12 @@ def submit_sales_invoice(conn, args):
                 err(f"SLE posting failed: {e}")
 
             # COGS GL from SLE
-            sle_rows = conn.execute(
-                """SELECT * FROM stock_ledger_entry
-                   WHERE voucher_type = ? AND voucher_id = ?
-                     AND is_cancelled = 0""",
-                (voucher_type, args.sales_invoice_id),
-            ).fetchall()
+            sleq = (Q.from_(_t_stock_ledger).select(_t_stock_ledger.star)
+                    .where(_t_stock_ledger.voucher_type == P())
+                    .where(_t_stock_ledger.voucher_id == P())
+                    .where(_t_stock_ledger.is_cancelled == 0))
+            sle_rows = conn.execute(sleq.get_sql(),
+                (voucher_type, args.sales_invoice_id)).fetchall()
             sle_dicts = [row_to_dict(r) for r in sle_rows]
 
             cogs_gl_entries = create_perpetual_inventory_gl(
@@ -2286,6 +2439,7 @@ def submit_sales_invoice(conn, args):
     if is_return and si_dict.get("return_against"):
         against_vtype = "sales_invoice"
         against_vid = si_dict["return_against"]
+    # raw SQL — INSERT with embedded literal strings ('customer', 'USD')
     conn.execute(
         """INSERT INTO payment_ledger_entry
            (id, posting_date, account_id, party_type, party_id,
@@ -2300,17 +2454,19 @@ def submit_sales_invoice(conn, args):
     )
 
     # Update invoice status (naming already generated above before GL posting)
-    conn.execute(
-        """UPDATE sales_invoice SET status = 'submitted', naming_series = ?,
-           updated_at = datetime('now') WHERE id = ?""",
-        (naming, args.sales_invoice_id),
-    )
+    uq = (Q.update(_t_sales_invoice)
+          .set("status", ValueWrapper("submitted"))
+          .set("naming_series", P())
+          .set("updated_at", LiteralValue("datetime('now')"))
+          .where(_t_sales_invoice.id == P()))
+    conn.execute(uq.get_sql(), (naming, args.sales_invoice_id))
 
     # Update SO invoiced_qty if linked
     if si_dict.get("sales_order_id"):
         for sii in si_items:
             sii_dict = row_to_dict(sii)
             if sii_dict.get("sales_order_item_id"):
+                # raw SQL — CAST with arithmetic on TEXT column
                 conn.execute(
                     """UPDATE sales_order_item
                        SET invoiced_qty = CAST(
@@ -2334,10 +2490,10 @@ def submit_sales_invoice(conn, args):
 
 def _update_so_invoice_status(conn, sales_order_id: str):
     """Recalculate SO per_invoiced and update status."""
-    items = conn.execute(
-        "SELECT quantity, invoiced_qty FROM sales_order_item WHERE sales_order_id = ?",
-        (sales_order_id,),
-    ).fetchall()
+    q = (Q.from_(_t_sales_order_item)
+         .select(_t_sales_order_item.quantity, _t_sales_order_item.invoiced_qty)
+         .where(_t_sales_order_item.sales_order_id == P()))
+    items = conn.execute(q.get_sql(), (sales_order_id,)).fetchall()
 
     total_qty = Decimal("0")
     total_invoiced = Decimal("0")
@@ -2350,8 +2506,9 @@ def _update_so_invoice_status(conn, sales_order_id: str):
     else:
         per_invoiced = Decimal("0")
 
-    so = conn.execute("SELECT status FROM sales_order WHERE id = ?",
-                      (sales_order_id,)).fetchone()
+    soq = (Q.from_(_t_sales_order).select(_t_sales_order.status)
+           .where(_t_sales_order.id == P()))
+    so = conn.execute(soq.get_sql(), (sales_order_id,)).fetchone()
     if so and so["status"] not in ("cancelled",):
         if per_invoiced >= Decimal("100"):
             new_status = "fully_invoiced"
@@ -2360,10 +2517,12 @@ def _update_so_invoice_status(conn, sales_order_id: str):
         else:
             return
 
-        conn.execute(
-            "UPDATE sales_order SET per_invoiced = ?, status = ?, updated_at = datetime('now') WHERE id = ?",
-            (str(per_invoiced), new_status, sales_order_id),
-        )
+        uq = (Q.update(_t_sales_order)
+              .set("per_invoiced", P())
+              .set("status", P())
+              .set("updated_at", LiteralValue("datetime('now')"))
+              .where(_t_sales_order.id == P()))
+        conn.execute(uq.get_sql(), (str(per_invoiced), new_status, sales_order_id))
 
 
 # ---------------------------------------------------------------------------
@@ -2375,8 +2534,9 @@ def cancel_sales_invoice(conn, args):
     if not args.sales_invoice_id:
         err("--sales-invoice-id is required")
 
-    si = conn.execute("SELECT * FROM sales_invoice WHERE id = ?",
-                      (args.sales_invoice_id,)).fetchone()
+    siq = (Q.from_(_t_sales_invoice).select(_t_sales_invoice.star)
+           .where(_t_sales_invoice.id == P()))
+    si = conn.execute(siq.get_sql(), (args.sales_invoice_id,)).fetchone()
     if not si:
         err(f"Sales invoice {args.sales_invoice_id} not found")
     if si["status"] not in ("submitted", "overdue", "partially_paid"):
@@ -2417,28 +2577,30 @@ def cancel_sales_invoice(conn, args):
             reversal_sle_ids = []
 
     # Mark PLE as delinked
-    conn.execute(
-        """UPDATE payment_ledger_entry SET delinked = 1, updated_at = datetime('now')
-           WHERE voucher_type = ? AND voucher_id = ?""",
-        (cancel_voucher_type, args.sales_invoice_id),
-    )
+    ple_uq = (Q.update(_t_payment_ledger)
+              .set("delinked", 1)
+              .set("updated_at", LiteralValue("datetime('now')"))
+              .where(_t_payment_ledger.voucher_type == P())
+              .where(_t_payment_ledger.voucher_id == P()))
+    conn.execute(ple_uq.get_sql(), (cancel_voucher_type, args.sales_invoice_id))
 
     # Update invoice status
-    conn.execute(
-        """UPDATE sales_invoice SET status = 'cancelled', outstanding_amount = '0',
-           updated_at = datetime('now') WHERE id = ?""",
-        (args.sales_invoice_id,),
-    )
+    uq = (Q.update(_t_sales_invoice)
+          .set("status", ValueWrapper("cancelled"))
+          .set("outstanding_amount", ValueWrapper("0"))
+          .set("updated_at", LiteralValue("datetime('now')"))
+          .where(_t_sales_invoice.id == P()))
+    conn.execute(uq.get_sql(), (args.sales_invoice_id,))
 
     # Reverse SO invoiced_qty if linked
     if si_dict.get("sales_order_id"):
-        si_items = conn.execute(
-            "SELECT * FROM sales_invoice_item WHERE sales_invoice_id = ?",
-            (args.sales_invoice_id,),
-        ).fetchall()
+        siiq = (Q.from_(_t_sales_invoice_item).select(_t_sales_invoice_item.star)
+                .where(_t_sales_invoice_item.sales_invoice_id == P()))
+        si_items = conn.execute(siiq.get_sql(), (args.sales_invoice_id,)).fetchall()
         for sii in si_items:
             sii_dict = row_to_dict(sii)
             if sii_dict.get("sales_order_item_id"):
+                # raw SQL — CAST with MAX and arithmetic on TEXT column
                 conn.execute(
                     """UPDATE sales_order_item
                        SET invoiced_qty = CAST(
@@ -2468,8 +2630,9 @@ def create_credit_note(conn, args):
     if not args.items:
         err("--items is required (JSON array)")
 
-    orig = conn.execute("SELECT * FROM sales_invoice WHERE id = ?",
-                        (args.against_invoice_id,)).fetchone()
+    origq = (Q.from_(_t_sales_invoice).select(_t_sales_invoice.star)
+             .where(_t_sales_invoice.id == P()))
+    orig = conn.execute(origq.get_sql(), (args.against_invoice_id,)).fetchone()
     if not orig:
         err(f"Original invoice {args.against_invoice_id} not found")
     if orig["status"] not in ("submitted", "overdue", "partially_paid", "paid"):
@@ -2485,10 +2648,9 @@ def create_credit_note(conn, args):
         err("--items must be a non-empty JSON array")
 
     # Validate return items against original invoice items
-    orig_items = conn.execute(
-        "SELECT * FROM sales_invoice_item WHERE sales_invoice_id = ?",
-        (args.against_invoice_id,),
-    ).fetchall()
+    oiq = (Q.from_(_t_sales_invoice_item).select(_t_sales_invoice_item.star)
+           .where(_t_sales_invoice_item.sales_invoice_id == P()))
+    orig_items = conn.execute(oiq.get_sql(), (args.against_invoice_id,)).fetchall()
     orig_item_map = {row_to_dict(oi)["item_id"]: row_to_dict(oi) for oi in orig_items}
 
     total_amount = Decimal("0")
@@ -2532,12 +2694,15 @@ def create_credit_note(conn, args):
     si_id = str(uuid.uuid4())
 
     # Insert parent sales_invoice (is_return=1)
-    conn.execute(
-        """INSERT INTO sales_invoice
-           (id, customer_id, posting_date, due_date, total_amount, tax_amount,
-            grand_total, outstanding_amount, tax_template_id, status,
-            sales_order_id, is_return, return_against, update_stock, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, 1, ?, ?, ?)""",
+    cn_ins = (Q.into(_t_sales_invoice)
+              .columns("id", "customer_id", "posting_date", "due_date",
+                        "total_amount", "tax_amount", "grand_total",
+                        "outstanding_amount", "tax_template_id", "status",
+                        "sales_order_id", "is_return", "return_against",
+                        "update_stock", "company_id")
+              .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(),
+                      ValueWrapper("draft"), P(), 1, P(), P(), P()))
+    conn.execute(cn_ins.get_sql(),
         (si_id, customer_id, posting_date, posting_date,
          str(total_amount), str(tax_amount), str(grand_total), str(grand_total),
          orig_dict.get("tax_template_id"), orig_dict.get("sales_order_id"),
@@ -2546,12 +2711,14 @@ def create_credit_note(conn, args):
     )
 
     # Insert child items
+    cni_ins = (Q.into(_t_sales_invoice_item)
+               .columns("id", "sales_invoice_id", "item_id", "quantity", "uom",
+                         "rate", "amount", "discount_percentage",
+                         "net_amount", "sales_order_item_id")
+               .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+    cni_ins_sql = cni_ins.get_sql()
     for row in si_items_data:
-        conn.execute(
-            """INSERT INTO sales_invoice_item
-               (id, sales_invoice_id, item_id, quantity, uom, rate, amount,
-                discount_percentage, net_amount, sales_order_item_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        conn.execute(cni_ins_sql,
             (str(uuid.uuid4()), si_id, row["item_id"], row["qty"],
              row["uom"], row["rate"], row["amount"],
              row["discount_percentage"], row["net_amount"],
@@ -2577,8 +2744,9 @@ def update_invoice_outstanding(conn, args):
     if not args.amount:
         err("--amount is required")
 
-    si = conn.execute("SELECT * FROM sales_invoice WHERE id = ?",
-                      (args.sales_invoice_id,)).fetchone()
+    siq = (Q.from_(_t_sales_invoice).select(_t_sales_invoice.star)
+           .where(_t_sales_invoice.id == P()))
+    si = conn.execute(siq.get_sql(), (args.sales_invoice_id,)).fetchone()
     if not si:
         err(f"Sales invoice {args.sales_invoice_id} not found")
     if si["status"] not in ("submitted", "overdue", "partially_paid"):
@@ -2600,11 +2768,12 @@ def update_invoice_outstanding(conn, args):
     else:
         new_status = "partially_paid"
 
-    conn.execute(
-        """UPDATE sales_invoice SET outstanding_amount = ?, status = ?,
-           updated_at = datetime('now') WHERE id = ?""",
-        (str(new_outstanding), new_status, args.sales_invoice_id),
-    )
+    uq = (Q.update(_t_sales_invoice)
+          .set("outstanding_amount", P())
+          .set("status", P())
+          .set("updated_at", LiteralValue("datetime('now')"))
+          .where(_t_sales_invoice.id == P()))
+    conn.execute(uq.get_sql(), (str(new_outstanding), new_status, args.sales_invoice_id))
 
     audit(conn, "erpclaw-selling", "update-invoice-outstanding", "sales_invoice",
            args.sales_invoice_id,
@@ -2632,10 +2801,10 @@ def add_sales_partner(conn, args):
     sp_id = str(uuid.uuid4())
 
     try:
-        conn.execute(
-            "INSERT INTO sales_partner (id, name, commission_rate) VALUES (?, ?, ?)",
-            (sp_id, args.name, str(rate)),
-        )
+        sp_ins = (Q.into(_t_sales_partner)
+                  .columns("id", "name", "commission_rate")
+                  .insert(P(), P(), P()))
+        conn.execute(sp_ins.get_sql(), (sp_id, args.name, str(rate)))
     except sqlite3.IntegrityError as e:
         sys.stderr.write(f"[erpclaw-selling] {e}\n")
         err("Sales partner creation failed — check for duplicates or invalid data")
@@ -2656,12 +2825,13 @@ def list_sales_partners(conn, args):
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
 
-    rows = conn.execute(
-        "SELECT * FROM sales_partner ORDER BY name LIMIT ? OFFSET ?",
-        (limit, offset),
-    ).fetchall()
+    lq = (Q.from_(_t_sales_partner).select(_t_sales_partner.star)
+          .orderby(_t_sales_partner.name)
+          .limit(P()).offset(P()))
+    rows = conn.execute(lq.get_sql(), (limit, offset)).fetchall()
 
-    count_row = conn.execute("SELECT COUNT(*) FROM sales_partner").fetchone()
+    cq = Q.from_(_t_sales_partner).select(fn.Count("*"))
+    count_row = conn.execute(cq.get_sql()).fetchone()
     total_count = count_row[0]
     ok({"sales_partners": [row_to_dict(r) for r in rows],
          "total_count": total_count, "limit": limit, "offset": offset,
@@ -2688,14 +2858,16 @@ def add_recurring_template(conn, args):
     if args.frequency not in VALID_FREQUENCIES:
         err(f"--frequency must be one of: {', '.join(VALID_FREQUENCIES)}")
 
-    cust_sub = conn.execute(
-        "SELECT id FROM customer WHERE (id = ? OR name = ?) AND status = 'active'",
+    csq = (Q.from_(_t_customer).select(_t_customer.id)
+           .where((_t_customer.id == P()) | (_t_customer.name == P()))
+           .where(_t_customer.status == ValueWrapper("active")))
+    cust_sub = conn.execute(csq.get_sql(),
         (args.customer_id, args.customer_id)).fetchone()
     if not cust_sub:
         err(f"Active customer {args.customer_id} not found")
     args.customer_id = cust_sub["id"]  # normalize to id
-    if not conn.execute("SELECT id FROM company WHERE id = ?",
-                        (args.company_id,)).fetchone():
+    coq = Q.from_(_t_company).select(_t_company.id).where(_t_company.id == P())
+    if not conn.execute(coq.get_sql(), (args.company_id,)).fetchone():
         err(f"Company {args.company_id} not found")
 
     items = _parse_json_arg(args.items, "items")
@@ -2705,18 +2877,24 @@ def add_recurring_template(conn, args):
     rt_id = str(uuid.uuid4())
 
     # Insert parent template first
-    conn.execute(
-        """INSERT INTO recurring_invoice_template
-           (id, customer_id, frequency, start_date, end_date,
-            next_invoice_date, tax_template_id, payment_terms_id,
-            status, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)""",
+    rt_ins = (Q.into(_t_recurring_template)
+              .columns("id", "customer_id", "frequency", "start_date",
+                        "end_date", "next_invoice_date", "tax_template_id",
+                        "payment_terms_id", "status", "company_id")
+              .insert(P(), P(), P(), P(), P(), P(), P(), P(),
+                      ValueWrapper("draft"), P()))
+    conn.execute(rt_ins.get_sql(),
         (rt_id, args.customer_id, args.frequency, args.start_date,
          args.end_date, args.start_date, args.tax_template_id,
          args.payment_terms_id, args.company_id),
     )
 
     # Insert child items
+    rti_ins = (Q.into(_t_recurring_template_item)
+               .columns("id", "template_id", "item_id", "quantity", "uom",
+                         "rate", "amount")
+               .insert(P(), P(), P(), P(), P(), P(), P()))
+    rti_ins_sql = rti_ins.get_sql()
     for i, item in enumerate(items):
         item_id = item.get("item_id")
         if not item_id:
@@ -2725,10 +2903,7 @@ def add_recurring_template(conn, args):
         rate = to_decimal(item.get("rate", "0"))
         amount = round_currency(qty * rate)
 
-        conn.execute(
-            """INSERT INTO recurring_invoice_template_item
-               (id, template_id, item_id, quantity, uom, rate, amount)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        conn.execute(rti_ins_sql,
             (str(uuid.uuid4()), rt_id, item_id, str(round_currency(qty)),
              item.get("uom"), str(round_currency(rate)), str(amount)),
         )
@@ -2749,8 +2924,9 @@ def update_recurring_template(conn, args):
     if not args.template_id:
         err("--template-id is required")
 
-    rt = conn.execute("SELECT * FROM recurring_invoice_template WHERE id = ?",
-                      (args.template_id,)).fetchone()
+    rtq = (Q.from_(_t_recurring_template).select(_t_recurring_template.star)
+           .where(_t_recurring_template.id == P()))
+    rt = conn.execute(rtq.get_sql(), (args.template_id,)).fetchone()
     if not rt:
         err(f"Template {args.template_id} not found")
 
@@ -2759,17 +2935,21 @@ def update_recurring_template(conn, args):
     if args.frequency is not None:
         if args.frequency not in VALID_FREQUENCIES:
             err(f"--frequency must be one of: {', '.join(VALID_FREQUENCIES)}")
-        conn.execute(
-            "UPDATE recurring_invoice_template SET frequency = ?, updated_at = datetime('now') WHERE id = ?",
-            (args.frequency, args.template_id))
+        uq = (Q.update(_t_recurring_template)
+              .set("frequency", P())
+              .set("updated_at", LiteralValue("datetime('now')"))
+              .where(_t_recurring_template.id == P()))
+        conn.execute(uq.get_sql(), (args.frequency, args.template_id))
         updated_fields.append("frequency")
 
     if args.template_status is not None:
         if args.template_status not in ("active", "paused", "cancelled"):
             err("--status must be 'active', 'paused', or 'cancelled'")
-        conn.execute(
-            "UPDATE recurring_invoice_template SET status = ?, updated_at = datetime('now') WHERE id = ?",
-            (args.template_status, args.template_id))
+        uq2 = (Q.update(_t_recurring_template)
+               .set("status", P())
+               .set("updated_at", LiteralValue("datetime('now')"))
+               .where(_t_recurring_template.id == P()))
+        conn.execute(uq2.get_sql(), (args.template_status, args.template_id))
         updated_fields.append("status")
 
     if args.items:
@@ -2777,10 +2957,15 @@ def update_recurring_template(conn, args):
         if not items or not isinstance(items, list):
             err("--items must be a non-empty JSON array")
 
-        conn.execute(
-            "DELETE FROM recurring_invoice_template_item WHERE template_id = ?",
-            (args.template_id,))
+        dq = (Q.from_(_t_recurring_template_item).delete()
+              .where(_t_recurring_template_item.template_id == P()))
+        conn.execute(dq.get_sql(), (args.template_id,))
 
+        rti_ins = (Q.into(_t_recurring_template_item)
+                   .columns("id", "template_id", "item_id", "quantity", "uom",
+                             "rate", "amount")
+                   .insert(P(), P(), P(), P(), P(), P(), P()))
+        rti_ins_sql = rti_ins.get_sql()
         for i, item in enumerate(items):
             item_id = item.get("item_id")
             if not item_id:
@@ -2789,10 +2974,7 @@ def update_recurring_template(conn, args):
             rate = to_decimal(item.get("rate", "0"))
             amount = round_currency(qty * rate)
 
-            conn.execute(
-                """INSERT INTO recurring_invoice_template_item
-                   (id, template_id, item_id, quantity, uom, rate, amount)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            conn.execute(rti_ins_sql,
                 (str(uuid.uuid4()), args.template_id, item_id,
                  str(round_currency(qty)), item.get("uom"),
                  str(round_currency(rate)), str(amount)),
@@ -2814,37 +2996,37 @@ def update_recurring_template(conn, args):
 
 def list_recurring_templates(conn, args):
     """List recurring invoice templates."""
-    conditions = ["1=1"]
+    rt = _t_recurring_template.as_("rt")
     params = []
+    crit = None
 
     if args.company_id:
-        conditions.append("rt.company_id = ?")
+        crit = (rt.company_id == P())
         params.append(args.company_id)
     if args.customer_id:
-        conditions.append("rt.customer_id = ?")
+        cond = rt.customer_id == P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.customer_id)
     if args.template_status:
-        conditions.append("rt.status = ?")
+        cond = rt.status == P()
+        crit = Criterion.all([crit, cond]) if crit else cond
         params.append(args.template_status)
 
-    where = " AND ".join(conditions)
-
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM recurring_invoice_template rt WHERE {where}", params
-    ).fetchone()
+    count_q = Q.from_(rt).select(fn.Count("*"))
+    if crit:
+        count_q = count_q.where(crit)
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"""SELECT rt.*
-           FROM recurring_invoice_template rt WHERE {where}
-           ORDER BY rt.next_invoice_date ASC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    list_q = (Q.from_(rt).select(rt.star)
+              .orderby(rt.next_invoice_date)
+              .limit(P()).offset(P()))
+    if crit:
+        list_q = list_q.where(crit)
+    rows = conn.execute(list_q.get_sql(), params + [limit, offset]).fetchall()
 
     ok({"recurring_templates": [row_to_dict(r) for r in rows],
          "total_count": total_count, "limit": limit, "offset": offset,
@@ -2862,6 +3044,7 @@ def generate_recurring_invoices(conn, args):
 
     as_of_date = args.as_of_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
+    # raw SQL — OR with IS NULL comparison
     templates = conn.execute(
         """SELECT * FROM recurring_invoice_template
            WHERE status = 'active'
@@ -2885,10 +3068,10 @@ def generate_recurring_invoices(conn, args):
 
         try:
             # Fetch template items
-            tmpl_items = conn.execute(
-                "SELECT * FROM recurring_invoice_template_item WHERE template_id = ?",
-                (template_id,),
-            ).fetchall()
+            tiq = (Q.from_(_t_recurring_template_item)
+                   .select(_t_recurring_template_item.star)
+                   .where(_t_recurring_template_item.template_id == P()))
+            tmpl_items = conn.execute(tiq.get_sql(), (template_id,)).fetchall()
             if not tmpl_items:
                 errors.append({"template_id": template_id,
                                "error": "Template has no items"})
@@ -2925,24 +3108,29 @@ def generate_recurring_invoices(conn, args):
             si_id = str(uuid.uuid4())
 
             # Create draft invoice
-            conn.execute(
-                """INSERT INTO sales_invoice
-                   (id, customer_id, posting_date, due_date, total_amount,
-                    tax_amount, grand_total, outstanding_amount,
-                    tax_template_id, status, update_stock, company_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 0, ?)""",
+            rsi_ins = (Q.into(_t_sales_invoice)
+                       .columns("id", "customer_id", "posting_date", "due_date",
+                                 "total_amount", "tax_amount", "grand_total",
+                                 "outstanding_amount", "tax_template_id",
+                                 "status", "update_stock", "company_id")
+                       .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(),
+                               ValueWrapper("draft"), 0, P()))
+            conn.execute(rsi_ins.get_sql(),
                 (si_id, customer_id, next_date, due_date,
                  str(total_amount), str(tax_amount), str(grand_total),
                  str(grand_total), tmpl_dict.get("tax_template_id"),
                  company_id),
             )
 
+            rsii_ins = (Q.into(_t_sales_invoice_item)
+                        .columns("id", "sales_invoice_id", "item_id", "quantity",
+                                  "uom", "rate", "amount", "discount_percentage",
+                                  "net_amount")
+                        .insert(P(), P(), P(), P(), P(), P(), P(),
+                                ValueWrapper("0"), P()))
+            rsii_ins_sql = rsii_ins.get_sql()
             for row in si_items_data:
-                conn.execute(
-                    """INSERT INTO sales_invoice_item
-                       (id, sales_invoice_id, item_id, quantity, uom, rate,
-                        amount, discount_percentage, net_amount)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, '0', ?)""",
+                conn.execute(rsii_ins_sql,
                     (str(uuid.uuid4()), si_id, row["item_id"], row["qty"],
                      row["uom"], row["rate"], row["amount"], row["net_amount"]),
                 )
@@ -3003,6 +3191,7 @@ def generate_recurring_invoices(conn, args):
                     continue
 
                 # PLE
+                # raw SQL — INSERT with embedded literal strings ('customer', 'sales_invoice', 'USD')
                 ple_id = str(uuid.uuid4())
                 conn.execute(
                     """INSERT INTO payment_ledger_entry
@@ -3020,28 +3209,29 @@ def generate_recurring_invoices(conn, args):
 
             # Generate naming and mark as submitted
             naming = get_next_name(conn, "sales_invoice", company_id=company_id)
-            conn.execute(
-                """UPDATE sales_invoice SET status = 'submitted',
-                   naming_series = ?, updated_at = datetime('now') WHERE id = ?""",
-                (naming, si_id),
-            )
+            uq_si = (Q.update(_t_sales_invoice)
+                     .set("status", ValueWrapper("submitted"))
+                     .set("naming_series", P())
+                     .set("updated_at", LiteralValue("datetime('now')"))
+                     .where(_t_sales_invoice.id == P()))
+            conn.execute(uq_si.get_sql(), (naming, si_id))
 
             # Update template dates
             new_next = _next_invoice_date(next_date, frequency)
-            conn.execute(
-                """UPDATE recurring_invoice_template
-                   SET last_invoice_date = ?, next_invoice_date = ?,
-                       updated_at = datetime('now') WHERE id = ?""",
-                (next_date, new_next, template_id),
-            )
+            uq_rt = (Q.update(_t_recurring_template)
+                     .set("last_invoice_date", P())
+                     .set("next_invoice_date", P())
+                     .set("updated_at", LiteralValue("datetime('now')"))
+                     .where(_t_recurring_template.id == P()))
+            conn.execute(uq_rt.get_sql(), (next_date, new_next, template_id))
 
             # Check if template is completed
             if tmpl_dict.get("end_date") and new_next > tmpl_dict["end_date"]:
-                conn.execute(
-                    """UPDATE recurring_invoice_template SET status = 'completed',
-                       updated_at = datetime('now') WHERE id = ?""",
-                    (template_id,),
-                )
+                uq_comp = (Q.update(_t_recurring_template)
+                           .set("status", ValueWrapper("completed"))
+                           .set("updated_at", LiteralValue("datetime('now')"))
+                           .where(_t_recurring_template.id == P()))
+                conn.execute(uq_comp.get_sql(), (template_id,))
                 templates_completed += 1
 
             invoices_generated.append({
@@ -3073,46 +3263,50 @@ def status_action(conn, args):
     """Selling summary for a company."""
     company_id = args.company_id
     if not company_id:
-        row = conn.execute("SELECT id FROM company LIMIT 1").fetchone()
+        cq = Q.from_(_t_company).select(_t_company.id).limit(1)
+        row = conn.execute(cq.get_sql()).fetchone()
         if not row:
             err("No company found. Create one with erpclaw-setup first.",
                  suggestion="Run 'tutorial' to create a demo company, or 'setup company' to create your own.")
         company_id = row["id"]
 
     # Customer count
-    cust_count = conn.execute(
-        "SELECT COUNT(*) as cnt FROM customer WHERE company_id = ?",
-        (company_id,),
-    ).fetchone()["cnt"]
+    ccq = (Q.from_(_t_customer).select(fn.Count("*").as_("cnt"))
+           .where(_t_customer.company_id == P()))
+    cust_count = conn.execute(ccq.get_sql(), (company_id,)).fetchone()["cnt"]
 
     # Quotations by status
-    q_rows = conn.execute(
-        "SELECT status, COUNT(*) as cnt FROM quotation WHERE company_id = ? GROUP BY status",
-        (company_id,),
-    ).fetchall()
+    qqb = (Q.from_(_t_quotation)
+           .select(_t_quotation.status, fn.Count("*").as_("cnt"))
+           .where(_t_quotation.company_id == P())
+           .groupby(_t_quotation.status))
+    q_rows = conn.execute(qqb.get_sql(), (company_id,)).fetchall()
     q_counts = {}
     for row in q_rows:
         q_counts[row["status"]] = row["cnt"]
 
     # Sales orders by status
-    so_rows = conn.execute(
-        "SELECT status, COUNT(*) as cnt FROM sales_order WHERE company_id = ? GROUP BY status",
-        (company_id,),
-    ).fetchall()
+    soq = (Q.from_(_t_sales_order)
+           .select(_t_sales_order.status, fn.Count("*").as_("cnt"))
+           .where(_t_sales_order.company_id == P())
+           .groupby(_t_sales_order.status))
+    so_rows = conn.execute(soq.get_sql(), (company_id,)).fetchall()
     so_counts = {}
     for row in so_rows:
         so_counts[row["status"]] = row["cnt"]
 
     # Sales invoices by status
-    si_rows = conn.execute(
-        "SELECT status, COUNT(*) as cnt FROM sales_invoice WHERE company_id = ? GROUP BY status",
-        (company_id,),
-    ).fetchall()
+    siq = (Q.from_(_t_sales_invoice)
+           .select(_t_sales_invoice.status, fn.Count("*").as_("cnt"))
+           .where(_t_sales_invoice.company_id == P())
+           .groupby(_t_sales_invoice.status))
+    si_rows = conn.execute(siq.get_sql(), (company_id,)).fetchall()
     si_counts = {}
     for row in si_rows:
         si_counts[row["status"]] = row["cnt"]
 
     # Total outstanding
+    # raw SQL — decimal_sum with COALESCE and IN clause with arithmetic comparison
     outstanding_row = conn.execute(
         """SELECT COALESCE(decimal_sum(outstanding_amount), '0') as total
            FROM sales_invoice
@@ -3172,20 +3366,22 @@ def import_customers(conn, args):
         name = row.get("name", "")
 
         # Check for duplicate
-        existing = conn.execute(
-            "SELECT id FROM customer WHERE name = ? AND company_id = ?",
-            (name, company_id),
-        ).fetchone()
+        dup_q = (Q.from_(_t_customer).select(_t_customer.id)
+                 .where(_t_customer.name == P())
+                 .where(_t_customer.company_id == P()))
+        existing = conn.execute(dup_q.get_sql(), (name, company_id)).fetchone()
         if existing:
             skipped += 1
             continue
 
         customer_id = str(uuid.uuid4())
         naming = get_next_name(conn, "customer")
-        conn.execute(
-            """INSERT INTO customer (id, name, naming_series, customer_type,
-               territory, default_currency, email, phone, tax_id, company_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        c_ins = (Q.into(_t_customer)
+                 .columns("id", "name", "naming_series", "customer_type",
+                           "territory", "default_currency", "email", "phone",
+                           "tax_id", "company_id")
+                 .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+        conn.execute(c_ins.get_sql(),
             (customer_id, name, naming,
              row.get("customer_type", "Company"),
              row.get("territory"),
@@ -3223,44 +3419,45 @@ def add_intercompany_account_map(conn, args):
         err("Source and target company must be different")
 
     # Validate companies exist
+    co_chk = Q.from_(_t_company).select(LiteralValue("1")).where(_t_company.id == P())
+    co_chk_sql = co_chk.get_sql()
     for cid, label in [(source_company_id, "Source"), (target_company_id, "Target")]:
-        if not conn.execute("SELECT 1 FROM company WHERE id = ?", (cid,)).fetchone():
+        if not conn.execute(co_chk_sql, (cid,)).fetchone():
             err(f"{label} company not found: {cid}")
 
     # Validate accounts exist and belong to correct companies
-    src_acct = conn.execute(
-        "SELECT id, company_id FROM account WHERE id = ?", (source_account_id,)
-    ).fetchone()
+    acq = (Q.from_(_t_account).select(_t_account.id, _t_account.company_id)
+           .where(_t_account.id == P()))
+    acq_sql = acq.get_sql()
+    src_acct = conn.execute(acq_sql, (source_account_id,)).fetchone()
     if not src_acct:
         err(f"Source account not found: {source_account_id}")
     if src_acct["company_id"] != source_company_id:
         err("Source account does not belong to source company")
 
-    tgt_acct = conn.execute(
-        "SELECT id, company_id FROM account WHERE id = ?", (target_account_id,)
-    ).fetchone()
+    tgt_acct = conn.execute(acq_sql, (target_account_id,)).fetchone()
     if not tgt_acct:
         err(f"Target account not found: {target_account_id}")
     if tgt_acct["company_id"] != target_company_id:
         err("Target account does not belong to target company")
 
     # Check for duplicate
-    existing = conn.execute(
-        """SELECT id FROM intercompany_account_map
-           WHERE source_company_id = ? AND target_company_id = ?
-             AND source_account_id = ?""",
-        (source_company_id, target_company_id, source_account_id),
-    ).fetchone()
+    dup_q = (Q.from_(_t_ic_account_map).select(_t_ic_account_map.id)
+             .where(_t_ic_account_map.source_company_id == P())
+             .where(_t_ic_account_map.target_company_id == P())
+             .where(_t_ic_account_map.source_account_id == P()))
+    existing = conn.execute(dup_q.get_sql(),
+        (source_company_id, target_company_id, source_account_id)).fetchone()
     if existing:
         err("Mapping already exists for this source account and company pair")
 
     map_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO intercompany_account_map
-           (id, source_company_id, target_company_id, source_account_id, target_account_id)
-           VALUES (?, ?, ?, ?, ?)""",
-        (map_id, source_company_id, target_company_id, source_account_id, target_account_id),
-    )
+    ic_ins = (Q.into(_t_ic_account_map)
+              .columns("id", "source_company_id", "target_company_id",
+                        "source_account_id", "target_account_id")
+              .insert(P(), P(), P(), P(), P()))
+    conn.execute(ic_ins.get_sql(),
+        (map_id, source_company_id, target_company_id, source_account_id, target_account_id))
     conn.commit()
     ok({"map_id": map_id})
 
@@ -3273,19 +3470,22 @@ def list_intercompany_account_maps(conn, args):
     if not source_company_id:
         err("--company-id (source company) is required")
 
-    query = """SELECT m.id, m.source_company_id, m.target_company_id,
-                      m.source_account_id, sa.name as source_account_name,
-                      m.target_account_id, ta.name as target_account_name
-               FROM intercompany_account_map m
-               JOIN account sa ON sa.id = m.source_account_id
-               JOIN account ta ON ta.id = m.target_account_id
-               WHERE m.source_company_id = ?"""
+    m = _t_ic_account_map.as_("m")
+    sa = _t_account.as_("sa")
+    ta = _t_account.as_("ta")
     params = [source_company_id]
+    lq = (Q.from_(m)
+          .join(sa).on(sa.id == m.source_account_id)
+          .join(ta).on(ta.id == m.target_account_id)
+          .select(m.id, m.source_company_id, m.target_company_id,
+                  m.source_account_id, sa.name.as_("source_account_name"),
+                  m.target_account_id, ta.name.as_("target_account_name"))
+          .where(m.source_company_id == P()))
     if target_company_id:
-        query += " AND m.target_company_id = ?"
+        lq = lq.where(m.target_company_id == P())
         params.append(target_company_id)
 
-    rows = conn.execute(query, params).fetchall()
+    rows = conn.execute(lq.get_sql(), params).fetchall()
     ok({"mappings": [dict(r) for r in rows], "total": len(rows)})
 
 
@@ -3314,9 +3514,9 @@ def create_intercompany_invoice(conn, args):
         err("--supplier-id is required (supplier in target company representing source)")
 
     # Fetch the sales invoice
-    si = conn.execute(
-        "SELECT * FROM sales_invoice WHERE id = ?", (si_id,)
-    ).fetchone()
+    siq = (Q.from_(_t_sales_invoice).select(_t_sales_invoice.star)
+           .where(_t_sales_invoice.id == P()))
+    si = conn.execute(siq.get_sql(), (si_id,)).fetchone()
     if not si:
         err(f"Sales invoice not found: {si_id}")
 
@@ -3331,45 +3531,47 @@ def create_intercompany_invoice(conn, args):
         err("Sales invoice is already an intercompany invoice")
 
     # Validate target company exists
-    target_company = conn.execute(
-        "SELECT id, name FROM company WHERE id = ?", (target_company_id,)
-    ).fetchone()
+    tcq = (Q.from_(_t_company).select(_t_company.id, _t_company.name)
+           .where(_t_company.id == P()))
+    target_company = conn.execute(tcq.get_sql(), (target_company_id,)).fetchone()
     if not target_company:
         err(f"Target company not found: {target_company_id}")
 
     # Validate supplier exists in target company
-    supplier = conn.execute(
-        "SELECT id, company_id FROM supplier WHERE id = ?", (supplier_id,)
-    ).fetchone()
+    sq = (Q.from_(_t_supplier).select(_t_supplier.id, _t_supplier.company_id)
+          .where(_t_supplier.id == P()))
+    supplier = conn.execute(sq.get_sql(), (supplier_id,)).fetchone()
     if not supplier:
         err(f"Supplier not found: {supplier_id}")
     if supplier["company_id"] != target_company_id:
         err("Supplier does not belong to target company")
 
     # Fetch SI items
-    si_items = conn.execute(
-        "SELECT * FROM sales_invoice_item WHERE sales_invoice_id = ?", (si_id,)
-    ).fetchall()
+    siiq = (Q.from_(_t_sales_invoice_item).select(_t_sales_invoice_item.star)
+            .where(_t_sales_invoice_item.sales_invoice_id == P()))
+    si_items = conn.execute(siiq.get_sql(), (si_id,)).fetchall()
     if not si_items:
         err("Sales invoice has no items")
 
-    # Look up account mappings (source income → target expense)
+    # Look up account mappings (source income -> target expense)
     mappings = {}
-    map_rows = conn.execute(
-        """SELECT source_account_id, target_account_id
-           FROM intercompany_account_map
-           WHERE source_company_id = ? AND target_company_id = ?""",
-        (source_company_id, target_company_id),
-    ).fetchall()
+    mq = (Q.from_(_t_ic_account_map)
+          .select(_t_ic_account_map.source_account_id,
+                  _t_ic_account_map.target_account_id)
+          .where(_t_ic_account_map.source_company_id == P())
+          .where(_t_ic_account_map.target_company_id == P()))
+    map_rows = conn.execute(mq.get_sql(),
+        (source_company_id, target_company_id)).fetchall()
     for m in map_rows:
         mappings[m["source_account_id"]] = m["target_account_id"]
 
     # Find a default expense account in target company if no mappings
-    default_expense = conn.execute(
-        """SELECT id FROM account WHERE root_type = 'expense'
-           AND company_id = ? AND is_group = 0 LIMIT 1""",
-        (target_company_id,),
-    ).fetchone()
+    deq = (Q.from_(_t_account).select(_t_account.id)
+           .where(_t_account.root_type == ValueWrapper("expense"))
+           .where(_t_account.company_id == P())
+           .where(_t_account.is_group == 0)
+           .limit(1))
+    default_expense = conn.execute(deq.get_sql(), (target_company_id,)).fetchone()
     default_expense_id = default_expense["id"] if default_expense else None
 
     # Create mirror purchase invoice (draft)
@@ -3382,13 +3584,16 @@ def create_intercompany_invoice(conn, args):
     currency = si["currency"]
     exchange_rate = si["exchange_rate"]
 
-    conn.execute(
-        """INSERT INTO purchase_invoice
-           (id, supplier_id, posting_date, due_date, currency, exchange_rate,
-            total_amount, tax_amount, grand_total, outstanding_amount,
-            tax_template_id, status, update_stock,
-            is_intercompany, intercompany_reference_id, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 0, 1, ?, ?)""",
+    pi_ins = (Q.into(_t_purchase_invoice)
+              .columns("id", "supplier_id", "posting_date", "due_date",
+                        "currency", "exchange_rate", "total_amount",
+                        "tax_amount", "grand_total", "outstanding_amount",
+                        "tax_template_id", "status", "update_stock",
+                        "is_intercompany", "intercompany_reference_id",
+                        "company_id")
+              .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(),
+                      ValueWrapper("draft"), 0, 1, P(), P()))
+    conn.execute(pi_ins.get_sql(),
         (pi_id, supplier_id, posting_date, due_date, currency, exchange_rate,
          total_amount, tax_amount, grand_total, grand_total,
          si["tax_template_id"],
@@ -3402,29 +3607,30 @@ def create_intercompany_invoice(conn, args):
         expense_acct = default_expense_id
         if mappings:
             # Try to find source income account from SI's company
-            income_acct = conn.execute(
-                """SELECT id FROM account WHERE root_type = 'income'
-                   AND company_id = ? AND is_group = 0 LIMIT 1""",
-                (source_company_id,),
-            ).fetchone()
+            iaq = (Q.from_(_t_account).select(_t_account.id)
+                   .where(_t_account.root_type == ValueWrapper("income"))
+                   .where(_t_account.company_id == P())
+                   .where(_t_account.is_group == 0)
+                   .limit(1))
+            income_acct = conn.execute(iaq.get_sql(), (source_company_id,)).fetchone()
             if income_acct and income_acct["id"] in mappings:
                 expense_acct = mappings[income_acct["id"]]
 
-        conn.execute(
-            """INSERT INTO purchase_invoice_item
-               (id, purchase_invoice_id, item_id, quantity, uom, rate, amount,
-                expense_account_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        pii_ins = (Q.into(_t_purchase_invoice_item)
+                   .columns("id", "purchase_invoice_id", "item_id", "quantity",
+                             "uom", "rate", "amount", "expense_account_id")
+                   .insert(P(), P(), P(), P(), P(), P(), P(), P()))
+        conn.execute(pii_ins.get_sql(),
             (pi_item_id, pi_id, item["item_id"], item["quantity"],
              item["uom"], item["rate"], item["amount"], expense_acct),
         )
 
     # Mark SI as intercompany
-    conn.execute(
-        """UPDATE sales_invoice SET is_intercompany = 1,
-           intercompany_reference_id = ? WHERE id = ?""",
-        (pi_id, si_id),
-    )
+    uq = (Q.update(_t_sales_invoice)
+          .set("is_intercompany", 1)
+          .set("intercompany_reference_id", P())
+          .where(_t_sales_invoice.id == P()))
+    conn.execute(uq.get_sql(), (pi_id, si_id))
 
     conn.commit()
     ok({
@@ -3448,30 +3654,36 @@ def list_intercompany_invoices(conn, args):
     offset = int(args.offset or "0")
 
     # Sales invoices that are intercompany (this company is seller)
-    si_rows = conn.execute(
-        """SELECT si.id, si.naming_series, si.posting_date, si.grand_total,
-                  si.status, si.intercompany_reference_id,
-                  c.name as customer_name, 'sales' as direction
-           FROM sales_invoice si
-           JOIN customer c ON c.id = si.customer_id
-           WHERE si.company_id = ? AND si.is_intercompany = 1
-           ORDER BY si.posting_date DESC
-           LIMIT ? OFFSET ?""",
-        (company_id, limit, offset),
-    ).fetchall()
+    si_a = _t_sales_invoice.as_("si")
+    c = _t_customer.as_("c")
+    si_q = (Q.from_(si_a)
+            .join(c).on(c.id == si_a.customer_id)
+            .select(si_a.id, si_a.naming_series, si_a.posting_date,
+                    si_a.grand_total, si_a.status,
+                    si_a.intercompany_reference_id,
+                    c.name.as_("customer_name"),
+                    ValueWrapper("sales").as_("direction"))
+            .where(si_a.company_id == P())
+            .where(si_a.is_intercompany == 1)
+            .orderby(si_a.posting_date, order=Order.desc)
+            .limit(P()).offset(P()))
+    si_rows = conn.execute(si_q.get_sql(), (company_id, limit, offset)).fetchall()
 
     # Purchase invoices that are intercompany (this company is buyer)
-    pi_rows = conn.execute(
-        """SELECT pi.id, pi.naming_series, pi.posting_date, pi.grand_total,
-                  pi.status, pi.intercompany_reference_id,
-                  s.name as supplier_name, 'purchase' as direction
-           FROM purchase_invoice pi
-           JOIN supplier s ON s.id = pi.supplier_id
-           WHERE pi.company_id = ? AND pi.is_intercompany = 1
-           ORDER BY pi.posting_date DESC
-           LIMIT ? OFFSET ?""",
-        (company_id, limit, offset),
-    ).fetchall()
+    pi_a = _t_purchase_invoice.as_("pi")
+    s = _t_supplier.as_("s")
+    pi_q = (Q.from_(pi_a)
+            .join(s).on(s.id == pi_a.supplier_id)
+            .select(pi_a.id, pi_a.naming_series, pi_a.posting_date,
+                    pi_a.grand_total, pi_a.status,
+                    pi_a.intercompany_reference_id,
+                    s.name.as_("supplier_name"),
+                    ValueWrapper("purchase").as_("direction"))
+            .where(pi_a.company_id == P())
+            .where(pi_a.is_intercompany == 1)
+            .orderby(pi_a.posting_date, order=Order.desc)
+            .limit(P()).offset(P()))
+    pi_rows = conn.execute(pi_q.get_sql(), (company_id, limit, offset)).fetchall()
 
     invoices = [dict(r) for r in si_rows] + [dict(r) for r in pi_rows]
     ok({"invoices": invoices, "total": len(invoices)})
@@ -3486,9 +3698,9 @@ def cancel_intercompany_invoice(conn, args):
     if not si_id:
         err("--sales-invoice-id is required")
 
-    si = conn.execute(
-        "SELECT * FROM sales_invoice WHERE id = ?", (si_id,)
-    ).fetchone()
+    siq = (Q.from_(_t_sales_invoice).select(_t_sales_invoice.star)
+           .where(_t_sales_invoice.id == P()))
+    si = conn.execute(siq.get_sql(), (si_id,)).fetchone()
     if not si:
         err(f"Sales invoice not found: {si_id}")
     if si["is_intercompany"] != 1:
@@ -3521,16 +3733,18 @@ def cancel_intercompany_invoice(conn, args):
                 pass
 
         # Mark PLE as delinked
-        conn.execute(
-            "UPDATE payment_ledger_entry SET delinked = 1 WHERE voucher_type = ? AND voucher_id = ?",
-            (voucher_type, si_id),
-        )
+        ple_uq = (Q.update(_t_payment_ledger)
+                  .set("delinked", 1)
+                  .where(_t_payment_ledger.voucher_type == P())
+                  .where(_t_payment_ledger.voucher_id == P()))
+        conn.execute(ple_uq.get_sql(), (voucher_type, si_id))
 
         # Update SI status
-        conn.execute(
-            "UPDATE sales_invoice SET status = 'cancelled', outstanding_amount = '0' WHERE id = ?",
-            (si_id,),
-        )
+        si_uq = (Q.update(_t_sales_invoice)
+                 .set("status", ValueWrapper("cancelled"))
+                 .set("outstanding_amount", ValueWrapper("0"))
+                 .where(_t_sales_invoice.id == P()))
+        conn.execute(si_uq.get_sql(), (si_id,))
     elif si_status == "cancelled":
         pass  # Already cancelled
     else:
@@ -3540,9 +3754,9 @@ def cancel_intercompany_invoice(conn, args):
     pi_gl_reversals = 0
     pi_sle_reversals = 0
     if pi_id:
-        pi = conn.execute(
-            "SELECT * FROM purchase_invoice WHERE id = ?", (pi_id,)
-        ).fetchone()
+        piq = (Q.from_(_t_purchase_invoice).select(_t_purchase_invoice.star)
+               .where(_t_purchase_invoice.id == P()))
+        pi = conn.execute(piq.get_sql(), (pi_id,)).fetchone()
         if pi and pi["status"] in ("submitted", "overdue", "partially_paid"):
             pi_voucher = "debit_note" if pi["is_return"] else "purchase_invoice"
             pi_posting = pi["posting_date"]
@@ -3557,20 +3771,26 @@ def cancel_intercompany_invoice(conn, args):
                 pi_sle_reversals = len(rev_pi_sle)
 
             # Mark PI PLE as delinked
-            conn.execute(
-                "UPDATE payment_ledger_entry SET delinked = 1 WHERE voucher_type = ? AND voucher_id = ?",
-                (pi_voucher, pi_id),
-            )
+            pi_ple_uq = (Q.update(_t_payment_ledger)
+                         .set("delinked", 1)
+                         .where(_t_payment_ledger.voucher_type == P())
+                         .where(_t_payment_ledger.voucher_id == P()))
+            conn.execute(pi_ple_uq.get_sql(), (pi_voucher, pi_id))
 
             # Update PI status
-            conn.execute(
-                "UPDATE purchase_invoice SET status = 'cancelled', outstanding_amount = '0' WHERE id = ?",
-                (pi_id,),
-            )
+            pi_uq = (Q.update(_t_purchase_invoice)
+                     .set("status", ValueWrapper("cancelled"))
+                     .set("outstanding_amount", ValueWrapper("0"))
+                     .where(_t_purchase_invoice.id == P()))
+            conn.execute(pi_uq.get_sql(), (pi_id,))
         elif pi and pi["status"] == "draft":
             # Just delete the draft PI and its items
-            conn.execute("DELETE FROM purchase_invoice_item WHERE purchase_invoice_id = ?", (pi_id,))
-            conn.execute("DELETE FROM purchase_invoice WHERE id = ?", (pi_id,))
+            dq1 = (Q.from_(_t_purchase_invoice_item).delete()
+                   .where(_t_purchase_invoice_item.purchase_invoice_id == P()))
+            conn.execute(dq1.get_sql(), (pi_id,))
+            dq2 = (Q.from_(_t_purchase_invoice).delete()
+                   .where(_t_purchase_invoice.id == P()))
+            conn.execute(dq2.get_sql(), (pi_id,))
 
     conn.commit()
     ok({

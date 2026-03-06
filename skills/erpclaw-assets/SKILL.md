@@ -4,7 +4,7 @@ version: 1.0.0
 description: Fixed asset management, depreciation, and disposal for ERPClaw
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-assets
 tier: 5
 category: accounting
 requires: [erpclaw-setup, erpclaw-gl]

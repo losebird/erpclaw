@@ -4,7 +4,7 @@ version: 1.0.0
 description: US Payroll management -- salary structures, components, slips, payroll processing, FICA, income tax withholding, W-2 generation for ERPClaw ERP
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-payroll
 tier: 4
 category: hr
 requires: [erpclaw-setup, erpclaw-gl, erpclaw-hr]

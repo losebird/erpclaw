@@ -16,6 +16,15 @@ import sqlite3
 import sys
 from pathlib import Path
 
+# PyPika is optional — only available when erpclaw-setup has installed the shared lib.
+# check-installation and install-guide work without it; seed-demo-data uses it for queries.
+try:
+    sys.path.insert(0, os.path.expanduser("~/.openclaw/erpclaw/lib"))
+    from erpclaw_lib.query import Q, P, Table, Field, fn, Order
+    _HAS_PYPIKA = True
+except ImportError:
+    _HAS_PYPIKA = False
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -201,7 +210,12 @@ def get_db_info(db_path):
         info["table_count"] = len(info["tables"])
 
         if "company" in info["tables"]:
-            count = conn.execute("SELECT COUNT(*) FROM company").fetchone()[0]
+            if _HAS_PYPIKA:
+                co = Table("company")
+                q = Q.from_(co).select(fn.Count("*"))
+                count = conn.execute(q.get_sql()).fetchone()[0]
+            else:
+                count = conn.execute("SELECT COUNT(*) FROM company").fetchone()[0]
             info["company_count"] = count
 
         conn.close()
@@ -355,22 +369,26 @@ def install_guide(args):
 
 
 def seed_demo_data(args):
-    """Create a complete demo company 'Stark Manufacturing Inc.' with sample data.
+    """Create demo data for a company.
+
+    If --company-id is provided, seeds demo data into that existing company.
+    Otherwise, creates 'Stark Manufacturing Inc.' as the demo company.
 
     Uses subprocess calls to each skill's db_query.py to create:
-    - Company, chart of accounts, fiscal years, cost centers
+    - Company (unless --company-id), chart of accounts, fiscal years, cost centers
     - 25 items (15 raw materials + 10 finished goods), 3 warehouses
     - 10 customers, 8 suppliers
     - Opening stock via stock entries
     - 5 journal entries, 5 sales orders + invoices, 3 purchase orders + invoices
     - 5 payment entries
 
-    Idempotent: skips if 'Stark Manufacturing Inc.' already exists.
+    Idempotent: skips if demo data already exists for the target company.
     """
     import subprocess
     import traceback
 
     db_path = args.db_path
+    use_existing_company = getattr(args, "company_id", None)
 
     # ------------------------------------------------------------------
     # Idempotency check — company exists AND demo data is populated
@@ -380,25 +398,54 @@ def seed_demo_data(args):
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
-        row = conn.execute(
-            "SELECT id FROM company WHERE name LIKE 'Stark Manufacturing Inc%'"
-        ).fetchone()
-        if row:
+
+        target_company_id = None
+        if use_existing_company:
+            # Check existing company
+            row = conn.execute(
+                "SELECT id FROM company WHERE id = ?", (use_existing_company,)
+            ).fetchone()
+            if row:
+                target_company_id = row[0]
+        else:
+            if _HAS_PYPIKA:
+                co = Table("company")
+                q = Q.from_(co).select(co.id).where(co.name.like("Stark Manufacturing Inc%"))
+                row = conn.execute(q.get_sql()).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT id FROM company WHERE name LIKE 'Stark Manufacturing Inc%'"
+                ).fetchone()
+            if row:
+                target_company_id = row[0]
+
+        if target_company_id:
             # Company exists — check if demo data was also loaded
-            customer_count = conn.execute(
-                "SELECT COUNT(*) FROM customer WHERE company_id = ?", (row[0],)
-            ).fetchone()[0]
+            if _HAS_PYPIKA:
+                cu = Table("customer")
+                q = Q.from_(cu).select(fn.Count("*")).where(cu.company_id == P())
+                customer_count = conn.execute(q.get_sql(), (target_company_id,)).fetchone()[0]
+            else:
+                customer_count = conn.execute(
+                    "SELECT COUNT(*) FROM customer WHERE company_id = ?", (target_company_id,)
+                ).fetchone()[0]
             conn.close()
             if customer_count > 0:
                 output_json({
                     "status": "ok",
-                    "message": "Demo company already exists with data",
-                    "company_id": row[0],
+                    "message": "Demo data already exists for this company",
+                    "company_id": target_company_id,
                 })
                 return
             # Company exists but no demo data — fall through to seed
         else:
             conn.close()
+            if use_existing_company:
+                output_json({
+                    "status": "error",
+                    "error": f"Company {use_existing_company} not found",
+                })
+                return
     except sqlite3.Error:
         pass  # DB may not exist yet — that is fine, setup-company will create it
 
@@ -468,18 +515,32 @@ def seed_demo_data(args):
 
     def _get_account_id(conn, account_number, company_id):
         """Look up an account ID by account_number within a company."""
-        row = conn.execute(
-            "SELECT id FROM account WHERE account_number = ? AND company_id = ?",
-            (account_number, company_id),
-        ).fetchone()
+        if _HAS_PYPIKA:
+            t = Table("account")
+            q = (Q.from_(t).select(t.id)
+                 .where(t.account_number == P())
+                 .where(t.company_id == P()))
+            row = conn.execute(q.get_sql(), (account_number, company_id)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id FROM account WHERE account_number = ? AND company_id = ?",
+                (account_number, company_id),
+            ).fetchone()
         return row[0] if row else None
 
     def _get_account_id_by_name(conn, name_pattern, company_id):
         """Look up an account ID by name LIKE pattern within a company."""
-        row = conn.execute(
-            "SELECT id FROM account WHERE name LIKE ? AND company_id = ?",
-            (name_pattern, company_id),
-        ).fetchone()
+        if _HAS_PYPIKA:
+            t = Table("account")
+            q = (Q.from_(t).select(t.id)
+                 .where(t.name.like(P()))
+                 .where(t.company_id == P()))
+            row = conn.execute(q.get_sql(), (name_pattern, company_id)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id FROM account WHERE name LIKE ? AND company_id = ?",
+                (name_pattern, company_id),
+            ).fetchone()
         return row[0] if row else None
 
     # Track what was created for the summary
@@ -517,31 +578,43 @@ def seed_demo_data(args):
     # ==================================================================
     # PHASE 1: Foundation
     # ==================================================================
-    try:
-        _progress("Phase 1: Setting up company...")
-        result = _run_skill("erpclaw-setup", "setup-company",
-                            name="Stark Manufacturing Inc.",
-                            currency="USD",
-                            country="United States",
-                            fiscal_year_start_month=1)
-        company_id = result.get("company_id")
-        _progress(f"  Company created: {company_id}")
-    except Exception as e:
-        errors.append(f"Phase 1 (setup-company): {e}")
-        # Fall back: look for any existing company to use
+    if use_existing_company:
+        # Use the provided company — skip creating Stark Manufacturing
+        company_id = use_existing_company
+        _progress(f"Phase 1: Using existing company {company_id}...")
+    else:
         try:
-            conn = sqlite3.connect(db_path, timeout=5)
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT id, name FROM company ORDER BY created_at LIMIT 1"
-            ).fetchone()
-            conn.close()
-            if row:
-                company_id = row[0]
-                _progress(f"  Using existing company: {row[1]} ({company_id})")
-                errors.pop()  # Remove the setup-company error since we recovered
-        except sqlite3.Error:
-            pass
+            _progress("Phase 1: Setting up company...")
+            result = _run_skill("erpclaw-setup", "setup-company",
+                                name="Stark Manufacturing Inc.",
+                                currency="USD",
+                                country="United States",
+                                fiscal_year_start_month=1)
+            company_id = result.get("company_id")
+            _progress(f"  Company created: {company_id}")
+        except Exception as e:
+            errors.append(f"Phase 1 (setup-company): {e}")
+            # Fall back: look for any existing company to use
+            try:
+                conn = sqlite3.connect(db_path, timeout=5)
+                conn.row_factory = sqlite3.Row
+                if _HAS_PYPIKA:
+                    co = Table("company")
+                    q = (Q.from_(co).select(co.id, co.name)
+                         .orderby(co.created_at, order=Order.asc)
+                         .limit(1))
+                    row = conn.execute(q.get_sql()).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT id, name FROM company ORDER BY created_at LIMIT 1"
+                    ).fetchone()
+                conn.close()
+                if row:
+                    company_id = row[0]
+                    _progress(f"  Using existing company: {row[1]} ({company_id})")
+                    errors.pop()  # Remove the setup-company error since we recovered
+            except sqlite3.Error:
+                pass
         if not company_id:
             output_json({
                 "status": "error",
@@ -638,9 +711,16 @@ def seed_demo_data(args):
                     # Look up existing
                     try:
                         conn_tmp = sqlite3.connect(db_path, timeout=5)
-                        row = conn_tmp.execute(
-                            "SELECT id FROM cost_center WHERE name = ? AND company_id = ?",
-                            (cc_name, company_id)).fetchone()
+                        if _HAS_PYPIKA:
+                            cc = Table("cost_center")
+                            q = (Q.from_(cc).select(cc.id)
+                                 .where(cc.name == P())
+                                 .where(cc.company_id == P()))
+                            row = conn_tmp.execute(q.get_sql(), (cc_name, company_id)).fetchone()
+                        else:
+                            row = conn_tmp.execute(
+                                "SELECT id FROM cost_center WHERE name = ? AND company_id = ?",
+                                (cc_name, company_id)).fetchone()
                         if row:
                             cost_center_ids[cc_name] = row[0]
                         conn_tmp.close()
@@ -692,9 +772,14 @@ def seed_demo_data(args):
                 try:
                     conn = sqlite3.connect(db_path, timeout=5)
                     conn.row_factory = sqlite3.Row
-                    row = conn.execute(
-                        "SELECT id FROM item_group WHERE name = ?", (group_name,)
-                    ).fetchone()
+                    if _HAS_PYPIKA:
+                        ig = Table("item_group")
+                        q = Q.from_(ig).select(ig.id).where(ig.name == P())
+                        row = conn.execute(q.get_sql(), (group_name,)).fetchone()
+                    else:
+                        row = conn.execute(
+                            "SELECT id FROM item_group WHERE name = ?", (group_name,)
+                        ).fetchone()
                     if row:
                         item_group_ids[group_name] = row[0]
                     conn.close()
@@ -1169,9 +1254,14 @@ def seed_demo_data(args):
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
-        item_rows = conn.execute(
-            "SELECT id, item_code FROM item"
-        ).fetchall()
+        if _HAS_PYPIKA:
+            it = Table("item")
+            q = Q.from_(it).select(it.id, it.item_code)
+            item_rows = conn.execute(q.get_sql()).fetchall()
+        else:
+            item_rows = conn.execute(
+                "SELECT id, item_code FROM item"
+            ).fetchall()
         item_map = {r["item_code"]: r["id"] for r in item_rows}
         conn.close()
         # Merge into item_ids (in case some were missed during creation)
@@ -1220,9 +1310,14 @@ def seed_demo_data(args):
             try:
                 conn_tmp = sqlite3.connect(db_path, timeout=5)
                 conn_tmp.row_factory = sqlite3.Row
-                rate_row = conn_tmp.execute(
-                    "SELECT standard_rate FROM item WHERE id = ?", (rm_id,)
-                ).fetchone()
+                if _HAS_PYPIKA:
+                    it = Table("item")
+                    q = Q.from_(it).select(it.standard_rate).where(it.id == P())
+                    rate_row = conn_tmp.execute(q.get_sql(), (rm_id,)).fetchone()
+                else:
+                    rate_row = conn_tmp.execute(
+                        "SELECT standard_rate FROM item WHERE id = ?", (rm_id,)
+                    ).fetchone()
                 if rate_row and rate_row["standard_rate"]:
                     rate = rate_row["standard_rate"]
                 conn_tmp.close()
@@ -1670,7 +1765,7 @@ def seed_demo_data(args):
 
     result = {
         "status": "ok" if not errors else "partial",
-        "message": f"Demo company 'Stark Manufacturing Inc.' created with sample data",
+        "message": f"Demo data seeded successfully for company {company_id}",
         "company_id": company_id,
         "summary": summary,
     }
@@ -1706,6 +1801,10 @@ def main():
         "--db-path",
         default=DEFAULT_DB_PATH,
         help=f"Path to the ERPClaw database (default: {DEFAULT_DB_PATH})",
+    )
+    parser.add_argument(
+        "--company-id",
+        help="Use an existing company instead of creating Stark Manufacturing (seed-demo-data)",
     )
 
     args = parser.parse_args()

@@ -31,6 +31,8 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
+    from erpclaw_lib.query import Q, P, Table, Field, fn, insert_row, update_row
+    from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
@@ -40,6 +42,18 @@ REQUIRED_TABLES = ["company", "account"]
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(os.path.dirname(SCRIPT_DIR), "assets")
+
+# --- PyPika table references ---
+_t_company = Table("company")
+_t_account = Table("account")
+_t_regional = Table("regional_settings")
+_t_tax_tpl = Table("tax_template")
+_t_tax_line = Table("tax_template_line")
+_t_sal_comp = Table("salary_component")
+_t_sal_slip = Table("salary_slip")
+_t_employee = Table("employee")
+_t_si = Table("sales_invoice")
+_t_pi = Table("purchase_invoice")
 
 
 # ---------------------------------------------------------------------------
@@ -56,11 +70,13 @@ def _load_json_asset(filename):
 
 def _get_company(conn, company_id):
     if not company_id:
-        row = conn.execute("SELECT * FROM company LIMIT 1").fetchone()
+        q = Q.from_(_t_company).select(_t_company.star).limit(1)
+        row = conn.execute(q.get_sql()).fetchone()
         if not row:
             err("No company found. Create one with erpclaw-setup first.")
         return row_to_dict(row)
-    row = conn.execute("SELECT * FROM company WHERE id = ?", (company_id,)).fetchone()
+    q = Q.from_(_t_company).select(_t_company.star).where(_t_company.id == P())
+    row = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not row:
         err(f"Company not found: {company_id}")
     return row_to_dict(row)
@@ -79,10 +95,11 @@ def _get_company_region(conn, company):
     """Get region from company record or regional_settings."""
     region = company.get("region", "")
     if not region:
-        row = conn.execute(
-            "SELECT value FROM regional_settings WHERE company_id = ? AND key = 'region'",
-            (company["id"],),
-        ).fetchone()
+        q = (Q.from_(_t_regional)
+             .select(_t_regional.value)
+             .where(_t_regional.company_id == P())
+             .where(_t_regional.key == P()))
+        row = conn.execute(q.get_sql(), (company["id"], "region")).fetchone()
         if row:
             region = row["value"]
     return (region or "ENG").upper()
@@ -125,17 +142,17 @@ def seed_uk_defaults(conn, args):
         ("VAT Input (UK)", "tax", "asset"),
         ("VAT Control (UK)", "tax", "liability"),
     ]
+    q_chk_acct = (Q.from_(_t_account).select(_t_account.id)
+                   .where(_t_account.company_id == P())
+                   .where(_t_account.name == P()))
     for name, acct_type, root_type in vat_accounts:
-        exists = conn.execute(
-            "SELECT id FROM account WHERE company_id = ? AND name = ?",
-            (cid, name),
-        ).fetchone()
+        exists = conn.execute(q_chk_acct.get_sql(), (cid, name)).fetchone()
         if not exists:
-            conn.execute(
-                """INSERT INTO account (id, name, account_type, root_type, company_id)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (str(uuid.uuid4()), name, acct_type, root_type, cid),
-            )
+            sql, _ = insert_row("account", {
+                "id": P(), "name": P(), "account_type": P(),
+                "root_type": P(), "company_id": P(),
+            })
+            conn.execute(sql, (str(uuid.uuid4()), name, acct_type, root_type, cid))
             accounts_created += 1
 
     # Tax templates
@@ -144,29 +161,29 @@ def seed_uk_defaults(conn, args):
         ("UK VAT Reduced (5%)", "5"),
         ("UK VAT Zero (0%)", "0"),
     ]
+    q_chk_tpl = (Q.from_(_t_tax_tpl).select(_t_tax_tpl.id)
+                  .where(_t_tax_tpl.company_id == P())
+                  .where(_t_tax_tpl.name == P()))
     for tpl_name, rate in templates:
-        exists = conn.execute(
-            "SELECT id FROM tax_template WHERE company_id = ? AND name = ?",
-            (cid, tpl_name),
-        ).fetchone()
+        exists = conn.execute(q_chk_tpl.get_sql(), (cid, tpl_name)).fetchone()
         if not exists:
             tpl_id = str(uuid.uuid4())
-            conn.execute(
-                """INSERT INTO tax_template (id, name, tax_type, company_id)
-                   VALUES (?, ?, 'both', ?)""",
-                (tpl_id, tpl_name, cid),
-            )
+            sql, _ = insert_row("tax_template", {
+                "id": P(), "name": P(), "tax_type": P(), "company_id": P(),
+            })
+            conn.execute(sql, (tpl_id, tpl_name, "both", cid))
             # Get the output account
-            acct = conn.execute(
-                "SELECT id FROM account WHERE company_id = ? AND name LIKE ? LIMIT 1",
-                (cid, f"VAT Output%{rate}%"),
-            ).fetchone()
+            q_acct = (Q.from_(_t_account).select(_t_account.id)
+                       .where(_t_account.company_id == P())
+                       .where(_t_account.name.like(P()))
+                       .limit(1))
+            acct = conn.execute(q_acct.get_sql(), (cid, f"VAT Output%{rate}%")).fetchone()
             if acct:
-                conn.execute(
-                    """INSERT INTO tax_template_line (id, tax_template_id, tax_account_id, rate)
-                       VALUES (?, ?, ?, ?)""",
-                    (str(uuid.uuid4()), tpl_id, acct["id"], rate),
-                )
+                sql, _ = insert_row("tax_template_line", {
+                    "id": P(), "tax_template_id": P(),
+                    "tax_account_id": P(), "rate": P(),
+                })
+                conn.execute(sql, (str(uuid.uuid4()), tpl_id, acct["id"], rate))
             templates_created += 1
 
     conn.commit()
@@ -203,21 +220,21 @@ def setup_vat(conn, args):
     formatted = f"GB{digits}"
 
     # Store in regional_settings
+    q_chk_rs = (Q.from_(_t_regional).select(_t_regional.id)
+                 .where(_t_regional.company_id == P())
+                 .where(_t_regional.key == P()))
     for key, value in [("vat_number", formatted), ("mtd_enabled", "true")]:
-        existing = conn.execute(
-            "SELECT id FROM regional_settings WHERE company_id = ? AND key = ?",
-            (cid, key),
-        ).fetchone()
+        existing = conn.execute(q_chk_rs.get_sql(), (cid, key)).fetchone()
         if existing:
-            conn.execute(
-                "UPDATE regional_settings SET value = ?, updated_at = datetime('now') WHERE id = ?",
-                (value, existing["id"]),
-            )
+            sql = update_row("regional_settings",
+                             data={"value": P(), "updated_at": LiteralValue("datetime('now')")},
+                             where={"id": P()})
+            conn.execute(sql, (value, existing["id"]))
         else:
-            conn.execute(
-                "INSERT INTO regional_settings (id, company_id, key, value) VALUES (?, ?, ?, ?)",
-                (str(uuid.uuid4()), cid, key, value),
-            )
+            sql, _ = insert_row("regional_settings", {
+                "id": P(), "company_id": P(), "key": P(), "value": P(),
+            })
+            conn.execute(sql, (str(uuid.uuid4()), cid, key, value))
 
     conn.commit()
     audit(conn, "erpclaw-region-uk", "setup-vat", "company", cid,
@@ -241,11 +258,11 @@ def seed_uk_coa(conn, args):
     accounts = coa.get("accounts", [])
     created = 0
 
+    q_chk_coa = (Q.from_(_t_account).select(_t_account.id)
+                  .where(_t_account.company_id == P())
+                  .where(_t_account.account_number == P()))
     for acct in accounts:
-        exists = conn.execute(
-            "SELECT id FROM account WHERE company_id = ? AND account_number = ?",
-            (cid, acct["number"]),
-        ).fetchone()
+        exists = conn.execute(q_chk_coa.get_sql(), (cid, acct["number"])).fetchone()
         if not exists:
             acct_type = acct.get("type")
             root_type = acct.get("root_type", "asset")
@@ -262,13 +279,13 @@ def seed_uk_coa(conn, args):
                 acct_type = None
             if root_type not in ("asset", "liability", "equity", "income", "expense"):
                 root_type = "asset"
-            conn.execute(
-                """INSERT INTO account (id, name, account_type, root_type, company_id, account_number,
-                   is_group)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (str(uuid.uuid4()), acct["name"], acct_type, root_type, cid,
-                 acct["number"], acct.get("is_group", 0)),
-            )
+            sql, _ = insert_row("account", {
+                "id": P(), "name": P(), "account_type": P(),
+                "root_type": P(), "company_id": P(),
+                "account_number": P(), "is_group": P(),
+            })
+            conn.execute(sql, (str(uuid.uuid4()), acct["name"], acct_type,
+                               root_type, cid, acct["number"], acct.get("is_group", 0)))
             created += 1
 
     conn.commit()
@@ -298,17 +315,15 @@ def seed_uk_payroll(conn, args):
         ("Overtime", "earning", "Overtime payments", 0),
     ]
     created = 0
+    q_chk_sc = Q.from_(_t_sal_comp).select(_t_sal_comp.id).where(_t_sal_comp.name == P())
     for name, comp_type, desc, is_statutory in components:
-        exists = conn.execute(
-            "SELECT id FROM salary_component WHERE name = ?",
-            (name,),
-        ).fetchone()
+        exists = conn.execute(q_chk_sc.get_sql(), (name,)).fetchone()
         if not exists:
-            conn.execute(
-                """INSERT INTO salary_component (id, name, component_type, description, is_statutory)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (str(uuid.uuid4()), name, comp_type, desc, is_statutory),
-            )
+            sql, _ = insert_row("salary_component", {
+                "id": P(), "name": P(), "component_type": P(),
+                "description": P(), "is_statutory": P(),
+            })
+            conn.execute(sql, (str(uuid.uuid4()), name, comp_type, desc, is_statutory))
             created += 1
 
     conn.commit()
@@ -780,13 +795,15 @@ def uk_payroll_summary(conn, args):
 
     # Find salary slips for the period
     period_prefix = f"{year}-{int(month):02d}"
-    slips = conn.execute(
-        """SELECT ss.*, e.full_name, e.ssn
-           FROM salary_slip ss
-           JOIN employee e ON ss.employee_id = e.id
-           WHERE ss.company_id = ? AND ss.period_start LIKE ? AND ss.status = 'submitted'""",
-        (cid, f"{period_prefix}%"),
-    ).fetchall()
+    ss = Table("salary_slip")
+    e = Table("employee")
+    q = (Q.from_(ss)
+         .join(e).on(ss.employee_id == e.id)
+         .select(ss.star, e.full_name, e.ssn)
+         .where(ss.company_id == P())
+         .where(ss.period_start.like(P()))
+         .where(ss.status == P()))
+    slips = conn.execute(q.get_sql(), (cid, f"{period_prefix}%", "submitted")).fetchall()
 
     employees = []
     total_gross = Decimal("0")
@@ -842,13 +859,20 @@ def generate_vat_return(conn, args):
     else:
         date_to = f"{year}-{month + 1:02d}-01"
 
+    # Reusable WHERE filters for invoice queries
+    def _invoice_period_q(tbl, col_expr):
+        return (Q.from_(tbl)
+                .select(fn.Coalesce(fn.Sum(LiteralValue(f'CAST("{col_expr}" AS REAL)')), 0).as_("total"))
+                .where(tbl.company_id == P())
+                .where(tbl.posting_date >= P())
+                .where(tbl.posting_date < P())
+                .where(tbl.status == P()))
+
+    inv_params = (cid, date_from, date_to, "submitted")
+
     # Box 1: VAT due on sales
-    row = conn.execute(
-        """SELECT COALESCE(SUM(CAST(tax_amount AS REAL)), 0) as total
-           FROM sales_invoice
-           WHERE company_id = ? AND posting_date >= ? AND posting_date < ? AND status = 'submitted'""",
-        (cid, date_from, date_to),
-    ).fetchone()
+    q = _invoice_period_q(_t_si, "tax_amount")
+    row = conn.execute(q.get_sql(), inv_params).fetchone()
     box1 = round_currency(to_decimal(str(row["total"])))
 
     # Box 2: VAT due on acquisitions (EU — typically 0 post-Brexit)
@@ -858,33 +882,21 @@ def generate_vat_return(conn, args):
     box3 = round_currency(box1 + box2)
 
     # Box 4: VAT reclaimed on purchases
-    row = conn.execute(
-        """SELECT COALESCE(SUM(CAST(tax_amount AS REAL)), 0) as total
-           FROM purchase_invoice
-           WHERE company_id = ? AND posting_date >= ? AND posting_date < ? AND status = 'submitted'""",
-        (cid, date_from, date_to),
-    ).fetchone()
+    q = _invoice_period_q(_t_pi, "tax_amount")
+    row = conn.execute(q.get_sql(), inv_params).fetchone()
     box4 = round_currency(to_decimal(str(row["total"])))
 
     # Box 5: Net VAT (Box 3 - Box 4)
     box5 = round_currency(box3 - box4)
 
     # Box 6: Total sales (ex VAT)
-    row = conn.execute(
-        """SELECT COALESCE(SUM(CAST(total_amount AS REAL)), 0) as total
-           FROM sales_invoice
-           WHERE company_id = ? AND posting_date >= ? AND posting_date < ? AND status = 'submitted'""",
-        (cid, date_from, date_to),
-    ).fetchone()
+    q = _invoice_period_q(_t_si, "total_amount")
+    row = conn.execute(q.get_sql(), inv_params).fetchone()
     box6 = round_currency(to_decimal(str(row["total"])))
 
     # Box 7: Total purchases (ex VAT)
-    row = conn.execute(
-        """SELECT COALESCE(SUM(CAST(total_amount AS REAL)), 0) as total
-           FROM purchase_invoice
-           WHERE company_id = ? AND posting_date >= ? AND posting_date < ? AND status = 'submitted'""",
-        (cid, date_from, date_to),
-    ).fetchone()
+    q = _invoice_period_q(_t_pi, "total_amount")
+    row = conn.execute(q.get_sql(), inv_params).fetchone()
     box7 = round_currency(to_decimal(str(row["total"])))
 
     # Box 8: Total supplies to EU (post-Brexit NI protocol only)
@@ -926,25 +938,27 @@ def generate_mtd_payload(conn, args):
     else:
         date_to = f"{year}-{month + 1:02d}-01"
 
+    # Reusable builder for invoice aggregates
+    def _mtd_q(tbl):
+        return (Q.from_(tbl)
+                .select(
+                    fn.Coalesce(fn.Sum(LiteralValue('CAST("tax_amount" AS REAL)')), 0).as_("vat"),
+                    fn.Coalesce(fn.Sum(LiteralValue('CAST("total_amount" AS REAL)')), 0).as_("net"),
+                )
+                .where(tbl.company_id == P())
+                .where(tbl.posting_date >= P())
+                .where(tbl.posting_date < P())
+                .where(tbl.status == P()))
+
+    mtd_params = (cid, date_from, date_to, "submitted")
+
     # Sales VAT
-    row = conn.execute(
-        """SELECT COALESCE(SUM(CAST(tax_amount AS REAL)), 0) as vat,
-                  COALESCE(SUM(CAST(total_amount AS REAL)), 0) as net
-           FROM sales_invoice
-           WHERE company_id = ? AND posting_date >= ? AND posting_date < ? AND status = 'submitted'""",
-        (cid, date_from, date_to),
-    ).fetchone()
+    row = conn.execute(_mtd_q(_t_si).get_sql(), mtd_params).fetchone()
     vat_due_sales = round_currency(to_decimal(str(row["vat"])))
     total_sales = round_currency(to_decimal(str(row["net"])))
 
     # Purchase VAT
-    row = conn.execute(
-        """SELECT COALESCE(SUM(CAST(tax_amount AS REAL)), 0) as vat,
-                  COALESCE(SUM(CAST(total_amount AS REAL)), 0) as net
-           FROM purchase_invoice
-           WHERE company_id = ? AND posting_date >= ? AND posting_date < ? AND status = 'submitted'""",
-        (cid, date_from, date_to),
-    ).fetchone()
+    row = conn.execute(_mtd_q(_t_pi).get_sql(), mtd_params).fetchone()
     vat_reclaimed = round_currency(to_decimal(str(row["vat"])))
     total_purchases = round_currency(to_decimal(str(row["net"])))
 
@@ -1000,14 +1014,16 @@ def generate_fps(conn, args):
     period_prefix = f"{year}-{int(month):02d}"
 
     # Get employees with salary slips for the period
-    rows = conn.execute(
-        """SELECT e.id, e.full_name, e.first_name, e.last_name, e.ssn,
-                  ss.gross_pay, ss.total_deductions, ss.net_pay
-           FROM salary_slip ss
-           JOIN employee e ON ss.employee_id = e.id
-           WHERE ss.company_id = ? AND ss.period_start LIKE ? AND ss.status = 'submitted'""",
-        (cid, f"{period_prefix}%"),
-    ).fetchall()
+    ss = Table("salary_slip")
+    e = Table("employee")
+    q = (Q.from_(ss)
+         .join(e).on(ss.employee_id == e.id)
+         .select(e.id, e.full_name, e.first_name, e.last_name, e.ssn,
+                 ss.gross_pay, ss.total_deductions, ss.net_pay)
+         .where(ss.company_id == P())
+         .where(ss.period_start.like(P()))
+         .where(ss.status == P()))
+    rows = conn.execute(q.get_sql(), (cid, f"{period_prefix}%", "submitted")).fetchall()
 
     employees = []
     for row in rows:
@@ -1045,15 +1061,17 @@ def generate_eps(conn, args):
     period_prefix = f"{year}-{int(month):02d}"
 
     # Aggregate payroll for the period
-    row = conn.execute(
-        """SELECT COUNT(*) as emp_count,
-                  COALESCE(SUM(CAST(gross_pay AS REAL)), 0) as total_gross,
-                  COALESCE(SUM(CAST(total_deductions AS REAL)), 0) as total_deductions,
-                  COALESCE(SUM(CAST(net_pay AS REAL)), 0) as total_net
-           FROM salary_slip
-           WHERE company_id = ? AND period_start LIKE ? AND status = 'submitted'""",
-        (cid, f"{period_prefix}%"),
-    ).fetchone()
+    q = (Q.from_(_t_sal_slip)
+         .select(
+             fn.Count("*").as_("emp_count"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("gross_pay" AS REAL)')), 0).as_("total_gross"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("total_deductions" AS REAL)')), 0).as_("total_deductions"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("net_pay" AS REAL)')), 0).as_("total_net"),
+         )
+         .where(_t_sal_slip.company_id == P())
+         .where(_t_sal_slip.period_start.like(P()))
+         .where(_t_sal_slip.status == P()))
+    row = conn.execute(q.get_sql(), (cid, f"{period_prefix}%", "submitted")).fetchone()
 
     ok({
         "form": "EPS",
@@ -1075,9 +1093,8 @@ def generate_p60(conn, args):
     if not employee_id:
         err("--employee-id is required.")
 
-    employee = conn.execute(
-        "SELECT * FROM employee WHERE id = ?", (employee_id,)
-    ).fetchone()
+    q_emp = Q.from_(_t_employee).select(_t_employee.star).where(_t_employee.id == P())
+    employee = conn.execute(q_emp.get_sql(), (employee_id,)).fetchone()
     if not employee:
         err(f"Employee not found: {employee_id}")
     emp = row_to_dict(employee)
@@ -1094,14 +1111,17 @@ def generate_p60(conn, args):
         date_from = "1900-01-01"
         date_to = "2099-12-31"
 
-    row = conn.execute(
-        """SELECT COALESCE(SUM(CAST(gross_pay AS REAL)), 0) as total_gross,
-                  COALESCE(SUM(CAST(total_deductions AS REAL)), 0) as total_tax,
-                  COALESCE(SUM(CAST(net_pay AS REAL)), 0) as total_net
-           FROM salary_slip
-           WHERE employee_id = ? AND period_start >= ? AND period_start <= ? AND status = 'submitted'""",
-        (employee_id, date_from, date_to),
-    ).fetchone()
+    q = (Q.from_(_t_sal_slip)
+         .select(
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("gross_pay" AS REAL)')), 0).as_("total_gross"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("total_deductions" AS REAL)')), 0).as_("total_tax"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("net_pay" AS REAL)')), 0).as_("total_net"),
+         )
+         .where(_t_sal_slip.employee_id == P())
+         .where(_t_sal_slip.period_start >= P())
+         .where(_t_sal_slip.period_start <= P())
+         .where(_t_sal_slip.status == P()))
+    row = conn.execute(q.get_sql(), (employee_id, date_from, date_to, "submitted")).fetchone()
 
     ok({
         "form": "P60",
@@ -1121,9 +1141,8 @@ def generate_p45(conn, args):
     if not employee_id:
         err("--employee-id is required.")
 
-    employee = conn.execute(
-        "SELECT * FROM employee WHERE id = ?", (employee_id,)
-    ).fetchone()
+    q_emp = Q.from_(_t_employee).select(_t_employee.star).where(_t_employee.id == P())
+    employee = conn.execute(q_emp.get_sql(), (employee_id,)).fetchone()
     if not employee:
         err(f"Employee not found: {employee_id}")
     emp = row_to_dict(employee)
@@ -1133,13 +1152,14 @@ def generate_p45(conn, args):
     leaving_date = emp.get("date_of_leaving", "")
 
     # Total pay and tax up to leaving date
-    row = conn.execute(
-        """SELECT COALESCE(SUM(CAST(gross_pay AS REAL)), 0) as total_gross,
-                  COALESCE(SUM(CAST(total_deductions AS REAL)), 0) as total_tax
-           FROM salary_slip
-           WHERE employee_id = ? AND status = 'submitted'""",
-        (employee_id,),
-    ).fetchone()
+    q = (Q.from_(_t_sal_slip)
+         .select(
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("gross_pay" AS REAL)')), 0).as_("total_gross"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("total_deductions" AS REAL)')), 0).as_("total_tax"),
+         )
+         .where(_t_sal_slip.employee_id == P())
+         .where(_t_sal_slip.status == P()))
+    row = conn.execute(q.get_sql(), (employee_id, "submitted")).fetchone()
 
     ok({
         "form": "P45",
@@ -1192,36 +1212,40 @@ def uk_tax_summary(conn, args):
     if not from_date or not to_date:
         err("--from-date and --to-date are required.")
 
+    # Reusable builder for tax summary invoice queries (uses <= for to_date)
+    def _tax_sum_q(tbl, col_expr):
+        return (Q.from_(tbl)
+                .select(fn.Coalesce(fn.Sum(LiteralValue(f'CAST("{col_expr}" AS REAL)')), 0).as_("total"))
+                .where(tbl.company_id == P())
+                .where(tbl.posting_date >= P())
+                .where(tbl.posting_date <= P())
+                .where(tbl.status == P()))
+
+    ts_params = (cid, from_date, to_date, "submitted")
+
     # VAT collected (sales)
-    row = conn.execute(
-        """SELECT COALESCE(SUM(CAST(tax_amount AS REAL)), 0) as total
-           FROM sales_invoice
-           WHERE company_id = ? AND posting_date >= ? AND posting_date <= ? AND status = 'submitted'""",
-        (cid, from_date, to_date),
-    ).fetchone()
+    row = conn.execute(_tax_sum_q(_t_si, "tax_amount").get_sql(), ts_params).fetchone()
     vat_collected = round_currency(to_decimal(str(row["total"])))
 
     # VAT reclaimed (purchases)
-    row = conn.execute(
-        """SELECT COALESCE(SUM(CAST(tax_amount AS REAL)), 0) as total
-           FROM purchase_invoice
-           WHERE company_id = ? AND posting_date >= ? AND posting_date <= ? AND status = 'submitted'""",
-        (cid, from_date, to_date),
-    ).fetchone()
+    row = conn.execute(_tax_sum_q(_t_pi, "tax_amount").get_sql(), ts_params).fetchone()
     vat_reclaimed = round_currency(to_decimal(str(row["total"])))
 
     net_vat = round_currency(vat_collected - vat_reclaimed)
 
     # Payroll totals
-    row = conn.execute(
-        """SELECT COUNT(*) as slip_count,
-                  COALESCE(SUM(CAST(gross_pay AS REAL)), 0) as total_gross,
-                  COALESCE(SUM(CAST(total_deductions AS REAL)), 0) as total_deductions,
-                  COALESCE(SUM(CAST(net_pay AS REAL)), 0) as total_net
-           FROM salary_slip
-           WHERE company_id = ? AND period_start >= ? AND period_start <= ? AND status = 'submitted'""",
-        (cid, from_date, to_date),
-    ).fetchone()
+    q = (Q.from_(_t_sal_slip)
+         .select(
+             fn.Count("*").as_("slip_count"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("gross_pay" AS REAL)')), 0).as_("total_gross"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("total_deductions" AS REAL)')), 0).as_("total_deductions"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("net_pay" AS REAL)')), 0).as_("total_net"),
+         )
+         .where(_t_sal_slip.company_id == P())
+         .where(_t_sal_slip.period_start >= P())
+         .where(_t_sal_slip.period_start <= P())
+         .where(_t_sal_slip.status == P()))
+    row = conn.execute(q.get_sql(), ts_params).fetchone()
 
     ok({
         "report": "UK Tax Summary",
@@ -1279,10 +1303,11 @@ def status(conn, args):
             _check_uk_company(company)
             cid = company["id"]
             try:
-                vat_row = conn.execute(
-                    "SELECT value FROM regional_settings WHERE company_id = ? AND key = 'vat_number'",
-                    (cid,),
-                ).fetchone()
+                q_vat = (Q.from_(_t_regional)
+                          .select(_t_regional.value)
+                          .where(_t_regional.company_id == P())
+                          .where(_t_regional.key == P()))
+                vat_row = conn.execute(q_vat.get_sql(), (cid, "vat_number")).fetchone()
                 result["vat_configured"] = vat_row is not None
             except Exception:
                 result["vat_configured"] = False

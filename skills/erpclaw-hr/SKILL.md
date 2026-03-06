@@ -4,7 +4,7 @@ version: 1.0.0
 description: Human Resources management -- employees, departments, leave, attendance, expense claims, and employee lifecycle for ERPClaw ERP
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-hr
 tier: 4
 category: hr
 requires: [erpclaw-setup, erpclaw-gl]

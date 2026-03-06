@@ -26,6 +26,11 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
+    from erpclaw_lib.query import (
+        Q, P, Table, Field, fn, Case, Order,
+        DecimalSum, insert_row, update_row,
+    )
+    from erpclaw_lib.vendor.pypika.terms import ValueWrapper
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
@@ -43,6 +48,17 @@ VALID_MILESTONE_STATUSES = ("pending", "completed", "missed")
 VALID_TIMESHEET_STATUSES = ("draft", "submitted", "billed", "cancelled")
 VALID_ACTIVITY_TYPES = ("development", "design", "consulting", "support", "admin")
 
+# ── PyPika table aliases ──
+_t_company = Table("company")
+_t_project = Table("project")
+_t_task = Table("task")
+_t_milestone = Table("milestone")
+_t_timesheet = Table("timesheet")
+_t_ts_detail = Table("timesheet_detail")
+_t_employee = Table("employee")
+_t_customer = Table("customer")
+_t_cost_center = Table("cost_center")
+
 
 def _parse_json_arg(value, name):
     if value is None:
@@ -55,9 +71,8 @@ def _parse_json_arg(value, name):
 
 def _validate_company_exists(conn, company_id: str):
     """Validate that a company exists and return the row, or error."""
-    company = conn.execute(
-        "SELECT id FROM company WHERE id = ?", (company_id,),
-    ).fetchone()
+    q = Q.from_(_t_company).select(_t_company.id).where(_t_company.id == P())
+    company = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not company:
         err(f"Company {company_id} not found")
     return company
@@ -65,9 +80,8 @@ def _validate_company_exists(conn, company_id: str):
 
 def _validate_project_exists(conn, project_id: str):
     """Validate that a project exists and return the row, or error."""
-    project = conn.execute(
-        "SELECT * FROM project WHERE id = ?", (project_id,),
-    ).fetchone()
+    q = Q.from_(_t_project).select(_t_project.star).where(_t_project.id == P())
+    project = conn.execute(q.get_sql(), (project_id,)).fetchone()
     if not project:
         err(f"Project {project_id} not found",
              suggestion="Use 'list projects' to see available projects.")
@@ -76,9 +90,8 @@ def _validate_project_exists(conn, project_id: str):
 
 def _validate_task_exists(conn, task_id: str):
     """Validate that a task exists and return the row, or error."""
-    task = conn.execute(
-        "SELECT * FROM task WHERE id = ?", (task_id,),
-    ).fetchone()
+    q = Q.from_(_t_task).select(_t_task.star).where(_t_task.id == P())
+    task = conn.execute(q.get_sql(), (task_id,)).fetchone()
     if not task:
         err(f"Task {task_id} not found")
     return task
@@ -86,9 +99,8 @@ def _validate_task_exists(conn, task_id: str):
 
 def _validate_milestone_exists(conn, milestone_id: str):
     """Validate that a milestone exists and return the row, or error."""
-    milestone = conn.execute(
-        "SELECT * FROM milestone WHERE id = ?", (milestone_id,),
-    ).fetchone()
+    q = Q.from_(_t_milestone).select(_t_milestone.star).where(_t_milestone.id == P())
+    milestone = conn.execute(q.get_sql(), (milestone_id,)).fetchone()
     if not milestone:
         err(f"Milestone {milestone_id} not found")
     return milestone
@@ -96,9 +108,8 @@ def _validate_milestone_exists(conn, milestone_id: str):
 
 def _validate_timesheet_exists(conn, timesheet_id: str):
     """Validate that a timesheet exists and return the row, or error."""
-    ts = conn.execute(
-        "SELECT * FROM timesheet WHERE id = ?", (timesheet_id,),
-    ).fetchone()
+    q = Q.from_(_t_timesheet).select(_t_timesheet.star).where(_t_timesheet.id == P())
+    ts = conn.execute(q.get_sql(), (timesheet_id,)).fetchone()
     if not ts:
         err(f"Timesheet {timesheet_id} not found")
     return ts
@@ -106,9 +117,8 @@ def _validate_timesheet_exists(conn, timesheet_id: str):
 
 def _validate_employee_exists(conn, employee_id: str):
     """Validate that an employee exists and return the row, or error."""
-    emp = conn.execute(
-        "SELECT * FROM employee WHERE id = ?", (employee_id,),
-    ).fetchone()
+    q = Q.from_(_t_employee).select(_t_employee.star).where(_t_employee.id == P())
+    emp = conn.execute(q.get_sql(), (employee_id,)).fetchone()
     if not emp:
         err(f"Employee {employee_id} not found")
     return emp
@@ -116,9 +126,8 @@ def _validate_employee_exists(conn, employee_id: str):
 
 def _validate_customer_exists(conn, customer_id: str):
     """Validate that a customer exists and return the row, or error."""
-    cust = conn.execute(
-        "SELECT * FROM customer WHERE id = ?", (customer_id,),
-    ).fetchone()
+    q = Q.from_(_t_customer).select(_t_customer.star).where(_t_customer.id == P())
+    cust = conn.execute(q.get_sql(), (customer_id,)).fetchone()
     if not cust:
         err(f"Customer {customer_id} not found")
     return cust
@@ -169,10 +178,9 @@ def add_project(conn, args):
             err("--estimated-cost must be >= 0")
 
     if args.cost_center_id:
-        cc = conn.execute(
-            "SELECT id FROM cost_center WHERE id = ? OR name = ?",
-            (args.cost_center_id, args.cost_center_id),
-        ).fetchone()
+        cc_q = (Q.from_(_t_cost_center).select(_t_cost_center.id)
+                .where((_t_cost_center.id == P()) | (_t_cost_center.name == P())))
+        cc = conn.execute(cc_q.get_sql(), (args.cost_center_id, args.cost_center_id)).fetchone()
         if not cc:
             err(f"Cost center {args.cost_center_id} not found")
         args.cost_center_id = cc["id"]
@@ -180,22 +188,25 @@ def add_project(conn, args):
     project_id = str(uuid.uuid4())
     naming = get_next_name(conn, "project", company_id=args.company_id)
 
-    conn.execute(
-        """INSERT INTO project
-           (id, naming_series, project_name, customer_id, project_type, status,
-            priority, start_date, end_date, estimated_cost, actual_cost,
-            billing_type, total_billed, profit_margin, percent_complete,
-            cost_center_id, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '0', ?, '0', '0', '0', ?, ?)""",
-        (project_id, naming, args.name, args.customer_id, project_type,
-         status, priority, args.start_date, args.end_date, estimated_cost,
-         billing_type, args.cost_center_id, args.company_id),
-    )
+    ins_sql, _ = insert_row("project", {
+        "id": P(), "naming_series": P(), "project_name": P(),
+        "customer_id": P(), "project_type": P(), "status": P(),
+        "priority": P(), "start_date": P(), "end_date": P(),
+        "estimated_cost": P(), "actual_cost": P(), "billing_type": P(),
+        "total_billed": P(), "profit_margin": P(), "percent_complete": P(),
+        "cost_center_id": P(), "company_id": P(),
+    })
+    conn.execute(ins_sql, (
+        project_id, naming, args.name, args.customer_id, project_type,
+        status, priority, args.start_date, args.end_date, estimated_cost,
+        "0", billing_type, "0", "0", "0", args.cost_center_id, args.company_id,
+    ))
     audit(conn, "erpclaw-projects", "add-project", "project", project_id,
            new_values={"project_name": args.name, "company_id": args.company_id})
     conn.commit()
 
-    project = conn.execute("SELECT * FROM project WHERE id = ?", (project_id,)).fetchone()
+    q = Q.from_(_t_project).select(_t_project.star).where(_t_project.id == P())
+    project = conn.execute(q.get_sql(), (project_id,)).fetchone()
     ok({"project": row_to_dict(project)})
 
 
@@ -286,10 +297,9 @@ def update_project(conn, args):
 
     if args.cost_center_id is not None:
         if args.cost_center_id:
-            cc = conn.execute(
-                "SELECT id FROM cost_center WHERE id = ? OR name = ?",
-                (args.cost_center_id, args.cost_center_id),
-            ).fetchone()
+            cc_q = (Q.from_(_t_cost_center).select(_t_cost_center.id)
+                    .where((_t_cost_center.id == P()) | (_t_cost_center.name == P())))
+            cc = conn.execute(cc_q.get_sql(), (args.cost_center_id, args.cost_center_id)).fetchone()
             if not cc:
                 err(f"Cost center {args.cost_center_id} not found")
             args.cost_center_id = cc["id"]
@@ -315,7 +325,8 @@ def update_project(conn, args):
     conn.execute(sql, params)
 
     # Recalculate profit_margin from current values
-    updated = conn.execute("SELECT * FROM project WHERE id = ?", (args.project_id,)).fetchone()
+    refetch_q = Q.from_(_t_project).select(_t_project.star).where(_t_project.id == P())
+    updated = conn.execute(refetch_q.get_sql(), (args.project_id,)).fetchone()
     total_billed = to_decimal(updated["total_billed"])
     actual_cost = to_decimal(updated["actual_cost"])
     if total_billed > 0:
@@ -325,16 +336,14 @@ def update_project(conn, args):
     else:
         profit_margin = Decimal("0")
 
-    conn.execute(
-        "UPDATE project SET profit_margin = ? WHERE id = ?",
-        (str(profit_margin), args.project_id),
-    )
+    margin_sql = update_row("project", {"profit_margin": P()}, {"id": P()})
+    conn.execute(margin_sql, (str(profit_margin), args.project_id))
 
     audit(conn, "erpclaw-projects", "update-project", "project", args.project_id,
            old_values=old_values, description="Project updated")
     conn.commit()
 
-    project = conn.execute("SELECT * FROM project WHERE id = ?", (args.project_id,)).fetchone()
+    project = conn.execute(refetch_q.get_sql(), (args.project_id,)).fetchone()
     ok({"project": row_to_dict(project)})
 
 
@@ -354,31 +363,36 @@ def get_project(conn, args):
     project_dict = row_to_dict(project)
 
     # Fetch tasks
-    tasks = conn.execute(
-        "SELECT * FROM task WHERE project_id = ? ORDER BY start_date, task_name",
-        (args.project_id,),
-    ).fetchall()
+    tasks_q = (Q.from_(_t_task).select(_t_task.star)
+               .where(_t_task.project_id == P())
+               .orderby(_t_task.start_date)
+               .orderby(_t_task.task_name))
+    tasks = conn.execute(tasks_q.get_sql(), (args.project_id,)).fetchall()
     project_dict["tasks"] = [row_to_dict(t) for t in tasks]
 
     # Fetch milestones
-    milestones = conn.execute(
-        "SELECT * FROM milestone WHERE project_id = ? ORDER BY target_date",
-        (args.project_id,),
-    ).fetchall()
+    ms_q = (Q.from_(_t_milestone).select(_t_milestone.star)
+            .where(_t_milestone.project_id == P())
+            .orderby(_t_milestone.target_date))
+    milestones = conn.execute(ms_q.get_sql(), (args.project_id,)).fetchall()
     project_dict["milestones"] = [row_to_dict(m) for m in milestones]
 
     # Timesheet summary: aggregate from timesheet_detail for this project
-    ts_summary = conn.execute(
-        """SELECT
-               COALESCE(decimal_sum(td.hours), '0') AS total_hours,
-               COALESCE(SUM(CASE WHEN td.billable = 1 THEN td.hours + 0 ELSE 0 END), 0) AS billable_hours,
-               COALESCE(SUM(CASE WHEN td.billable = 1 THEN (td.hours + 0) * (td.billing_rate + 0) ELSE 0 END), 0) AS billable_amount,
-               COUNT(DISTINCT td.timesheet_id) AS timesheet_count
-           FROM timesheet_detail td
-           JOIN timesheet ts ON td.timesheet_id = ts.id
-           WHERE td.project_id = ? AND ts.status IN ('submitted', 'billed')""",
-        (args.project_id,),
-    ).fetchone()
+    td = Table("timesheet_detail")
+    ts = Table("timesheet")
+    billable_hours_case = Case().when(td.billable == 1, td.hours + 0).else_(0)
+    billable_amt_case = Case().when(td.billable == 1, (td.hours + 0) * (td.billing_rate + 0)).else_(0)
+    ts_sum_q = (Q.from_(td)
+                .join(ts).on(td.timesheet_id == ts.id)
+                .select(
+                    fn.Coalesce(DecimalSum(td.hours), ValueWrapper("0")).as_("total_hours"),
+                    fn.Coalesce(fn.Sum(billable_hours_case), 0).as_("billable_hours"),
+                    fn.Coalesce(fn.Sum(billable_amt_case), 0).as_("billable_amount"),
+                    fn.Count(td.timesheet_id, alias="timesheet_count").distinct(),
+                )
+                .where(td.project_id == P())
+                .where(ts.status.isin(["submitted", "billed"])))
+    ts_summary = conn.execute(ts_sum_q.get_sql(), (args.project_id,)).fetchone()
     project_dict["timesheet_summary"] = {
         "total_hours": str(round_currency(to_decimal(str(ts_summary["total_hours"])))),
         "billable_hours": str(round_currency(to_decimal(str(ts_summary["billable_hours"])))),
@@ -399,50 +413,50 @@ def list_projects(conn, args):
     Optional: --company-id, --status, --from-date, --to-date, --search,
               --customer-id, --limit, --offset
     """
-    conditions = []
+    p = _t_project
     params = []
 
+    base_q = Q.from_(p)
+
     if args.company_id:
-        conditions.append("company_id = ?")
+        base_q = base_q.where(p.company_id == P())
         params.append(args.company_id)
 
     if args.status:
         if args.status not in VALID_PROJECT_STATUSES:
             err(f"Invalid --status: {args.status}. Must be one of {VALID_PROJECT_STATUSES}")
-        conditions.append("status = ?")
+        base_q = base_q.where(p.status == P())
         params.append(args.status)
 
     if args.customer_id:
-        conditions.append("customer_id = ?")
+        base_q = base_q.where(p.customer_id == P())
         params.append(args.customer_id)
 
     if args.from_date:
-        conditions.append("start_date >= ?")
+        base_q = base_q.where(p.start_date >= P())
         params.append(args.from_date)
 
     if args.to_date:
-        conditions.append("(end_date <= ? OR end_date IS NULL)")
+        base_q = base_q.where((p.end_date <= P()) | (p.end_date.isnull()))
         params.append(args.to_date)
 
     if args.search:
-        conditions.append("project_name LIKE ?")
+        base_q = base_q.where(p.project_name.like(P()))
         params.append(f"%{args.search}%")
 
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     limit = int(args.limit or "20")
     offset = int(args.offset or "0")
 
     # Count
-    count_row = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM project {where}", params,
-    ).fetchone()
+    count_q = base_q.select(fn.Count("*", alias="cnt"))
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total = count_row["cnt"]
 
     # Fetch
-    rows = conn.execute(
-        f"SELECT * FROM project {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        params + [limit, offset],
-    ).fetchall()
+    fetch_q = (base_q.select(p.star)
+               .orderby(p.created_at, order=Order.desc)
+               .limit(P()).offset(P()))
+    rows = conn.execute(fetch_q.get_sql(), params + [limit, offset]).fetchall()
 
     ok({
         "projects": [row_to_dict(r) for r in rows],
@@ -494,14 +508,13 @@ def add_task(conn, args):
 
     # Validate depends_on task IDs
     depends_on = None
+    dep_q = Q.from_(_t_task).select(_t_task.id, _t_task.project_id).where(_t_task.id == P())
     if args.depends_on:
         dep_ids = _parse_json_arg(args.depends_on, "depends-on")
         if not isinstance(dep_ids, list):
             err("--depends-on must be a JSON array of task IDs")
         for dep_id in dep_ids:
-            dep_task = conn.execute(
-                "SELECT id, project_id FROM task WHERE id = ?", (dep_id,),
-            ).fetchone()
+            dep_task = conn.execute(dep_q.get_sql(), (dep_id,)).fetchone()
             if not dep_task:
                 err(f"Dependency task {dep_id} not found")
             if dep_task["project_id"] != args.project_id:
@@ -512,21 +525,23 @@ def add_task(conn, args):
     # Use project's company_id for naming
     naming = get_next_name(conn, "task", company_id=project["company_id"])
 
-    conn.execute(
-        """INSERT INTO task
-           (id, naming_series, project_id, task_name, parent_task_id,
-            assigned_to, status, priority, start_date, end_date,
-            estimated_hours, actual_hours, depends_on, description)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '0', ?, ?)""",
-        (task_id, naming, args.project_id, args.name, args.parent_task_id,
-         args.assigned_to, status, priority, args.start_date, args.end_date,
-         estimated_hours, depends_on, args.description),
-    )
+    ins_sql, _ = insert_row("task", {
+        "id": P(), "naming_series": P(), "project_id": P(), "task_name": P(),
+        "parent_task_id": P(), "assigned_to": P(), "status": P(), "priority": P(),
+        "start_date": P(), "end_date": P(), "estimated_hours": P(),
+        "actual_hours": P(), "depends_on": P(), "description": P(),
+    })
+    conn.execute(ins_sql, (
+        task_id, naming, args.project_id, args.name, args.parent_task_id,
+        args.assigned_to, status, priority, args.start_date, args.end_date,
+        estimated_hours, "0", depends_on, args.description,
+    ))
     audit(conn, "erpclaw-projects", "add-task", "task", task_id,
            new_values={"task_name": args.name, "project_id": args.project_id})
     conn.commit()
 
-    task = conn.execute("SELECT * FROM task WHERE id = ?", (task_id,)).fetchone()
+    refetch_q = Q.from_(_t_task).select(_t_task.star).where(_t_task.id == P())
+    task = conn.execute(refetch_q.get_sql(), (task_id,)).fetchone()
     ok({"task": row_to_dict(task)})
 
 
@@ -602,10 +617,9 @@ def update_task(conn, args):
             if not isinstance(dep_ids, list):
                 err("--depends-on must be a JSON array of task IDs")
             project_id = task["project_id"]
+            dep_q = Q.from_(_t_task).select(_t_task.id, _t_task.project_id).where(_t_task.id == P())
             for dep_id in dep_ids:
-                dep_task = conn.execute(
-                    "SELECT id, project_id FROM task WHERE id = ?", (dep_id,),
-                ).fetchone()
+                dep_task = conn.execute(dep_q.get_sql(), (dep_id,)).fetchone()
                 if not dep_task:
                     err(f"Dependency task {dep_id} not found")
                 if dep_task["project_id"] != project_id:
@@ -630,7 +644,8 @@ def update_task(conn, args):
            old_values=old_values, description="Task updated")
     conn.commit()
 
-    task = conn.execute("SELECT * FROM task WHERE id = ?", (args.task_id,)).fetchone()
+    refetch_q = Q.from_(_t_task).select(_t_task.star).where(_t_task.id == P())
+    task = conn.execute(refetch_q.get_sql(), (args.task_id,)).fetchone()
     ok({"task": row_to_dict(task)})
 
 
@@ -649,38 +664,37 @@ def list_tasks(conn, args):
 
     _validate_project_exists(conn, args.project_id)
 
-    conditions = ["project_id = ?"]
+    t = _t_task
     params = [args.project_id]
+    base_q = Q.from_(t).where(t.project_id == P())
 
     if args.status:
         if args.status not in VALID_TASK_STATUSES:
             err(f"Invalid --status: {args.status}. Must be one of {VALID_TASK_STATUSES}")
-        conditions.append("status = ?")
+        base_q = base_q.where(t.status == P())
         params.append(args.status)
 
     if args.assigned_to:
-        conditions.append("assigned_to = ?")
+        base_q = base_q.where(t.assigned_to == P())
         params.append(args.assigned_to)
 
     if args.priority:
         if args.priority not in VALID_TASK_PRIORITIES:
             err(f"Invalid --priority: {args.priority}. Must be one of {VALID_TASK_PRIORITIES}")
-        conditions.append("priority = ?")
+        base_q = base_q.where(t.priority == P())
         params.append(args.priority)
 
-    where = f"WHERE {' AND '.join(conditions)}"
     limit = int(args.limit or "20")
     offset = int(args.offset or "0")
 
-    count_row = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM task {where}", params,
-    ).fetchone()
+    count_q = base_q.select(fn.Count("*", alias="cnt"))
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total = count_row["cnt"]
 
-    rows = conn.execute(
-        f"SELECT * FROM task {where} ORDER BY start_date, task_name LIMIT ? OFFSET ?",
-        params + [limit, offset],
-    ).fetchall()
+    fetch_q = (base_q.select(t.star)
+               .orderby(t.start_date).orderby(t.task_name)
+               .limit(P()).offset(P()))
+    rows = conn.execute(fetch_q.get_sql(), params + [limit, offset]).fetchall()
 
     ok({
         "tasks": [row_to_dict(r) for r in rows],
@@ -712,20 +726,20 @@ def add_milestone(conn, args):
 
     milestone_id = str(uuid.uuid4())
 
-    conn.execute(
-        """INSERT INTO milestone
-           (id, project_id, milestone_name, target_date, status, description)
-           VALUES (?, ?, ?, ?, 'pending', ?)""",
-        (milestone_id, args.project_id, args.name, args.target_date,
-         args.description),
-    )
+    ins_sql, _ = insert_row("milestone", {
+        "id": P(), "project_id": P(), "milestone_name": P(),
+        "target_date": P(), "status": P(), "description": P(),
+    })
+    conn.execute(ins_sql, (
+        milestone_id, args.project_id, args.name, args.target_date,
+        "pending", args.description,
+    ))
     audit(conn, "erpclaw-projects", "add-milestone", "milestone", milestone_id,
            new_values={"milestone_name": args.name, "project_id": args.project_id})
     conn.commit()
 
-    milestone = conn.execute(
-        "SELECT * FROM milestone WHERE id = ?", (milestone_id,),
-    ).fetchone()
+    refetch_q = Q.from_(_t_milestone).select(_t_milestone.star).where(_t_milestone.id == P())
+    milestone = conn.execute(refetch_q.get_sql(), (milestone_id,)).fetchone()
     ok({"milestone": row_to_dict(milestone)})
 
 
@@ -783,9 +797,8 @@ def update_milestone(conn, args):
            old_values=old_values, description="Milestone updated")
     conn.commit()
 
-    milestone = conn.execute(
-        "SELECT * FROM milestone WHERE id = ?", (args.milestone_id,),
-    ).fetchone()
+    refetch_q = Q.from_(_t_milestone).select(_t_milestone.star).where(_t_milestone.id == P())
+    milestone = conn.execute(refetch_q.get_sql(), (args.milestone_id,)).fetchone()
     ok({"milestone": row_to_dict(milestone)})
 
 
@@ -890,28 +903,31 @@ def add_timesheet(conn, args):
     total_cost = round_currency(total_cost)
 
     # Insert timesheet header
-    conn.execute(
-        """INSERT INTO timesheet
-           (id, naming_series, employee_id, start_date, end_date,
-            total_hours, total_billable_hours, total_billed_hours,
-            total_cost, total_billable_amount, status, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, '0', ?, ?, 'draft', ?)""",
-        (timesheet_id, naming, args.employee_id, args.start_date,
-         args.end_date, str(total_hours), str(total_billable_hours),
-         str(total_cost), str(total_billable_amount), args.company_id),
-    )
+    hdr_sql, _ = insert_row("timesheet", {
+        "id": P(), "naming_series": P(), "employee_id": P(),
+        "start_date": P(), "end_date": P(), "total_hours": P(),
+        "total_billable_hours": P(), "total_billed_hours": P(),
+        "total_cost": P(), "total_billable_amount": P(),
+        "status": P(), "company_id": P(),
+    })
+    conn.execute(hdr_sql, (
+        timesheet_id, naming, args.employee_id, args.start_date,
+        args.end_date, str(total_hours), str(total_billable_hours), "0",
+        str(total_cost), str(total_billable_amount), "draft", args.company_id,
+    ))
 
     # Insert detail rows
+    dtl_sql, _ = insert_row("timesheet_detail", {
+        "id": P(), "timesheet_id": P(), "project_id": P(), "task_id": P(),
+        "activity_type": P(), "hours": P(), "billing_rate": P(),
+        "billable": P(), "description": P(), "date": P(),
+    })
     for d in detail_rows:
-        conn.execute(
-            """INSERT INTO timesheet_detail
-               (id, timesheet_id, project_id, task_id, activity_type,
-                hours, billing_rate, billable, description, date)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (d["id"], d["timesheet_id"], d["project_id"], d["task_id"],
-             d["activity_type"], d["hours"], d["billing_rate"], d["billable"],
-             d["description"], d["date"]),
-        )
+        conn.execute(dtl_sql, (
+            d["id"], d["timesheet_id"], d["project_id"], d["task_id"],
+            d["activity_type"], d["hours"], d["billing_rate"], d["billable"],
+            d["description"], d["date"],
+        ))
 
     audit(conn, "erpclaw-projects", "add-timesheet", "timesheet", timesheet_id,
            new_values={"employee_id": args.employee_id,
@@ -919,11 +935,12 @@ def add_timesheet(conn, args):
                        "items_count": len(detail_rows)})
     conn.commit()
 
-    ts = conn.execute("SELECT * FROM timesheet WHERE id = ?", (timesheet_id,)).fetchone()
-    details = conn.execute(
-        "SELECT * FROM timesheet_detail WHERE timesheet_id = ? ORDER BY date",
-        (timesheet_id,),
-    ).fetchall()
+    ts_q = Q.from_(_t_timesheet).select(_t_timesheet.star).where(_t_timesheet.id == P())
+    ts = conn.execute(ts_q.get_sql(), (timesheet_id,)).fetchone()
+    dtl_q = (Q.from_(_t_ts_detail).select(_t_ts_detail.star)
+             .where(_t_ts_detail.timesheet_id == P())
+             .orderby(_t_ts_detail.date))
+    details = conn.execute(dtl_q.get_sql(), (timesheet_id,)).fetchall()
 
     result = row_to_dict(ts)
     result["items"] = [row_to_dict(d) for d in details]
@@ -945,16 +962,17 @@ def get_timesheet(conn, args):
     ts = _validate_timesheet_exists(conn, args.timesheet_id)
     result = row_to_dict(ts)
 
-    details = conn.execute(
-        "SELECT * FROM timesheet_detail WHERE timesheet_id = ? ORDER BY date",
-        (args.timesheet_id,),
-    ).fetchall()
+    dtl_q = (Q.from_(_t_ts_detail).select(_t_ts_detail.star)
+             .where(_t_ts_detail.timesheet_id == P())
+             .orderby(_t_ts_detail.date))
+    details = conn.execute(dtl_q.get_sql(), (args.timesheet_id,)).fetchall()
     result["items"] = [row_to_dict(d) for d in details]
 
     # Include employee name
-    emp = conn.execute(
-        "SELECT full_name AS employee_name FROM employee WHERE id = ?", (ts["employee_id"],),
-    ).fetchone()
+    emp_q = (Q.from_(_t_employee)
+             .select(_t_employee.full_name.as_("employee_name"))
+             .where(_t_employee.id == P()))
+    emp = conn.execute(emp_q.get_sql(), (ts["employee_id"],)).fetchone()
     if emp:
         result["employee_name"] = emp["employee_name"]
 
@@ -971,56 +989,88 @@ def list_timesheets(conn, args):
     Optional: --company-id, --employee-id, --project-id, --status,
               --from-date, --to-date, --limit, --offset
     """
-    conditions = []
+    ts = Table("timesheet")
+    td = Table("timesheet_detail")
     params = []
 
+    base_q = Q.from_(ts)
+
     if args.company_id:
-        conditions.append("ts.company_id = ?")
+        base_q = base_q.where(ts.company_id == P())
         params.append(args.company_id)
 
     if args.employee_id:
-        conditions.append("ts.employee_id = ?")
+        base_q = base_q.where(ts.employee_id == P())
         params.append(args.employee_id)
 
     if args.status:
         if args.status not in VALID_TIMESHEET_STATUSES:
             err(f"Invalid --status: {args.status}. Must be one of {VALID_TIMESHEET_STATUSES}")
-        conditions.append("ts.status = ?")
+        base_q = base_q.where(ts.status == P())
         params.append(args.status)
 
     if args.from_date:
-        conditions.append("ts.start_date >= ?")
+        base_q = base_q.where(ts.start_date >= P())
         params.append(args.from_date)
 
     if args.to_date:
-        conditions.append("ts.end_date <= ?")
+        base_q = base_q.where(ts.end_date <= P())
         params.append(args.to_date)
 
     # If --project-id filter, join to detail to find timesheets for that project
-    join_clause = ""
+    use_distinct = False
     if args.project_id:
-        join_clause = "JOIN timesheet_detail td ON ts.id = td.timesheet_id"
-        conditions.append("td.project_id = ?")
+        base_q = base_q.join(td).on(ts.id == td.timesheet_id)
+        base_q = base_q.where(td.project_id == P())
         params.append(args.project_id)
+        use_distinct = True
 
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     limit = int(args.limit or "20")
     offset = int(args.offset or "0")
 
     # Use DISTINCT when joining to detail
-    distinct = "DISTINCT" if args.project_id else ""
-
-    count_row = conn.execute(
-        f"SELECT COUNT({distinct} ts.id) AS cnt FROM timesheet ts {join_clause} {where}",
-        params,
-    ).fetchone()
+    if use_distinct:
+        count_q = base_q.select(fn.Count(ts.id, alias="cnt").distinct())
+    else:
+        count_q = base_q.select(fn.Count(ts.id, alias="cnt"))
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total = count_row["cnt"]
 
-    rows = conn.execute(
-        f"""SELECT {distinct} ts.* FROM timesheet ts {join_clause} {where}
-            ORDER BY ts.created_at DESC LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
+    # For DISTINCT ts.* with JOIN, use raw SQL fragment since PyPika
+    # DISTINCT applies to the whole SELECT, not individual columns for ts.*
+    if use_distinct:
+        # Build WHERE from base_q but use raw for DISTINCT ts.*
+        conditions = []
+        raw_params = []
+        if args.company_id:
+            conditions.append("ts.company_id = ?")
+            raw_params.append(args.company_id)
+        if args.employee_id:
+            conditions.append("ts.employee_id = ?")
+            raw_params.append(args.employee_id)
+        if args.status:
+            conditions.append("ts.status = ?")
+            raw_params.append(args.status)
+        if args.from_date:
+            conditions.append("ts.start_date >= ?")
+            raw_params.append(args.from_date)
+        if args.to_date:
+            conditions.append("ts.end_date <= ?")
+            raw_params.append(args.to_date)
+        conditions.append("td.project_id = ?")
+        raw_params.append(args.project_id)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        rows = conn.execute(
+            f"SELECT DISTINCT ts.* FROM timesheet ts "
+            f"JOIN timesheet_detail td ON ts.id = td.timesheet_id "
+            f"{where} ORDER BY ts.created_at DESC LIMIT ? OFFSET ?",
+            raw_params + [limit, offset],
+        ).fetchall()
+    else:
+        fetch_q = (base_q.select(ts.star)
+                   .orderby(ts.created_at, order=Order.desc)
+                   .limit(P()).offset(P()))
+        rows = conn.execute(fetch_q.get_sql(), params + [limit, offset]).fetchall()
 
     ok({
         "timesheets": [row_to_dict(r) for r in rows],
@@ -1050,19 +1100,16 @@ def submit_timesheet(conn, args):
         err(f"Timesheet is '{ts['status']}', can only submit from 'draft'")
 
     # Validate detail rows
-    details = conn.execute(
-        "SELECT * FROM timesheet_detail WHERE timesheet_id = ?",
-        (args.timesheet_id,),
-    ).fetchall()
+    dtl_q = Q.from_(_t_ts_detail).select(_t_ts_detail.star).where(_t_ts_detail.timesheet_id == P())
+    details = conn.execute(dtl_q.get_sql(), (args.timesheet_id,)).fetchall()
     if not details:
         err("Timesheet has no detail rows")
 
+    proj_q = Q.from_(_t_project).select(_t_project.id).where(_t_project.id == P())
     for d in details:
         d_dict = row_to_dict(d)
         # Validate project exists
-        proj = conn.execute(
-            "SELECT id FROM project WHERE id = ?", (d_dict["project_id"],),
-        ).fetchone()
+        proj = conn.execute(proj_q.get_sql(), (d_dict["project_id"],)).fetchone()
         if not proj:
             err(f"Detail row {d_dict['id']}: project {d_dict['project_id']} not found")
 
@@ -1070,21 +1117,20 @@ def submit_timesheet(conn, args):
         if hours <= 0:
             err(f"Detail row {d_dict['id']}: hours must be > 0, got {hours}")
 
-    # Update status
+    # Update status -- uses datetime('now') SQLite function, keep as raw SQL
     conn.execute(
         "UPDATE timesheet SET status = 'submitted', updated_at = datetime('now') WHERE id = ?",
         (args.timesheet_id,),
     )
 
     # Update task actual_hours for each detail row that references a task
+    task_hrs_q = Q.from_(_t_task).select(_t_task.actual_hours).where(_t_task.id == P())
     for d in details:
         d_dict = row_to_dict(d)
         task_id = d_dict.get("task_id")
         if task_id:
             hours = to_decimal(d_dict["hours"])
-            task = conn.execute(
-                "SELECT actual_hours FROM task WHERE id = ?", (task_id,),
-            ).fetchone()
+            task = conn.execute(task_hrs_q.get_sql(), (task_id,)).fetchone()
             if task:
                 new_hours = round_currency(to_decimal(task["actual_hours"]) + hours)
                 conn.execute(
@@ -1097,7 +1143,8 @@ def submit_timesheet(conn, args):
            description="Timesheet submitted")
     conn.commit()
 
-    ts = conn.execute("SELECT * FROM timesheet WHERE id = ?", (args.timesheet_id,)).fetchone()
+    ts_refetch = Q.from_(_t_timesheet).select(_t_timesheet.star).where(_t_timesheet.id == P())
+    ts = conn.execute(ts_refetch.get_sql(), (args.timesheet_id,)).fetchone()
     ok({"timesheet": row_to_dict(ts)})
 
 
@@ -1123,21 +1170,16 @@ def bill_timesheet(conn, args):
     total_billable_amount = to_decimal(ts["total_billable_amount"])
     total_cost = to_decimal(ts["total_cost"])
 
-    # Mark as billed, set total_billed_hours
+    # Mark as billed, set total_billed_hours -- uses datetime('now'), keep as raw SQL
     conn.execute(
-        """UPDATE timesheet SET
-           status = 'billed',
-           total_billed_hours = ?,
-           updated_at = datetime('now')
-           WHERE id = ?""",
+        "UPDATE timesheet SET status = 'billed', total_billed_hours = ?, "
+        "updated_at = datetime('now') WHERE id = ?",
         (str(total_billable_hours), args.timesheet_id),
     )
 
     # Aggregate amounts per project from detail rows and update each project
-    details = conn.execute(
-        "SELECT * FROM timesheet_detail WHERE timesheet_id = ?",
-        (args.timesheet_id,),
-    ).fetchall()
+    dtl_q = Q.from_(_t_ts_detail).select(_t_ts_detail.star).where(_t_ts_detail.timesheet_id == P())
+    details = conn.execute(dtl_q.get_sql(), (args.timesheet_id,)).fetchall()
 
     project_costs = {}  # project_id -> {cost, billed}
     for d in details:
@@ -1155,11 +1197,11 @@ def bill_timesheet(conn, args):
         if billable:
             project_costs[proj_id]["billed"] += line_amount
 
+    proj_cost_q = (Q.from_(_t_project)
+                   .select(_t_project.actual_cost, _t_project.total_billed)
+                   .where(_t_project.id == P()))
     for proj_id, amounts in project_costs.items():
-        project = conn.execute(
-            "SELECT actual_cost, total_billed FROM project WHERE id = ?",
-            (proj_id,),
-        ).fetchone()
+        project = conn.execute(proj_cost_q.get_sql(), (proj_id,)).fetchone()
         if project:
             new_actual = round_currency(
                 to_decimal(project["actual_cost"]) + amounts["cost"]
@@ -1175,11 +1217,10 @@ def bill_timesheet(conn, args):
             else:
                 profit_margin = Decimal("0")
 
+            # Uses datetime('now'), keep as raw SQL
             conn.execute(
-                """UPDATE project SET
-                   actual_cost = ?, total_billed = ?, profit_margin = ?,
-                   updated_at = datetime('now')
-                   WHERE id = ?""",
+                "UPDATE project SET actual_cost = ?, total_billed = ?, profit_margin = ?, "
+                "updated_at = datetime('now') WHERE id = ?",
                 (str(new_actual), str(new_billed), str(profit_margin), proj_id),
             )
 
@@ -1190,7 +1231,8 @@ def bill_timesheet(conn, args):
            description="Timesheet billed")
     conn.commit()
 
-    ts = conn.execute("SELECT * FROM timesheet WHERE id = ?", (args.timesheet_id,)).fetchone()
+    ts_refetch = Q.from_(_t_timesheet).select(_t_timesheet.star).where(_t_timesheet.id == P())
+    ts = conn.execute(ts_refetch.get_sql(), (args.timesheet_id,)).fetchone()
     ok({"timesheet": row_to_dict(ts)})
 
 
@@ -1220,22 +1262,28 @@ def project_profitability(conn, args):
         margin = round_currency((profit / total_billed) * Decimal("100"))
 
     # Employee breakdown from submitted/billed timesheets
-    employee_rows = conn.execute(
-        """SELECT
-               ts.employee_id,
-               e.full_name AS employee_name,
-               decimal_sum(td.hours) AS total_hours,
-               SUM(CASE WHEN td.billable = 1 THEN td.hours + 0 ELSE 0 END) AS billable_hours,
-               SUM((td.hours + 0) * (td.billing_rate + 0)) AS total_cost,
-               SUM(CASE WHEN td.billable = 1 THEN (td.hours + 0) * (td.billing_rate + 0) ELSE 0 END) AS billable_amount
-           FROM timesheet_detail td
-           JOIN timesheet ts ON td.timesheet_id = ts.id
-           LEFT JOIN employee e ON ts.employee_id = e.id
-           WHERE td.project_id = ? AND ts.status IN ('submitted', 'billed')
-           GROUP BY ts.employee_id
-           ORDER BY total_hours DESC""",
-        (args.project_id,),
-    ).fetchall()
+    td = Table("timesheet_detail")
+    ts = Table("timesheet")
+    e = Table("employee")
+    billable_hrs = Case().when(td.billable == 1, td.hours + 0).else_(0)
+    total_cost_expr = (td.hours + 0) * (td.billing_rate + 0)
+    billable_amt = Case().when(td.billable == 1, (td.hours + 0) * (td.billing_rate + 0)).else_(0)
+    emp_q = (Q.from_(td)
+             .join(ts).on(td.timesheet_id == ts.id)
+             .left_join(e).on(ts.employee_id == e.id)
+             .select(
+                 ts.employee_id,
+                 e.full_name.as_("employee_name"),
+                 DecimalSum(td.hours).as_("total_hours"),
+                 fn.Sum(billable_hrs).as_("billable_hours"),
+                 fn.Sum(total_cost_expr).as_("total_cost"),
+                 fn.Sum(billable_amt).as_("billable_amount"),
+             )
+             .where(td.project_id == P())
+             .where(ts.status.isin(["submitted", "billed"]))
+             .groupby(ts.employee_id)
+             .orderby(Field("total_hours"), order=Order.desc))
+    employee_rows = conn.execute(emp_q.get_sql(), (args.project_id,)).fetchall()
 
     employees = []
     for row in employee_rows:
@@ -1281,14 +1329,14 @@ def gantt_data(conn, args):
 
     project = _validate_project_exists(conn, args.project_id)
 
-    tasks = conn.execute(
-        """SELECT id, task_name, start_date, end_date, depends_on,
-                  status, assigned_to, priority, estimated_hours, actual_hours,
-                  parent_task_id
-           FROM task WHERE project_id = ?
-           ORDER BY start_date, task_name""",
-        (args.project_id,),
-    ).fetchall()
+    tk = _t_task
+    gantt_q = (Q.from_(tk)
+               .select(tk.id, tk.task_name, tk.start_date, tk.end_date,
+                       tk.depends_on, tk.status, tk.assigned_to, tk.priority,
+                       tk.estimated_hours, tk.actual_hours, tk.parent_task_id)
+               .where(tk.project_id == P())
+               .orderby(tk.start_date).orderby(tk.task_name))
+    tasks = conn.execute(gantt_q.get_sql(), (args.project_id,)).fetchall()
 
     gantt_items = []
     for t in tasks:
@@ -1315,12 +1363,13 @@ def gantt_data(conn, args):
         })
 
     # Include milestones as markers
-    milestones = conn.execute(
-        """SELECT id, milestone_name, target_date, completion_date, status
-           FROM milestone WHERE project_id = ?
-           ORDER BY target_date""",
-        (args.project_id,),
-    ).fetchall()
+    ms = _t_milestone
+    ms_q = (Q.from_(ms)
+            .select(ms.id, ms.milestone_name, ms.target_date,
+                    ms.completion_date, ms.status)
+            .where(ms.project_id == P())
+            .orderby(ms.target_date))
+    milestones = conn.execute(ms_q.get_sql(), (args.project_id,)).fetchall()
 
     milestone_items = []
     for m in milestones:
@@ -1359,36 +1408,42 @@ def resource_utilization(conn, args):
 
     _validate_company_exists(conn, args.company_id)
 
-    conditions = ["ts.company_id = ?", "ts.status IN ('submitted', 'billed')"]
+    td = Table("timesheet_detail")
+    ts = Table("timesheet")
+    e = Table("employee")
     params = [args.company_id]
 
+    billable_hrs = Case().when(td.billable == 1, td.hours + 0).else_(0)
+    non_billable_hrs = Case().when(td.billable == 0, td.hours + 0).else_(0)
+    billable_amt = Case().when(td.billable == 1, (td.hours + 0) * (td.billing_rate + 0)).else_(0)
+
+    base_q = (Q.from_(td)
+              .join(ts).on(td.timesheet_id == ts.id)
+              .left_join(e).on(ts.employee_id == e.id)
+              .where(ts.company_id == P())
+              .where(ts.status.isin(["submitted", "billed"])))
+
     if args.from_date:
-        conditions.append("td.date >= ?")
+        base_q = base_q.where(td.date >= P())
         params.append(args.from_date)
 
     if args.to_date:
-        conditions.append("td.date <= ?")
+        base_q = base_q.where(td.date <= P())
         params.append(args.to_date)
 
-    where = f"WHERE {' AND '.join(conditions)}"
-
-    rows = conn.execute(
-        f"""SELECT
-               ts.employee_id,
-               e.full_name AS employee_name,
-               decimal_sum(td.hours) AS total_hours,
-               SUM(CASE WHEN td.billable = 1 THEN td.hours + 0 ELSE 0 END) AS billable_hours,
-               SUM(CASE WHEN td.billable = 0 THEN td.hours + 0 ELSE 0 END) AS non_billable_hours,
-               COUNT(DISTINCT td.project_id) AS project_count,
-               SUM(CASE WHEN td.billable = 1 THEN (td.hours + 0) * (td.billing_rate + 0) ELSE 0 END) AS billable_amount
-           FROM timesheet_detail td
-           JOIN timesheet ts ON td.timesheet_id = ts.id
-           LEFT JOIN employee e ON ts.employee_id = e.id
-           {where}
-           GROUP BY ts.employee_id
-           ORDER BY total_hours DESC""",
-        params,
-    ).fetchall()
+    util_q = (base_q
+              .select(
+                  ts.employee_id,
+                  e.full_name.as_("employee_name"),
+                  DecimalSum(td.hours).as_("total_hours"),
+                  fn.Sum(billable_hrs).as_("billable_hours"),
+                  fn.Sum(non_billable_hrs).as_("non_billable_hours"),
+                  fn.Count(td.project_id, alias="project_count").distinct(),
+                  fn.Sum(billable_amt).as_("billable_amount"),
+              )
+              .groupby(ts.employee_id)
+              .orderby(Field("total_hours"), order=Order.desc))
+    rows = conn.execute(util_q.get_sql(), params).fetchall()
 
     employees = []
     for row in rows:
@@ -1446,7 +1501,8 @@ def status_action(conn, args):
     """
     company_id = args.company_id
     if not company_id:
-        row = conn.execute("SELECT id FROM company LIMIT 1").fetchone()
+        first_q = Q.from_(_t_company).select(_t_company.id).limit(1)
+        row = conn.execute(first_q.get_sql()).fetchone()
         if not row:
             err("No company found. Create one with erpclaw-setup first.",
                  suggestion="Run 'tutorial' to create a demo company, or 'setup company' to create your own.")
@@ -1457,36 +1513,35 @@ def status_action(conn, args):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # Active projects (open or in_progress)
-    active_projects = conn.execute(
-        """SELECT COUNT(*) AS cnt FROM project
-           WHERE company_id = ? AND status IN ('open', 'in_progress')""",
-        (company_id,),
-    ).fetchone()
+    p = _t_project
+    active_q = (Q.from_(p).select(fn.Count("*", alias="cnt"))
+                .where(p.company_id == P())
+                .where(p.status.isin(["open", "in_progress"])))
+    active_projects = conn.execute(active_q.get_sql(), (company_id,)).fetchone()
 
     # Total projects by status
-    project_by_status = conn.execute(
-        """SELECT status, COUNT(*) AS cnt FROM project
-           WHERE company_id = ? GROUP BY status""",
-        (company_id,),
-    ).fetchall()
+    status_q = (Q.from_(p).select(p.status, fn.Count("*", alias="cnt"))
+                .where(p.company_id == P())
+                .groupby(p.status))
+    project_by_status = conn.execute(status_q.get_sql(), (company_id,)).fetchall()
     status_counts = {r["status"]: r["cnt"] for r in project_by_status}
 
     # Overdue tasks: open/in_progress tasks with end_date < today
-    overdue_tasks = conn.execute(
-        """SELECT t.id, t.task_name, t.end_date, t.assigned_to,
-                  t.status, t.project_id, p.project_name
-           FROM task t
-           JOIN project p ON t.project_id = p.id
-           WHERE p.company_id = ?
-             AND t.status IN ('open', 'in_progress')
-             AND t.end_date IS NOT NULL
-             AND t.end_date < ?
-           ORDER BY t.end_date
-           LIMIT 20""",
-        (company_id, today),
-    ).fetchall()
+    tk = _t_task
+    overdue_q = (Q.from_(tk)
+                 .join(p).on(tk.project_id == p.id)
+                 .select(tk.id, tk.task_name, tk.end_date, tk.assigned_to,
+                         tk.status, tk.project_id, p.project_name)
+                 .where(p.company_id == P())
+                 .where(tk.status.isin(["open", "in_progress"]))
+                 .where(tk.end_date.isnotnull())
+                 .where(tk.end_date < P())
+                 .orderby(tk.end_date)
+                 .limit(20))
+    overdue_tasks = conn.execute(overdue_q.get_sql(), (company_id, today)).fetchall()
 
     # Upcoming milestones: pending milestones within next 30 days
+    # Uses date(?, '+30 days') SQLite function -- keep as raw SQL
     upcoming_milestones = conn.execute(
         """SELECT m.id, m.milestone_name, m.target_date, m.status,
                   m.project_id, p.project_name
@@ -1502,45 +1557,46 @@ def status_action(conn, args):
     ).fetchall()
 
     # Missed milestones: pending milestones past target date
-    missed_milestones = conn.execute(
-        """SELECT m.id, m.milestone_name, m.target_date,
-                  m.project_id, p.project_name
-           FROM milestone m
-           JOIN project p ON m.project_id = p.id
-           WHERE p.company_id = ?
-             AND m.status = 'pending'
-             AND m.target_date < ?
-           ORDER BY m.target_date
-           LIMIT 10""",
-        (company_id, today),
-    ).fetchall()
+    ms = _t_milestone
+    missed_q = (Q.from_(ms)
+                .join(p).on(ms.project_id == p.id)
+                .select(ms.id, ms.milestone_name, ms.target_date,
+                        ms.project_id, p.project_name)
+                .where(p.company_id == P())
+                .where(ms.status == ValueWrapper("pending"))
+                .where(ms.target_date < P())
+                .orderby(ms.target_date)
+                .limit(10))
+    missed_milestones = conn.execute(missed_q.get_sql(), (company_id, today)).fetchall()
 
     # Recent timesheets (last 10)
-    recent_timesheets = conn.execute(
-        """SELECT ts.id, ts.naming_series, ts.employee_id, e.full_name AS employee_name,
-                  ts.start_date, ts.end_date, ts.total_hours,
-                  ts.total_billable_amount, ts.status
-           FROM timesheet ts
-           LEFT JOIN employee e ON ts.employee_id = e.id
-           WHERE ts.company_id = ?
-           ORDER BY ts.created_at DESC
-           LIMIT 10""",
-        (company_id,),
-    ).fetchall()
+    ts_t = _t_timesheet
+    e = _t_employee
+    recent_q = (Q.from_(ts_t)
+                .left_join(e).on(ts_t.employee_id == e.id)
+                .select(ts_t.id, ts_t.naming_series, ts_t.employee_id,
+                        e.full_name.as_("employee_name"),
+                        ts_t.start_date, ts_t.end_date, ts_t.total_hours,
+                        ts_t.total_billable_amount, ts_t.status)
+                .where(ts_t.company_id == P())
+                .orderby(ts_t.created_at, order=Order.desc)
+                .limit(10))
+    recent_timesheets = conn.execute(recent_q.get_sql(), (company_id,)).fetchall()
 
     # Hours summary this month
     month_start = datetime.now(timezone.utc).strftime("%Y-%m-01")
-    hours_this_month = conn.execute(
-        """SELECT
-               COALESCE(decimal_sum(td.hours), '0') AS total_hours,
-               COALESCE(SUM(CASE WHEN td.billable = 1 THEN td.hours + 0 ELSE 0 END), 0) AS billable_hours
-           FROM timesheet_detail td
-           JOIN timesheet ts ON td.timesheet_id = ts.id
-           WHERE ts.company_id = ?
-             AND ts.status IN ('submitted', 'billed')
-             AND td.date >= ?""",
-        (company_id, month_start),
-    ).fetchone()
+    td = _t_ts_detail
+    billable_hrs = Case().when(td.billable == 1, td.hours + 0).else_(0)
+    hrs_q = (Q.from_(td)
+             .join(ts_t).on(td.timesheet_id == ts_t.id)
+             .select(
+                 fn.Coalesce(DecimalSum(td.hours), ValueWrapper("0")).as_("total_hours"),
+                 fn.Coalesce(fn.Sum(billable_hrs), 0).as_("billable_hours"),
+             )
+             .where(ts_t.company_id == P())
+             .where(ts_t.status.isin(["submitted", "billed"]))
+             .where(td.date >= P()))
+    hours_this_month = conn.execute(hrs_q.get_sql(), (company_id, month_start)).fetchone()
 
     ok({
         "company_id": company_id,

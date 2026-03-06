@@ -34,6 +34,8 @@ try:
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
     from erpclaw_lib.query_helpers import resolve_company_id
+    from erpclaw_lib.query import Q, P, Table, Field, fn, Case, Order, Criterion, Not, NULL, DecimalSum, DecimalAbs
+    from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
@@ -57,7 +59,11 @@ def setup_chart_of_accounts(conn, args):
     if not company_id:
         err("--company-id is required")
 
-    company = conn.execute("SELECT id FROM company WHERE id = ?", (company_id,)).fetchone()
+    t_company = Table("company")
+    t_account = Table("account")
+
+    q = Q.from_(t_company).select(t_company.id).where(t_company.id == P())
+    company = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not company:
         err(f"Company {company_id} not found")
 
@@ -72,9 +78,8 @@ def setup_chart_of_accounts(conn, args):
     number_to_id = {}
     # Check existing accounts to skip duplicates
     existing = set()
-    for row in conn.execute(
-        "SELECT account_number FROM account WHERE company_id = ?", (company_id,)
-    ).fetchall():
+    q = Q.from_(t_account).select(t_account.account_number).where(t_account.company_id == P())
+    for row in conn.execute(q.get_sql(), (company_id,)).fetchall():
         existing.add(row["account_number"])
 
     created = 0
@@ -82,10 +87,10 @@ def setup_chart_of_accounts(conn, args):
         acct_num = acct["account_number"]
         if acct_num in existing:
             # Already exists, but still need to map number -> id
-            row = conn.execute(
-                "SELECT id FROM account WHERE account_number = ? AND company_id = ?",
-                (acct_num, company_id),
-            ).fetchone()
+            q = (Q.from_(t_account).select(t_account.id)
+                 .where(t_account.account_number == P())
+                 .where(t_account.company_id == P()))
+            row = conn.execute(q.get_sql(), (acct_num, company_id)).fetchone()
             if row:
                 number_to_id[acct_num] = row["id"]
             continue
@@ -98,16 +103,16 @@ def setup_chart_of_accounts(conn, args):
         # Calculate depth from parent
         depth = 0
         if parent_id:
-            parent_row = conn.execute(
-                "SELECT depth FROM account WHERE id = ?", (parent_id,)
-            ).fetchone()
+            q = Q.from_(t_account).select(t_account.depth).where(t_account.id == P())
+            parent_row = conn.execute(q.get_sql(), (parent_id,)).fetchone()
             if parent_row:
                 depth = parent_row["depth"] + 1
 
-        conn.execute(
-            """INSERT INTO account (id, name, account_number, parent_id, root_type,
-               account_type, is_group, balance_direction, company_id, depth)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        q = (Q.into(t_account)
+             .columns("id", "name", "account_number", "parent_id", "root_type",
+                       "account_type", "is_group", "balance_direction", "company_id", "depth")
+             .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+        conn.execute(q.get_sql(),
             (acct_id, acct["name"], acct_num, parent_id, acct["root_type"],
              acct.get("account_type"), acct.get("is_group", 0),
              acct.get("balance_direction", "debit_normal"), company_id, depth),
@@ -149,20 +154,23 @@ def add_account(conn, args):
     if root_type in ("liability", "equity", "income"):
         balance_direction = "credit_normal"
 
+    t_account = Table("account")
+
     depth = 0
     if parent_id:
-        parent_row = conn.execute(
-            "SELECT depth FROM account WHERE id = ?", (parent_id,)
-        ).fetchone()
+        q = Q.from_(t_account).select(t_account.depth).where(t_account.id == P())
+        parent_row = conn.execute(q.get_sql(), (parent_id,)).fetchone()
         if not parent_row:
             err(f"Parent account {parent_id} not found")
         depth = parent_row["depth"] + 1
 
     try:
-        conn.execute(
-            """INSERT INTO account (id, name, account_number, parent_id, root_type,
-               account_type, currency, is_group, balance_direction, company_id, depth)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        q = (Q.into(t_account)
+             .columns("id", "name", "account_number", "parent_id", "root_type",
+                       "account_type", "currency", "is_group", "balance_direction",
+                       "company_id", "depth")
+             .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+        conn.execute(q.get_sql(),
             (acct_id, name, account_number, parent_id, root_type,
              account_type, currency, is_group, balance_direction, company_id, depth),
         )
@@ -186,16 +194,21 @@ def update_account(conn, args):
     if not acct_id:
         err("--account-id is required")
 
-    old = row_to_dict(conn.execute(
-        "SELECT * FROM account WHERE id = ?", (acct_id,)).fetchone())
+    t_account = Table("account")
+    t_gl = Table("gl_entry")
+
+    q = Q.from_(t_account).select(t_account.star).where(t_account.id == P())
+    old = row_to_dict(conn.execute(q.get_sql(), (acct_id,)).fetchone())
     if not old:
         err(f"Account {acct_id} not found",
              suggestion="Use 'list accounts' to see available accounts.")
 
     # Check if GL entries exist (restricts root_type/account_type changes)
-    has_entries = conn.execute(
-        "SELECT 1 FROM gl_entry WHERE account_id = ? AND is_cancelled = 0 LIMIT 1",
-        (acct_id,)).fetchone()
+    q = (Q.from_(t_gl).select(ValueWrapper(1))
+         .where(t_gl.account_id == P())
+         .where(t_gl.is_cancelled == 0)
+         .limit(1))
+    has_entries = conn.execute(q.get_sql(), (acct_id,)).fetchone()
 
     updatable = {"name": args.name, "account_number": args.account_number,
                  "parent_id": args.parent_id}
@@ -207,6 +220,7 @@ def update_account(conn, args):
     if not updates:
         err("No fields to update")
 
+    # raw SQL — dynamic column building from user-provided update dict
     set_clause = ", ".join(f"{k} = ?" for k in updates)
     set_clause += ", updated_at = datetime('now')"
     values = list(updates.values()) + [acct_id]
@@ -227,38 +241,41 @@ def update_account(conn, args):
 def list_accounts(conn, args):
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
-    limit = int(args.limit or 20)
-    offset = int(args.offset or 0)
+    limit_val = int(args.limit or 20)
+    offset_val = int(args.offset or 0)
 
-    query = "SELECT * FROM account WHERE company_id = ?"
+    t = Table("account")
+    q = Q.from_(t).select(t.star).where(t.company_id == P())
     params = [company_id]
 
     if args.root_type:
-        query += " AND root_type = ?"
+        q = q.where(t.root_type == P())
         params.append(args.root_type)
     if args.account_type:
-        query += " AND account_type = ?"
+        q = q.where(t.account_type == P())
         params.append(args.account_type)
     if args.is_group:
-        query += " AND is_group = 1"
+        q = q.where(t.is_group == 1)
     if args.parent_id:
-        query += " AND parent_id = ?"
+        q = q.where(t.parent_id == P())
         params.append(args.parent_id)
     if args.search:
-        query += " AND (name LIKE ? OR account_number LIKE ?)"
+        q = q.where(
+            Criterion.any([t.name.like(P()), t.account_number.like(P())])
+        )
         params.extend([f"%{args.search}%", f"%{args.search}%"])
     if not args.include_frozen:
-        query += " AND is_frozen = 0 AND disabled = 0"
+        q = q.where(t.is_frozen == 0).where(t.disabled == 0)
 
-    count_query = query.replace("SELECT * FROM account", "SELECT COUNT(*) as cnt FROM account")
-    total_count = conn.execute(count_query, params).fetchone()["cnt"]
+    count_sql = q.get_sql().replace("SELECT *", 'SELECT COUNT(*) "cnt"', 1)
+    total_count = conn.execute(count_sql, params).fetchone()["cnt"]
 
-    query += " ORDER BY account_number, name LIMIT ? OFFSET ?"
-    params.extend([limit, offset])
-    rows = conn.execute(query, params).fetchall()
+    q = q.orderby(t.account_number).orderby(t.name).limit(P()).offset(P())
+    params.extend([limit_val, offset_val])
+    rows = conn.execute(q.get_sql(), params).fetchall()
     ok({"accounts": [row_to_dict(r) for r in rows],
-         "total_count": total_count, "limit": limit, "offset": offset,
-         "has_more": offset + limit < total_count})
+         "total_count": total_count, "limit": limit_val, "offset": offset_val,
+         "has_more": offset_val + limit_val < total_count})
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +287,11 @@ def get_account(conn, args):
     if not acct_id:
         err("--account-id is required")
 
-    row = conn.execute("SELECT * FROM account WHERE id = ?", (acct_id,)).fetchone()
+    t_account = Table("account")
+    t_gl = Table("gl_entry")
+
+    q = Q.from_(t_account).select(t_account.star).where(t_account.id == P())
+    row = conn.execute(q.get_sql(), (acct_id,)).fetchone()
     if not row:
         err(f"Account {acct_id} not found",
              suggestion="Use 'list accounts' to see available accounts.")
@@ -279,12 +300,13 @@ def get_account(conn, args):
 
     # Include balance
     as_of = args.as_of_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    bal = conn.execute(
-        """SELECT COALESCE(decimal_sum(debit), '0') as debit_total,
-                  COALESCE(decimal_sum(credit), '0') as credit_total
-           FROM gl_entry WHERE account_id = ? AND posting_date <= ? AND is_cancelled = 0""",
-        (acct_id, as_of),
-    ).fetchone()
+    q = (Q.from_(t_gl)
+         .select(fn.Coalesce(DecimalSum(t_gl.debit), ValueWrapper("0")).as_("debit_total"),
+                 fn.Coalesce(DecimalSum(t_gl.credit), ValueWrapper("0")).as_("credit_total"))
+         .where(t_gl.account_id == P())
+         .where(t_gl.posting_date <= P())
+         .where(t_gl.is_cancelled == 0))
+    bal = conn.execute(q.get_sql(), (acct_id, as_of)).fetchone()
 
     debit_total = Decimal(str(bal["debit_total"]))
     credit_total = Decimal(str(bal["credit_total"]))
@@ -308,11 +330,16 @@ def freeze_account(conn, args):
     acct_id = args.account_id
     if not acct_id:
         err("--account-id is required")
-    row = conn.execute("SELECT id FROM account WHERE id = ?", (acct_id,)).fetchone()
+    t = Table("account")
+    q = Q.from_(t).select(t.id).where(t.id == P())
+    row = conn.execute(q.get_sql(), (acct_id,)).fetchone()
     if not row:
         err(f"Account {acct_id} not found")
-    conn.execute("UPDATE account SET is_frozen = 1, updated_at = datetime('now') WHERE id = ?",
-                 (acct_id,))
+    q = (Q.update(t)
+         .set(Field("is_frozen"), 1)
+         .set(Field("updated_at"), LiteralValue("datetime('now')"))
+         .where(t.id == P()))
+    conn.execute(q.get_sql(), (acct_id,))
     audit(conn, "erpclaw-gl", "freeze", "account", acct_id, new_values={"is_frozen": 1})
     conn.commit()
     ok({"status": "updated", "account_id": acct_id, "is_frozen": True})
@@ -322,11 +349,16 @@ def unfreeze_account(conn, args):
     acct_id = args.account_id
     if not acct_id:
         err("--account-id is required")
-    row = conn.execute("SELECT id FROM account WHERE id = ?", (acct_id,)).fetchone()
+    t = Table("account")
+    q = Q.from_(t).select(t.id).where(t.id == P())
+    row = conn.execute(q.get_sql(), (acct_id,)).fetchone()
     if not row:
         err(f"Account {acct_id} not found")
-    conn.execute("UPDATE account SET is_frozen = 0, updated_at = datetime('now') WHERE id = ?",
-                 (acct_id,))
+    q = (Q.update(t)
+         .set(Field("is_frozen"), 0)
+         .set(Field("updated_at"), LiteralValue("datetime('now')"))
+         .where(t.id == P()))
+    conn.execute(q.get_sql(), (acct_id,))
     audit(conn, "erpclaw-gl", "unfreeze", "account", acct_id, new_values={"is_frozen": 0})
     conn.commit()
     ok({"status": "updated", "account_id": acct_id, "is_frozen": False})
@@ -408,54 +440,58 @@ def reverse_gl_entries_action(conn, args):
 def list_gl_entries(conn, args):
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
-    query = """SELECT g.*, a.name as account_name
-               FROM gl_entry g JOIN account a ON g.account_id = a.id
-               WHERE 1=1"""
+    g = Table("gl_entry").as_("g")
+    a = Table("account").as_("a")
+
+    q = (Q.from_(g).join(a).on(g.account_id == a.id)
+         .select(g.star, a.name.as_("account_name")))
     params = []
 
     if company_id:
-        query += " AND a.company_id = ?"
+        q = q.where(a.company_id == P())
         params.append(company_id)
     if args.account_id:
-        query += " AND g.account_id = ?"
+        q = q.where(g.account_id == P())
         params.append(args.account_id)
     if args.voucher_type:
-        query += " AND g.voucher_type = ?"
+        q = q.where(g.voucher_type == P())
         params.append(args.voucher_type)
     if args.voucher_id:
-        query += " AND g.voucher_id = ?"
+        q = q.where(g.voucher_id == P())
         params.append(args.voucher_id)
     if args.party_type:
-        query += " AND g.party_type = ?"
+        q = q.where(g.party_type == P())
         params.append(args.party_type)
     if args.party_id:
-        query += " AND g.party_id = ?"
+        q = q.where(g.party_id == P())
         params.append(args.party_id)
     if args.from_date:
-        query += " AND g.posting_date >= ?"
+        q = q.where(g.posting_date >= P())
         params.append(args.from_date)
     if args.to_date:
-        query += " AND g.posting_date <= ?"
+        q = q.where(g.posting_date <= P())
         params.append(args.to_date)
     if args.is_cancelled is not None:
-        query += " AND g.is_cancelled = ?"
+        q = q.where(g.is_cancelled == P())
         params.append(1 if args.is_cancelled else 0)
 
     # Count total before limit
-    count_query = query.replace(
-        "SELECT g.*, a.name as account_name", "SELECT COUNT(*) as cnt")
-    total = conn.execute(count_query, params).fetchone()["cnt"]
+    select_sql = q.get_sql()
+    # Replace the SELECT columns with COUNT(*)
+    from_pos = select_sql.index(" FROM ")
+    count_sql = 'SELECT COUNT(*) "cnt"' + select_sql[from_pos:]
+    total = conn.execute(count_sql, params).fetchone()["cnt"]
 
-    query += " ORDER BY g.posting_date DESC, g.created_at DESC"
-    limit = args.limit or 100
-    offset = args.offset or 0
-    query += " LIMIT ? OFFSET ?"
-    params.extend([int(limit), int(offset)])
+    limit_val = int(args.limit or 100)
+    offset_val = int(args.offset or 0)
+    q = q.orderby(g.posting_date, order=Order.desc).orderby(g.created_at, order=Order.desc)
+    q = q.limit(P()).offset(P())
+    params.extend([limit_val, offset_val])
 
-    rows = conn.execute(query, params).fetchall()
+    rows = conn.execute(q.get_sql(), params).fetchall()
     ok({"entries": [row_to_dict(r) for r in rows], "total_count": total,
-         "limit": int(limit), "offset": int(offset),
-         "has_more": int(offset) + int(limit) < total})
+         "limit": limit_val, "offset": offset_val,
+         "has_more": offset_val + limit_val < total})
 
 
 # ---------------------------------------------------------------------------
@@ -472,21 +508,21 @@ def add_fiscal_year(conn, args):
         err("--name, --start-date, --end-date, --company-id are required")
 
     # Validate no overlap
-    overlap = conn.execute(
-        """SELECT id, name FROM fiscal_year
-           WHERE company_id = ? AND start_date <= ? AND end_date >= ?""",
-        (company_id, end_date, start_date),
-    ).fetchone()
+    t_fy = Table("fiscal_year")
+    q = (Q.from_(t_fy).select(t_fy.id, t_fy.name)
+         .where(t_fy.company_id == P())
+         .where(t_fy.start_date <= P())
+         .where(t_fy.end_date >= P()))
+    overlap = conn.execute(q.get_sql(), (company_id, end_date, start_date)).fetchone()
     if overlap:
         err(f"Dates overlap with existing fiscal year '{overlap['name']}'")
 
     fy_id = str(uuid.uuid4())
     try:
-        conn.execute(
-            """INSERT INTO fiscal_year (id, name, start_date, end_date, company_id)
-               VALUES (?, ?, ?, ?, ?)""",
-            (fy_id, name, start_date, end_date, company_id),
-        )
+        q = (Q.into(t_fy)
+             .columns("id", "name", "start_date", "end_date", "company_id")
+             .insert(P(), P(), P(), P(), P()))
+        conn.execute(q.get_sql(), (fy_id, name, start_date, end_date, company_id))
         audit(conn, "erpclaw-gl", "create", "fiscal_year", fy_id,
                new_values={"name": name, "start_date": start_date, "end_date": end_date})
         conn.commit()
@@ -504,18 +540,22 @@ def add_fiscal_year(conn, args):
 def list_fiscal_years(conn, args):
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
-    limit = int(args.limit or 20)
-    offset = int(args.offset or 0)
-    total_count = conn.execute(
-        "SELECT COUNT(*) as cnt FROM fiscal_year WHERE company_id = ?",
-        (company_id,)).fetchone()["cnt"]
-    rows = conn.execute(
-        "SELECT * FROM fiscal_year WHERE company_id = ? ORDER BY start_date DESC LIMIT ? OFFSET ?",
-        (company_id, limit, offset),
-    ).fetchall()
+    limit_val = int(args.limit or 20)
+    offset_val = int(args.offset or 0)
+
+    t = Table("fiscal_year")
+    q_count = (Q.from_(t).select(fn.Count("*").as_("cnt"))
+               .where(t.company_id == P()))
+    total_count = conn.execute(q_count.get_sql(), (company_id,)).fetchone()["cnt"]
+
+    q = (Q.from_(t).select(t.star)
+         .where(t.company_id == P())
+         .orderby(t.start_date, order=Order.desc)
+         .limit(P()).offset(P()))
+    rows = conn.execute(q.get_sql(), (company_id, limit_val, offset_val)).fetchall()
     ok({"fiscal_years": [row_to_dict(r) for r in rows],
-         "total_count": total_count, "limit": limit, "offset": offset,
-         "has_more": offset + limit < total_count})
+         "total_count": total_count, "limit": limit_val, "offset": offset_val,
+         "has_more": offset_val + limit_val < total_count})
 
 
 # ---------------------------------------------------------------------------
@@ -527,8 +567,12 @@ def validate_period_close(conn, args):
     if not fy_id:
         err("--fiscal-year-id is required")
 
-    fy = row_to_dict(conn.execute(
-        "SELECT * FROM fiscal_year WHERE id = ?", (fy_id,)).fetchone())
+    t_fy = Table("fiscal_year")
+    t_gl = Table("gl_entry").as_("g")
+    t_acct = Table("account").as_("a")
+
+    q = Q.from_(t_fy).select(t_fy.star).where(t_fy.id == P())
+    fy = row_to_dict(conn.execute(q.get_sql(), (fy_id,)).fetchone())
     if not fy:
         err(f"Fiscal year {fy_id} not found")
 
@@ -537,7 +581,8 @@ def validate_period_close(conn, args):
 
     company_id = fy["company_id"]
 
-    # Calculate P&L for the period
+    # Calculate P&L for the period — raw SQL for expression arithmetic in SELECT
+    # raw SQL — SELECT uses column arithmetic (decimal_sum(credit) - decimal_sum(debit))
     income = conn.execute(
         """SELECT COALESCE(decimal_sum(g.credit), '0') - COALESCE(decimal_sum(g.debit), '0') as total
            FROM gl_entry g JOIN account a ON g.account_id = a.id
@@ -547,6 +592,7 @@ def validate_period_close(conn, args):
         (company_id, fy["start_date"], fy["end_date"]),
     ).fetchone()["total"]
 
+    # raw SQL — SELECT uses column arithmetic (decimal_sum(debit) - decimal_sum(credit))
     expense = conn.execute(
         """SELECT COALESCE(decimal_sum(g.debit), '0') - COALESCE(decimal_sum(g.credit), '0') as total
            FROM gl_entry g JOIN account a ON g.account_id = a.id
@@ -559,6 +605,7 @@ def validate_period_close(conn, args):
     net_income = Decimal(str(income)) - Decimal(str(expense))
 
     # Check trial balance
+    # raw SQL — COALESCE(decimal_sum(...)) aggregate with JOIN
     totals = conn.execute(
         """SELECT COALESCE(decimal_sum(debit), '0') as total_debit,
                   COALESCE(decimal_sum(credit), '0') as total_credit
@@ -589,16 +636,20 @@ def close_fiscal_year(conn, args):
     if not all([fy_id, closing_account_id, posting_date]):
         err("--fiscal-year-id, --closing-account-id, --posting-date are required")
 
-    fy = row_to_dict(conn.execute(
-        "SELECT * FROM fiscal_year WHERE id = ?", (fy_id,)).fetchone())
+    t_fy = Table("fiscal_year")
+    t_account = Table("account")
+    t_pcv = Table("period_closing_voucher")
+
+    q = Q.from_(t_fy).select(t_fy.star).where(t_fy.id == P())
+    fy = row_to_dict(conn.execute(q.get_sql(), (fy_id,)).fetchone())
     if not fy:
         err(f"Fiscal year {fy_id} not found")
     if fy["is_closed"]:
         err(f"Fiscal year '{fy['name']}' is already closed")
 
     # Verify closing account exists and is equity type
-    closing_acct = conn.execute(
-        "SELECT * FROM account WHERE id = ?", (closing_account_id,)).fetchone()
+    q = Q.from_(t_account).select(t_account.star).where(t_account.id == P())
+    closing_acct = conn.execute(q.get_sql(), (closing_account_id,)).fetchone()
     if not closing_acct:
         err(f"Closing account {closing_account_id} not found")
     if closing_acct["root_type"] != "equity":
@@ -606,7 +657,7 @@ def close_fiscal_year(conn, args):
 
     company_id = fy["company_id"]
 
-    # Calculate net P&L
+    # raw SQL — SELECT uses column arithmetic (decimal_sum(credit) - decimal_sum(debit))
     income = conn.execute(
         """SELECT COALESCE(decimal_sum(g.credit), '0') - COALESCE(decimal_sum(g.debit), '0')
            FROM gl_entry g JOIN account a ON g.account_id = a.id
@@ -616,6 +667,7 @@ def close_fiscal_year(conn, args):
         (company_id, fy["start_date"], fy["end_date"]),
     ).fetchone()[0]
 
+    # raw SQL — SELECT uses column arithmetic (decimal_sum(debit) - decimal_sum(credit))
     expense = conn.execute(
         """SELECT COALESCE(decimal_sum(g.debit), '0') - COALESCE(decimal_sum(g.credit), '0')
            FROM gl_entry g JOIN account a ON g.account_id = a.id
@@ -629,13 +681,12 @@ def close_fiscal_year(conn, args):
 
     # Create period closing voucher
     pcv_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO period_closing_voucher
-           (id, fiscal_year_id, posting_date, closing_account_id,
-            net_pl_amount, status, company_id)
-           VALUES (?, ?, ?, ?, ?, 'submitted', ?)""",
-        (pcv_id, fy_id, posting_date, closing_account_id, str(net_pl), company_id),
-    )
+    q = (Q.into(t_pcv)
+         .columns("id", "fiscal_year_id", "posting_date", "closing_account_id",
+                   "net_pl_amount", "status", "company_id")
+         .insert(P(), P(), P(), P(), P(), ValueWrapper("submitted"), P()))
+    conn.execute(q.get_sql(),
+        (pcv_id, fy_id, posting_date, closing_account_id, str(net_pl), company_id))
 
     # Post closing GL entries: net P&L → retained earnings
     entries = []
@@ -688,8 +739,11 @@ def close_fiscal_year(conn, args):
             gl_entries_created = len(gl_ids)
 
     # Close the fiscal year
-    conn.execute("UPDATE fiscal_year SET is_closed = 1, updated_at = datetime('now') WHERE id = ?",
-                 (fy_id,))
+    q = (Q.update(t_fy)
+         .set(Field("is_closed"), 1)
+         .set(Field("updated_at"), LiteralValue("datetime('now')"))
+         .where(t_fy.id == P()))
+    conn.execute(q.get_sql(), (fy_id,))
 
     audit(conn, "erpclaw-gl", "close", "fiscal_year", fy_id,
            new_values={"pcv_id": pcv_id, "net_pl": str(net_pl)})
@@ -703,7 +757,7 @@ def _close_pl_accounts(conn, company_id, fy, closing_account_id, pcv_id, posting
     """Zero out all income and expense accounts into retained earnings."""
     gl_ids = []
 
-    # Get balances for each P&L account
+    # raw SQL — LEFT JOIN with conditions, GROUP BY, HAVING with != comparison
     pl_accounts = conn.execute(
         """SELECT a.id, a.root_type,
                   COALESCE(decimal_sum(g.debit), '0') as total_debit,
@@ -719,6 +773,14 @@ def _close_pl_accounts(conn, company_id, fy, closing_account_id, pcv_id, posting
         (fy["start_date"], fy["end_date"], company_id),
     ).fetchall()
 
+    t_gl = Table("gl_entry")
+    _gl_cols = ("id", "posting_date", "account_id", "debit", "credit",
+                "debit_base", "credit_base", "currency", "exchange_rate",
+                "fiscal_year", "voucher_type", "voucher_id")
+    _gl_insert = (Q.into(t_gl).columns(*_gl_cols)
+                  .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P())
+                  .get_sql())
+
     for acct in pl_accounts:
         net = Decimal(str(acct["total_debit"])) - Decimal(str(acct["total_credit"]))
         if net == 0:
@@ -728,93 +790,53 @@ def _close_pl_accounts(conn, company_id, fy, closing_account_id, pcv_id, posting
         re_entry_id = str(uuid.uuid4())
 
         if acct["root_type"] == "income":
-            # Income accounts have credit balance → debit to zero
+            # Income accounts have credit balance -> debit to zero
             # Income net = credit - debit (positive = credit balance)
             income_net = Decimal(str(acct["total_credit"])) - Decimal(str(acct["total_debit"]))
             if income_net == 0:
                 continue
             if income_net > 0:
                 # DR income account, CR retained earnings
-                conn.execute(
-                    """INSERT INTO gl_entry (id, posting_date, account_id, debit, credit,
-                       debit_base, credit_base, currency, exchange_rate, fiscal_year,
-                       voucher_type, voucher_id)
-                       VALUES (?, ?, ?, ?, '0', ?, '0', 'USD', '1', ?, 'period_closing', ?)""",
-                    (entry_id, posting_date, acct["id"], str(income_net), str(income_net),
-                     fy["name"], pcv_id),
-                )
-                conn.execute(
-                    """INSERT INTO gl_entry (id, posting_date, account_id, debit, credit,
-                       debit_base, credit_base, currency, exchange_rate, fiscal_year,
-                       voucher_type, voucher_id)
-                       VALUES (?, ?, ?, '0', ?, '0', ?, 'USD', '1', ?, 'period_closing', ?)""",
-                    (re_entry_id, posting_date, closing_account_id, str(income_net),
-                     str(income_net), fy["name"], pcv_id),
-                )
+                conn.execute(_gl_insert,
+                    (entry_id, posting_date, acct["id"], str(income_net), "0",
+                     str(income_net), "0", "USD", "1", fy["name"], "period_closing", pcv_id))
+                conn.execute(_gl_insert,
+                    (re_entry_id, posting_date, closing_account_id, "0", str(income_net),
+                     "0", str(income_net), "USD", "1", fy["name"], "period_closing", pcv_id))
                 gl_ids.extend([entry_id, re_entry_id])
             else:
-                # Unusual: income account has debit balance → credit to zero
+                # Unusual: income account has debit balance -> credit to zero
                 abs_net = abs(income_net)
-                conn.execute(
-                    """INSERT INTO gl_entry (id, posting_date, account_id, debit, credit,
-                       debit_base, credit_base, currency, exchange_rate, fiscal_year,
-                       voucher_type, voucher_id)
-                       VALUES (?, ?, ?, '0', ?, '0', ?, 'USD', '1', ?, 'period_closing', ?)""",
-                    (entry_id, posting_date, acct["id"], str(abs_net), str(abs_net),
-                     fy["name"], pcv_id),
-                )
-                conn.execute(
-                    """INSERT INTO gl_entry (id, posting_date, account_id, debit, credit,
-                       debit_base, credit_base, currency, exchange_rate, fiscal_year,
-                       voucher_type, voucher_id)
-                       VALUES (?, ?, ?, ?, '0', ?, '0', 'USD', '1', ?, 'period_closing', ?)""",
-                    (re_entry_id, posting_date, closing_account_id, str(abs_net), str(abs_net),
-                     fy["name"], pcv_id),
-                )
+                conn.execute(_gl_insert,
+                    (entry_id, posting_date, acct["id"], "0", str(abs_net),
+                     "0", str(abs_net), "USD", "1", fy["name"], "period_closing", pcv_id))
+                conn.execute(_gl_insert,
+                    (re_entry_id, posting_date, closing_account_id, str(abs_net), "0",
+                     str(abs_net), "0", "USD", "1", fy["name"], "period_closing", pcv_id))
                 gl_ids.extend([entry_id, re_entry_id])
         else:
-            # Expense accounts have debit balance → credit to zero
+            # Expense accounts have debit balance -> credit to zero
             expense_net = Decimal(str(acct["total_debit"])) - Decimal(str(acct["total_credit"]))
             if expense_net == 0:
                 continue
             if expense_net > 0:
                 # CR expense account, DR retained earnings
-                conn.execute(
-                    """INSERT INTO gl_entry (id, posting_date, account_id, debit, credit,
-                       debit_base, credit_base, currency, exchange_rate, fiscal_year,
-                       voucher_type, voucher_id)
-                       VALUES (?, ?, ?, '0', ?, '0', ?, 'USD', '1', ?, 'period_closing', ?)""",
-                    (entry_id, posting_date, acct["id"], str(expense_net), str(expense_net),
-                     fy["name"], pcv_id),
-                )
-                conn.execute(
-                    """INSERT INTO gl_entry (id, posting_date, account_id, debit, credit,
-                       debit_base, credit_base, currency, exchange_rate, fiscal_year,
-                       voucher_type, voucher_id)
-                       VALUES (?, ?, ?, ?, '0', ?, '0', 'USD', '1', ?, 'period_closing', ?)""",
-                    (re_entry_id, posting_date, closing_account_id, str(expense_net),
-                     str(expense_net), fy["name"], pcv_id),
-                )
+                conn.execute(_gl_insert,
+                    (entry_id, posting_date, acct["id"], "0", str(expense_net),
+                     "0", str(expense_net), "USD", "1", fy["name"], "period_closing", pcv_id))
+                conn.execute(_gl_insert,
+                    (re_entry_id, posting_date, closing_account_id, str(expense_net), "0",
+                     str(expense_net), "0", "USD", "1", fy["name"], "period_closing", pcv_id))
                 gl_ids.extend([entry_id, re_entry_id])
             else:
                 # Unusual: expense has credit balance
                 abs_net = abs(expense_net)
-                conn.execute(
-                    """INSERT INTO gl_entry (id, posting_date, account_id, debit, credit,
-                       debit_base, credit_base, currency, exchange_rate, fiscal_year,
-                       voucher_type, voucher_id)
-                       VALUES (?, ?, ?, ?, '0', ?, '0', 'USD', '1', ?, 'period_closing', ?)""",
-                    (entry_id, posting_date, acct["id"], str(abs_net), str(abs_net),
-                     fy["name"], pcv_id),
-                )
-                conn.execute(
-                    """INSERT INTO gl_entry (id, posting_date, account_id, debit, credit,
-                       debit_base, credit_base, currency, exchange_rate, fiscal_year,
-                       voucher_type, voucher_id)
-                       VALUES (?, ?, ?, '0', ?, '0', ?, 'USD', '1', ?, 'period_closing', ?)""",
-                    (re_entry_id, posting_date, closing_account_id, str(abs_net),
-                     str(abs_net), fy["name"], pcv_id),
-                )
+                conn.execute(_gl_insert,
+                    (entry_id, posting_date, acct["id"], str(abs_net), "0",
+                     str(abs_net), "0", "USD", "1", fy["name"], "period_closing", pcv_id))
+                conn.execute(_gl_insert,
+                    (re_entry_id, posting_date, closing_account_id, "0", str(abs_net),
+                     "0", str(abs_net), "USD", "1", fy["name"], "period_closing", pcv_id))
                 gl_ids.extend([entry_id, re_entry_id])
 
     return gl_ids
@@ -829,34 +851,44 @@ def reopen_fiscal_year(conn, args):
     if not fy_id:
         err("--fiscal-year-id is required")
 
-    fy = row_to_dict(conn.execute(
-        "SELECT * FROM fiscal_year WHERE id = ?", (fy_id,)).fetchone())
+    t_fy = Table("fiscal_year")
+    t_gl = Table("gl_entry")
+    t_pcv = Table("period_closing_voucher")
+
+    q = Q.from_(t_fy).select(t_fy.star).where(t_fy.id == P())
+    fy = row_to_dict(conn.execute(q.get_sql(), (fy_id,)).fetchone())
     if not fy:
         err(f"Fiscal year {fy_id} not found")
     if not fy["is_closed"]:
         err(f"Fiscal year '{fy['name']}' is not closed")
 
     # Reverse the period closing voucher entries
-    pcv = conn.execute(
-        "SELECT id FROM period_closing_voucher WHERE fiscal_year_id = ? AND status = 'submitted'",
-        (fy_id,),
-    ).fetchone()
+    q = (Q.from_(t_pcv).select(t_pcv.id)
+         .where(t_pcv.fiscal_year_id == P())
+         .where(t_pcv.status == ValueWrapper("submitted")))
+    pcv = conn.execute(q.get_sql(), (fy_id,)).fetchone()
 
     pcv_reversed = False
     if pcv:
         # Cancel all GL entries for this PCV
-        conn.execute(
-            "UPDATE gl_entry SET is_cancelled = 1 WHERE voucher_type = 'period_closing' AND voucher_id = ?",
-            (pcv["id"],),
-        )
-        conn.execute(
-            "UPDATE period_closing_voucher SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?",
-            (pcv["id"],),
-        )
+        q = (Q.update(t_gl)
+             .set(Field("is_cancelled"), 1)
+             .where(t_gl.voucher_type == ValueWrapper("period_closing"))
+             .where(t_gl.voucher_id == P()))
+        conn.execute(q.get_sql(), (pcv["id"],))
+
+        q = (Q.update(t_pcv)
+             .set(Field("status"), ValueWrapper("cancelled"))
+             .set(Field("updated_at"), LiteralValue("datetime('now')"))
+             .where(t_pcv.id == P()))
+        conn.execute(q.get_sql(), (pcv["id"],))
         pcv_reversed = True
 
-    conn.execute("UPDATE fiscal_year SET is_closed = 0, updated_at = datetime('now') WHERE id = ?",
-                 (fy_id,))
+    q = (Q.update(t_fy)
+         .set(Field("is_closed"), 0)
+         .set(Field("updated_at"), LiteralValue("datetime('now')"))
+         .where(t_fy.id == P()))
+    conn.execute(q.get_sql(), (fy_id,))
 
     audit(conn, "erpclaw-gl", "reopen", "fiscal_year", fy_id,
            new_values={"is_closed": 0, "pcv_reversed": pcv_reversed})
@@ -881,12 +913,12 @@ def add_cost_center(conn, args):
     parent_id = args.parent_id
     is_group = 1 if args.is_group else 0
 
+    t_cc = Table("cost_center")
     try:
-        conn.execute(
-            """INSERT INTO cost_center (id, name, parent_id, company_id, is_group)
-               VALUES (?, ?, ?, ?, ?)""",
-            (cc_id, name, parent_id, company_id, is_group),
-        )
+        q = (Q.into(t_cc)
+             .columns("id", "name", "parent_id", "company_id", "is_group")
+             .insert(P(), P(), P(), P(), P()))
+        conn.execute(q.get_sql(), (cc_id, name, parent_id, company_id, is_group))
         audit(conn, "erpclaw-gl", "create", "cost_center", cc_id, new_values={"name": name})
         conn.commit()
     except sqlite3.IntegrityError as e:
@@ -903,25 +935,26 @@ def add_cost_center(conn, args):
 def list_cost_centers(conn, args):
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
-    limit = int(args.limit or 20)
-    offset = int(args.offset or 0)
+    limit_val = int(args.limit or 20)
+    offset_val = int(args.offset or 0)
 
-    query = "SELECT * FROM cost_center WHERE company_id = ?"
+    t = Table("cost_center")
+    q = Q.from_(t).select(t.star).where(t.company_id == P())
     params = [company_id]
     if args.parent_id:
-        query += " AND parent_id = ?"
+        q = q.where(t.parent_id == P())
         params.append(args.parent_id)
 
-    count_query = query.replace("SELECT * FROM cost_center", "SELECT COUNT(*) as cnt FROM cost_center")
-    total_count = conn.execute(count_query, params).fetchone()["cnt"]
+    count_sql = q.get_sql().replace("SELECT *", 'SELECT COUNT(*) "cnt"', 1)
+    total_count = conn.execute(count_sql, params).fetchone()["cnt"]
 
-    query += " ORDER BY name LIMIT ? OFFSET ?"
-    params.extend([limit, offset])
+    q = q.orderby(t.name).limit(P()).offset(P())
+    params.extend([limit_val, offset_val])
 
-    rows = conn.execute(query, params).fetchall()
+    rows = conn.execute(q.get_sql(), params).fetchall()
     ok({"cost_centers": [row_to_dict(r) for r in rows],
-         "total_count": total_count, "limit": limit, "offset": offset,
-         "has_more": offset + limit < total_count})
+         "total_count": total_count, "limit": limit_val, "offset": offset_val,
+         "has_more": offset_val + limit_val < total_count})
 
 
 # ---------------------------------------------------------------------------
@@ -942,7 +975,10 @@ def add_budget(conn, args):
         err("At least one of --account-id or --cost-center-id is required")
 
     # Get company_id from fiscal year
-    fy = conn.execute("SELECT company_id FROM fiscal_year WHERE id = ?", (fy_id,)).fetchone()
+    t_fy = Table("fiscal_year")
+    t_budget = Table("budget")
+    q = Q.from_(t_fy).select(t_fy.company_id).where(t_fy.id == P())
+    fy = conn.execute(q.get_sql(), (fy_id,)).fetchone()
     if not fy:
         err(f"Fiscal year {fy_id} not found")
 
@@ -950,13 +986,13 @@ def add_budget(conn, args):
     budget_id = str(uuid.uuid4())
 
     try:
-        conn.execute(
-            """INSERT INTO budget (id, fiscal_year_id, account_id, cost_center_id,
-               budget_amount, action_if_exceeded, company_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        q = (Q.into(t_budget)
+             .columns("id", "fiscal_year_id", "account_id", "cost_center_id",
+                       "budget_amount", "action_if_exceeded", "company_id")
+             .insert(P(), P(), P(), P(), P(), P(), P()))
+        conn.execute(q.get_sql(),
             (budget_id, fy_id, account_id, cost_center_id,
-             budget_amount, action_if_exceeded, fy["company_id"]),
-        )
+             budget_amount, action_if_exceeded, fy["company_id"]))
         audit(conn, "erpclaw-gl", "create", "budget", budget_id,
                new_values={"budget_amount": budget_amount, "action_if_exceeded": action_if_exceeded})
         conn.commit()
@@ -980,37 +1016,45 @@ def list_budgets(conn, args):
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
 
-    fy = row_to_dict(conn.execute(
-        "SELECT * FROM fiscal_year WHERE id = ?", (fy_id,)).fetchone())
+    t_fy = Table("fiscal_year")
+    t_budget = Table("budget")
+
+    q = Q.from_(t_fy).select(t_fy.star).where(t_fy.id == P())
+    fy = row_to_dict(conn.execute(q.get_sql(), (fy_id,)).fetchone())
     if not fy:
         err(f"Fiscal year {fy_id} not found")
 
-    total_count = conn.execute(
-        "SELECT COUNT(*) as cnt FROM budget WHERE fiscal_year_id = ? AND company_id = ?",
-        (fy_id, company_id)).fetchone()["cnt"]
+    q_count = (Q.from_(t_budget).select(fn.Count("*").as_("cnt"))
+               .where(t_budget.fiscal_year_id == P())
+               .where(t_budget.company_id == P()))
+    total_count = conn.execute(q_count.get_sql(), (fy_id, company_id)).fetchone()["cnt"]
 
-    budgets = conn.execute(
-        "SELECT * FROM budget WHERE fiscal_year_id = ? AND company_id = ? LIMIT ? OFFSET ?",
-        (fy_id, company_id, limit, offset),
-    ).fetchall()
+    q = (Q.from_(t_budget).select(t_budget.star)
+         .where(t_budget.fiscal_year_id == P())
+         .where(t_budget.company_id == P())
+         .limit(P()).offset(P()))
+    budgets = conn.execute(q.get_sql(), (fy_id, company_id, limit, offset)).fetchall()
 
     result = []
     for b in budgets:
         bd = row_to_dict(b)
         # Compute actual from GL
-        actual_query = """SELECT COALESCE(decimal_sum(debit), '0') as total
-                          FROM gl_entry g WHERE g.is_cancelled = 0
-                            AND g.posting_date >= ? AND g.posting_date <= ?"""
+        t_gl = Table("gl_entry").as_("g")
+        q_actual = (Q.from_(t_gl)
+                    .select(fn.Coalesce(DecimalSum(t_gl.debit), ValueWrapper("0")).as_("total"))
+                    .where(t_gl.is_cancelled == 0)
+                    .where(t_gl.posting_date >= P())
+                    .where(t_gl.posting_date <= P()))
         actual_params = [fy["start_date"], fy["end_date"]]
 
         if bd["account_id"]:
-            actual_query += " AND g.account_id = ?"
+            q_actual = q_actual.where(t_gl.account_id == P())
             actual_params.append(bd["account_id"])
         if bd["cost_center_id"]:
-            actual_query += " AND g.cost_center_id = ?"
+            q_actual = q_actual.where(t_gl.cost_center_id == P())
             actual_params.append(bd["cost_center_id"])
 
-        actual = Decimal(str(conn.execute(actual_query, actual_params).fetchone()["total"]))
+        actual = Decimal(str(conn.execute(q_actual.get_sql(), actual_params).fetchone()["total"]))
         budget_amt = Decimal(bd["budget_amount"])
         bd["actual_amount"] = str(actual)
         bd["variance"] = str(budget_amt - actual)
@@ -1029,19 +1073,22 @@ def seed_naming_series(conn, args):
     if not company_id:
         err("--company-id is required")
 
+    t_ns = Table("naming_series")
+
     year = datetime.now(timezone.utc).year
     created = 0
     for entity_type, prefix in ENTITY_PREFIXES.items():
         year_prefix = f"{prefix}{year}-"
-        existing = conn.execute(
-            "SELECT id FROM naming_series WHERE entity_type = ? AND prefix = ? AND company_id = ?",
-            (entity_type, year_prefix, company_id),
-        ).fetchone()
+        q = (Q.from_(t_ns).select(t_ns.id)
+             .where(t_ns.entity_type == P())
+             .where(t_ns.prefix == P())
+             .where(t_ns.company_id == P()))
+        existing = conn.execute(q.get_sql(), (entity_type, year_prefix, company_id)).fetchone()
         if not existing:
-            conn.execute(
-                "INSERT INTO naming_series (id, entity_type, prefix, current_value, company_id) VALUES (?, ?, ?, 0, ?)",
-                (str(uuid.uuid4()), entity_type, year_prefix, company_id),
-            )
+            q = (Q.into(t_ns)
+                 .columns("id", "entity_type", "prefix", "current_value", "company_id")
+                 .insert(P(), P(), P(), 0, P()))
+            conn.execute(q.get_sql(), (str(uuid.uuid4()), entity_type, year_prefix, company_id))
             created += 1
 
     conn.commit()
@@ -1079,29 +1126,28 @@ def check_gl_integrity(conn, args):
 
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
+    g = Table("gl_entry").as_("g")
+    a = Table("account").as_("a")
+
     # 1. Balance check
-    totals = conn.execute(
-        """SELECT COALESCE(decimal_sum(g.debit), '0') as total_debit,
-                  COALESCE(decimal_sum(g.credit), '0') as total_credit
-           FROM gl_entry g JOIN account a ON g.account_id = a.id
-           WHERE a.company_id = ? AND g.is_cancelled = 0""",
-        (company_id,),
-    ).fetchone()
+    q = (Q.from_(g).join(a).on(g.account_id == a.id)
+         .select(fn.Coalesce(DecimalSum(g.debit), ValueWrapper("0")).as_("total_debit"),
+                 fn.Coalesce(DecimalSum(g.credit), ValueWrapper("0")).as_("total_credit"))
+         .where(a.company_id == P())
+         .where(g.is_cancelled == 0))
+    totals = conn.execute(q.get_sql(), (company_id,)).fetchone()
 
     total_debit = Decimal(str(totals["total_debit"]))
     total_credit = Decimal(str(totals["total_credit"]))
     difference = abs(total_debit - total_credit)
 
     # 2. Chain hash verification
-    entries = conn.execute(
-        """SELECT g.posting_date, g.account_id, g.debit, g.credit,
-                  g.voucher_type, g.voucher_id, g.gl_checksum
-           FROM gl_entry g
-           JOIN account a ON g.account_id = a.id
-           WHERE a.company_id = ?
-           ORDER BY g.created_at ASC, g.rowid ASC""",
-        (company_id,),
-    ).fetchall()
+    q = (Q.from_(g).join(a).on(g.account_id == a.id)
+         .select(g.posting_date, g.account_id, g.debit, g.credit,
+                 g.voucher_type, g.voucher_id, g.gl_checksum)
+         .where(a.company_id == P())
+         .orderby(g.created_at).orderby(LiteralValue('"g"."rowid"')))
+    entries = conn.execute(q.get_sql(), (company_id,)).fetchall()
 
     chain_intact = True
     broken_links = 0
@@ -1153,23 +1199,30 @@ def get_account_balance_action(conn, args):
     if not as_of:
         err("--as-of-date is required")
 
-    acct = conn.execute("SELECT * FROM account WHERE id = ?", (acct_id,)).fetchone()
+    t_account = Table("account")
+    t_gl = Table("gl_entry")
+
+    q = Q.from_(t_account).select(t_account.star).where(t_account.id == P())
+    acct = conn.execute(q.get_sql(), (acct_id,)).fetchone()
     if not acct:
         err(f"Account {acct_id} not found")
 
-    query = """SELECT COALESCE(decimal_sum(debit), '0') as debit_total,
-                      COALESCE(decimal_sum(credit), '0') as credit_total
-               FROM gl_entry WHERE account_id = ? AND posting_date <= ? AND is_cancelled = 0"""
+    q = (Q.from_(t_gl)
+         .select(fn.Coalesce(DecimalSum(t_gl.debit), ValueWrapper("0")).as_("debit_total"),
+                 fn.Coalesce(DecimalSum(t_gl.credit), ValueWrapper("0")).as_("credit_total"))
+         .where(t_gl.account_id == P())
+         .where(t_gl.posting_date <= P())
+         .where(t_gl.is_cancelled == 0))
     params = [acct_id, as_of]
 
     if args.party_type:
-        query += " AND party_type = ?"
+        q = q.where(t_gl.party_type == P())
         params.append(args.party_type)
     if args.party_id:
-        query += " AND party_id = ?"
+        q = q.where(t_gl.party_id == P())
         params.append(args.party_id)
 
-    result = conn.execute(query, params).fetchone()
+    result = conn.execute(q.get_sql(), params).fetchone()
     debit_total = Decimal(str(result["debit_total"]))
     credit_total = Decimal(str(result["credit_total"]))
 
@@ -1191,40 +1244,57 @@ def get_account_balance_action(conn, args):
 # ---------------------------------------------------------------------------
 
 def status(conn, args):
+    t_company = Table("company")
+    t_account = Table("account")
+    t_fy = Table("fiscal_year")
+    t_gl = Table("gl_entry")
+
     company_id = getattr(args, 'company_id', None)
     # Auto-detect: if single company, use it; if multiple, show global stats
     if not company_id:
-        rows = conn.execute("SELECT id FROM company LIMIT 2").fetchall()
+        q = Q.from_(t_company).select(t_company.id).limit(2)
+        rows = conn.execute(q.get_sql()).fetchall()
         if len(rows) == 1:
             company_id = rows[0]["id"]
 
-    if company_id:
-        accounts = conn.execute(
-            "SELECT COUNT(*) as cnt FROM account WHERE company_id = ?",
-            (company_id,)).fetchone()["cnt"]
-        fiscal_years = conn.execute(
-            "SELECT COUNT(*) as cnt FROM fiscal_year WHERE company_id = ?",
-            (company_id,)).fetchone()["cnt"]
-        gl_entries = conn.execute(
-            """SELECT COUNT(*) as cnt FROM gl_entry g
-               JOIN account a ON g.account_id = a.id
-               WHERE a.company_id = ? AND g.is_cancelled = 0""",
-            (company_id,)).fetchone()["cnt"]
-        latest = conn.execute(
-            """SELECT MAX(g.posting_date) as latest FROM gl_entry g
-               JOIN account a ON g.account_id = a.id
-               WHERE a.company_id = ? AND g.is_cancelled = 0""",
-            (company_id,)).fetchone()["latest"]
-    else:
-        accounts = conn.execute("SELECT COUNT(*) as cnt FROM account").fetchone()["cnt"]
-        fiscal_years = conn.execute("SELECT COUNT(*) as cnt FROM fiscal_year").fetchone()["cnt"]
-        gl_entries = conn.execute(
-            "SELECT COUNT(*) as cnt FROM gl_entry WHERE is_cancelled = 0").fetchone()["cnt"]
-        latest = conn.execute(
-            "SELECT MAX(posting_date) as latest FROM gl_entry WHERE is_cancelled = 0"
-        ).fetchone()["latest"]
+    g = Table("gl_entry").as_("g")
+    a = Table("account").as_("a")
 
-    companies = conn.execute("SELECT COUNT(*) as cnt FROM company").fetchone()["cnt"]
+    if company_id:
+        q = Q.from_(t_account).select(fn.Count("*").as_("cnt")).where(t_account.company_id == P())
+        accounts = conn.execute(q.get_sql(), (company_id,)).fetchone()["cnt"]
+
+        q = Q.from_(t_fy).select(fn.Count("*").as_("cnt")).where(t_fy.company_id == P())
+        fiscal_years = conn.execute(q.get_sql(), (company_id,)).fetchone()["cnt"]
+
+        q = (Q.from_(g).join(a).on(g.account_id == a.id)
+             .select(fn.Count("*").as_("cnt"))
+             .where(a.company_id == P())
+             .where(g.is_cancelled == 0))
+        gl_entries = conn.execute(q.get_sql(), (company_id,)).fetchone()["cnt"]
+
+        q = (Q.from_(g).join(a).on(g.account_id == a.id)
+             .select(fn.Max(g.posting_date).as_("latest"))
+             .where(a.company_id == P())
+             .where(g.is_cancelled == 0))
+        latest = conn.execute(q.get_sql(), (company_id,)).fetchone()["latest"]
+    else:
+        q = Q.from_(t_account).select(fn.Count("*").as_("cnt"))
+        accounts = conn.execute(q.get_sql()).fetchone()["cnt"]
+
+        q = Q.from_(t_fy).select(fn.Count("*").as_("cnt"))
+        fiscal_years = conn.execute(q.get_sql()).fetchone()["cnt"]
+
+        q = (Q.from_(t_gl).select(fn.Count("*").as_("cnt"))
+             .where(t_gl.is_cancelled == 0))
+        gl_entries = conn.execute(q.get_sql()).fetchone()["cnt"]
+
+        q = (Q.from_(t_gl).select(fn.Max(t_gl.posting_date).as_("latest"))
+             .where(t_gl.is_cancelled == 0))
+        latest = conn.execute(q.get_sql()).fetchone()["latest"]
+
+    q = Q.from_(t_company).select(fn.Count("*").as_("cnt"))
+    companies = conn.execute(q.get_sql()).fetchone()["cnt"]
 
     ok({
         "companies": companies,
@@ -1254,10 +1324,11 @@ def revalue_foreign_balances(conn, args):
         err("--as-of-date is required")
 
     # Get company base currency
-    company = conn.execute(
-        "SELECT default_currency, exchange_gain_loss_account_id FROM company WHERE id = ?",
-        (company_id,),
-    ).fetchone()
+    t_company = Table("company")
+    q = (Q.from_(t_company)
+         .select(t_company.default_currency, t_company.exchange_gain_loss_account_id)
+         .where(t_company.id == P()))
+    company = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not company:
         err(f"Company {company_id} not found")
 
@@ -1267,14 +1338,16 @@ def revalue_foreign_balances(conn, args):
         err("Company has no exchange_gain_loss_account_id configured")
 
     # Find all foreign-currency accounts (AR, AP, Bank) with balances
-    accounts = conn.execute(
-        """SELECT a.id, a.name, a.currency, a.account_type, a.root_type
-           FROM account a
-           WHERE a.company_id = ? AND a.currency != ? AND a.is_group = 0
-             AND a.disabled = 0 AND a.currency IS NOT NULL
-             AND a.account_type IN ('receivable', 'payable', 'bank', 'cash')""",
-        (company_id, base_currency),
-    ).fetchall()
+    t_acct = Table("account").as_("a")
+    q = (Q.from_(t_acct)
+         .select(t_acct.id, t_acct.name, t_acct.currency, t_acct.account_type, t_acct.root_type)
+         .where(t_acct.company_id == P())
+         .where(t_acct.currency != P())
+         .where(t_acct.is_group == 0)
+         .where(t_acct.disabled == 0)
+         .where(t_acct.currency.isnotnull())
+         .where(t_acct.account_type.isin(["receivable", "payable", "bank", "cash"])))
+    accounts = conn.execute(q.get_sql(), (company_id, base_currency)).fetchall()
 
     if not accounts:
         ok({"revaluations": [], "message": "No foreign currency accounts found"})
@@ -1285,7 +1358,7 @@ def revalue_foreign_balances(conn, args):
     for acct in accounts:
         acct_currency = acct["currency"]
 
-        # Get current balance in transaction currency
+        # raw SQL — uses CAST(column AS REAL) which PyPika doesn't support cleanly
         bal = conn.execute(
             """SELECT
                 COALESCE(SUM(CAST(debit AS REAL)), 0) as total_debit,
@@ -1344,10 +1417,9 @@ def revalue_foreign_balances(conn, args):
             ]
 
         # FX account needs cost center (P&L account)
-        default_cc = conn.execute(
-            "SELECT default_cost_center_id FROM company WHERE id = ?",
-            (company_id,),
-        ).fetchone()
+        q_cc = (Q.from_(t_company).select(t_company.default_cost_center_id)
+                .where(t_company.id == P()))
+        default_cc = conn.execute(q_cc.get_sql(), (company_id,)).fetchone()
         if default_cc and default_cc["default_cost_center_id"]:
             gl_entries[-1]["cost_center_id"] = default_cc["default_cost_center_id"]
 
@@ -1429,10 +1501,11 @@ def import_chart_of_accounts(conn, args):
         root_type = row.get("root_type", "")
 
         # Check for duplicate
-        existing = conn.execute(
-            "SELECT id FROM account WHERE name = ? AND company_id = ?",
-            (name, company_id),
-        ).fetchone()
+        t_account = Table("account")
+        q = (Q.from_(t_account).select(t_account.id)
+             .where(t_account.name == P())
+             .where(t_account.company_id == P()))
+        existing = conn.execute(q.get_sql(), (name, company_id)).fetchone()
         if existing:
             skipped += 1
             continue
@@ -1441,10 +1514,7 @@ def import_chart_of_accounts(conn, args):
         parent_id = None
         parent_name = row.get("parent_name")
         if parent_name:
-            parent = conn.execute(
-                "SELECT id FROM account WHERE name = ? AND company_id = ?",
-                (parent_name, company_id),
-            ).fetchone()
+            parent = conn.execute(q.get_sql(), (parent_name, company_id)).fetchone()
             if parent:
                 parent_id = parent["id"]
 
@@ -1454,14 +1524,15 @@ def import_chart_of_accounts(conn, args):
             balance_dir = "credit_normal"
 
         acct_id = str(uuid.uuid4())
-        conn.execute(
-            """INSERT INTO account (id, name, account_number, parent_id, root_type,
-               account_type, currency, is_group, balance_direction, company_id, depth)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+        q_ins = (Q.into(t_account)
+                 .columns("id", "name", "account_number", "parent_id", "root_type",
+                           "account_type", "currency", "is_group", "balance_direction",
+                           "company_id", "depth")
+                 .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), 0))
+        conn.execute(q_ins.get_sql(),
             (acct_id, name, row.get("account_number"), parent_id, root_type,
              row.get("account_type"), row.get("currency", "USD"),
-             is_group, balance_dir, company_id),
-        )
+             is_group, balance_dir, company_id))
         imported += 1
 
     conn.commit()
@@ -1505,13 +1576,17 @@ def import_opening_balances(conn, args):
         err("CSV file is empty")
 
     # Build GL entries
+    t_account = Table("account")
+    t_customer = Table("customer")
+    t_supplier = Table("supplier")
+
     gl_entries = []
     for row in rows:
         acct_num = row.get("account_number", "")
-        acct = conn.execute(
-            "SELECT id, root_type FROM account WHERE account_number = ? AND company_id = ?",
-            (acct_num, company_id),
-        ).fetchone()
+        q = (Q.from_(t_account).select(t_account.id, t_account.root_type)
+             .where(t_account.account_number == P())
+             .where(t_account.company_id == P()))
+        acct = conn.execute(q.get_sql(), (acct_num, company_id)).fetchone()
         if not acct:
             err(f"Account not found: {acct_num}")
 
@@ -1524,15 +1599,14 @@ def import_opening_balances(conn, args):
             entry["party_type"] = row["party_type"]
             # Look up party ID
             if row["party_type"] == "customer":
-                party = conn.execute(
-                    "SELECT id FROM customer WHERE name = ? AND company_id = ?",
-                    (row["party_name"], company_id),
-                ).fetchone()
+                q_party = (Q.from_(t_customer).select(t_customer.id)
+                           .where(t_customer.name == P())
+                           .where(t_customer.company_id == P()))
             else:
-                party = conn.execute(
-                    "SELECT id FROM supplier WHERE name = ? AND company_id = ?",
-                    (row["party_name"], company_id),
-                ).fetchone()
+                q_party = (Q.from_(t_supplier).select(t_supplier.id)
+                           .where(t_supplier.name == P())
+                           .where(t_supplier.company_id == P()))
+            party = conn.execute(q_party.get_sql(), (row["party_name"], company_id)).fetchone()
             if party:
                 entry["party_id"] = party["id"]
 

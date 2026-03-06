@@ -325,6 +325,20 @@ ROLE_PERMISSIONS = {
 }
 
 
+def register_role(role_name: str, default_permissions: list[tuple[str, str]]):
+    """Register a vertical-specific role with default permissions.
+
+    Verticals call this during init to add their roles to the
+    permission matrix without modifying shared lib source.
+
+    Args:
+        role_name: e.g. 'Site Foreman', 'Attorney'
+        default_permissions: List of (skill, action_pattern) tuples.
+            e.g. [('buildclaw', '*'), ('erpclaw-projects', 'list-*')]
+    """
+    ROLE_PERMISSIONS[role_name] = default_permissions
+
+
 def seed_role_permissions(conn):
     """Seed role_permission table with default permissions.
 

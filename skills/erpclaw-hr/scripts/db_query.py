@@ -10,6 +10,7 @@ Output: JSON to stdout, exit 0 on success, exit 1 on error.
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import uuid
@@ -27,6 +28,11 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
+    from erpclaw_lib.query import (
+        Q, P, Table, Field, fn, Case, Order, Criterion, Not, NULL,
+        DecimalSum, DecimalAbs, insert_row, update_row,
+    )
+    from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
@@ -71,38 +77,45 @@ def _parse_json_arg(value, name):
 
 def _get_fiscal_year(conn, target_date: str) -> str | None:
     """Return the fiscal year name for a date, or None if not found."""
-    fy = conn.execute(
-        "SELECT name FROM fiscal_year WHERE start_date <= ? AND end_date >= ? AND is_closed = 0",
-        (target_date, target_date),
-    ).fetchone()
+    t = Table("fiscal_year")
+    q = (Q.from_(t)
+         .select(t.name)
+         .where(t.start_date <= P())
+         .where(t.end_date >= P())
+         .where(t.is_closed == 0))
+    fy = conn.execute(q.get_sql(), (target_date, target_date)).fetchone()
     return fy["name"] if fy else None
 
 
 def _get_fiscal_year_row(conn, target_date: str) -> dict | None:
     """Return the full fiscal year row for a date, or None."""
-    fy = conn.execute(
-        """SELECT id, name, start_date, end_date, company_id
-           FROM fiscal_year
-           WHERE start_date <= ? AND end_date >= ? AND is_closed = 0""",
-        (target_date, target_date),
-    ).fetchone()
+    t = Table("fiscal_year")
+    q = (Q.from_(t)
+         .select(t.id, t.name, t.start_date, t.end_date, t.company_id)
+         .where(t.start_date <= P())
+         .where(t.end_date >= P())
+         .where(t.is_closed == 0))
+    fy = conn.execute(q.get_sql(), (target_date, target_date)).fetchone()
     return row_to_dict(fy) if fy else None
 
 
 def _get_cost_center(conn, company_id: str) -> str | None:
     """Return the first non-group cost center for a company, or None."""
-    cc = conn.execute(
-        "SELECT id FROM cost_center WHERE company_id = ? AND is_group = 0 LIMIT 1",
-        (company_id,),
-    ).fetchone()
+    t = Table("cost_center")
+    q = (Q.from_(t)
+         .select(t.id)
+         .where(t.company_id == P())
+         .where(t.is_group == 0)
+         .limit(1))
+    cc = conn.execute(q.get_sql(), (company_id,)).fetchone()
     return cc["id"] if cc else None
 
 
 def _validate_company_exists(conn, company_id: str):
     """Validate that a company exists and return the row, or error."""
-    company = conn.execute(
-        "SELECT id FROM company WHERE id = ?", (company_id,),
-    ).fetchone()
+    t = Table("company")
+    q = Q.from_(t).select(t.id).where(t.id == P())
+    company = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not company:
         err(f"Company {company_id} not found")
     return company
@@ -110,9 +123,9 @@ def _validate_company_exists(conn, company_id: str):
 
 def _validate_employee_exists(conn, employee_id: str):
     """Validate that an employee exists and return the full row, or error."""
-    emp = conn.execute(
-        "SELECT * FROM employee WHERE id = ?", (employee_id,),
-    ).fetchone()
+    t = Table("employee")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    emp = conn.execute(q.get_sql(), (employee_id,)).fetchone()
     if not emp:
         err(f"Employee {employee_id} not found",
              suggestion="Use 'list employees' to see available employees.")
@@ -121,10 +134,9 @@ def _validate_employee_exists(conn, employee_id: str):
 
 def _validate_department_exists(conn, department_id: str):
     """Validate that a department exists and return the row, or error."""
-    dept = conn.execute(
-        "SELECT * FROM department WHERE id = ? OR name = ?",
-        (department_id, department_id),
-    ).fetchone()
+    t = Table("department")
+    q = Q.from_(t).select(t.star).where((t.id == P()) | (t.name == P()))
+    dept = conn.execute(q.get_sql(), (department_id, department_id)).fetchone()
     if not dept:
         err(f"Department {department_id} not found")
     return dept
@@ -132,10 +144,9 @@ def _validate_department_exists(conn, department_id: str):
 
 def _validate_designation_exists(conn, designation_id: str):
     """Validate that a designation exists and return the row, or error."""
-    des = conn.execute(
-        "SELECT * FROM designation WHERE id = ? OR name = ?",
-        (designation_id, designation_id),
-    ).fetchone()
+    t = Table("designation")
+    q = Q.from_(t).select(t.star).where((t.id == P()) | (t.name == P()))
+    des = conn.execute(q.get_sql(), (designation_id, designation_id)).fetchone()
     if not des:
         err(f"Designation {designation_id} not found")
     return des
@@ -143,9 +154,9 @@ def _validate_designation_exists(conn, designation_id: str):
 
 def _validate_leave_type_exists(conn, leave_type_id: str):
     """Validate that a leave type exists and return the row, or error."""
-    lt = conn.execute(
-        "SELECT * FROM leave_type WHERE id = ?", (leave_type_id,),
-    ).fetchone()
+    t = Table("leave_type")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    lt = conn.execute(q.get_sql(), (leave_type_id,)).fetchone()
     if not lt:
         err(f"Leave type {leave_type_id} not found")
     return lt
@@ -153,9 +164,9 @@ def _validate_leave_type_exists(conn, leave_type_id: str):
 
 def _validate_employee_grade_exists(conn, grade_id: str):
     """Validate that an employee grade exists and return the row, or error."""
-    grade = conn.execute(
-        "SELECT * FROM employee_grade WHERE id = ?", (grade_id,),
-    ).fetchone()
+    t = Table("employee_grade")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    grade = conn.execute(q.get_sql(), (grade_id,)).fetchone()
     if not grade:
         err(f"Employee grade {grade_id} not found")
     return grade
@@ -163,9 +174,9 @@ def _validate_employee_grade_exists(conn, grade_id: str):
 
 def _validate_holiday_list_exists(conn, holiday_list_id: str):
     """Validate that a holiday list exists and return the row, or error."""
-    hl = conn.execute(
-        "SELECT * FROM holiday_list WHERE id = ?", (holiday_list_id,),
-    ).fetchone()
+    t = Table("holiday_list")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    hl = conn.execute(q.get_sql(), (holiday_list_id,)).fetchone()
     if not hl:
         err(f"Holiday list {holiday_list_id} not found")
     return hl
@@ -214,10 +225,9 @@ def _get_employee_holidays(conn, employee_id: str,
     Checks the employee's assigned holiday_list_id first, then falls back
     to the company's holiday list if available.
     """
-    emp = conn.execute(
-        "SELECT holiday_list_id, company_id FROM employee WHERE id = ?",
-        (employee_id,),
-    ).fetchone()
+    et = Table("employee")
+    q = Q.from_(et).select(et.holiday_list_id, et.company_id).where(et.id == P())
+    emp = conn.execute(q.get_sql(), (employee_id,)).fetchone()
     if not emp:
         return []
 
@@ -225,24 +235,28 @@ def _get_employee_holidays(conn, employee_id: str,
 
     # If employee has no explicit holiday list, try company default
     if not holiday_list_id and emp["company_id"]:
-        hl = conn.execute(
-            """SELECT id FROM holiday_list
-               WHERE company_id = ? AND from_date <= ? AND to_date >= ?
-               ORDER BY from_date DESC LIMIT 1""",
-            (emp["company_id"], to_date, from_date),
-        ).fetchone()
+        ht = Table("holiday_list")
+        q = (Q.from_(ht)
+             .select(ht.id)
+             .where(ht.company_id == P())
+             .where(ht.from_date <= P())
+             .where(ht.to_date >= P())
+             .orderby(ht.from_date, order=Order.desc)
+             .limit(1))
+        hl = conn.execute(q.get_sql(), (emp["company_id"], to_date, from_date)).fetchone()
         if hl:
             holiday_list_id = hl["id"]
 
     if not holiday_list_id:
         return []
 
-    rows = conn.execute(
-        """SELECT holiday_date FROM holiday
-           WHERE holiday_list_id = ?
-             AND holiday_date >= ? AND holiday_date <= ?""",
-        (holiday_list_id, from_date, to_date),
-    ).fetchall()
+    hol = Table("holiday")
+    q = (Q.from_(hol)
+         .select(hol.holiday_date)
+         .where(hol.holiday_list_id == P())
+         .where(hol.holiday_date >= P())
+         .where(hol.holiday_date <= P()))
+    rows = conn.execute(q.get_sql(), (holiday_list_id, from_date, to_date)).fetchall()
     return [r["holiday_date"] for r in rows]
 
 
@@ -309,10 +323,9 @@ def add_employee(conn, args):
     if args.holiday_list_id:
         _validate_holiday_list_exists(conn, args.holiday_list_id)
     if args.payroll_cost_center_id:
-        cc = conn.execute(
-            "SELECT id FROM cost_center WHERE id = ?",
-            (args.payroll_cost_center_id,),
-        ).fetchone()
+        cct = Table("cost_center")
+        q = Q.from_(cct).select(cct.id).where(cct.id == P())
+        cc = conn.execute(q.get_sql(), (args.payroll_cost_center_id,)).fetchone()
         if not cc:
             err(f"Cost center {args.payroll_cost_center_id} not found")
 
@@ -323,6 +336,13 @@ def add_employee(conn, args):
                 f"Invalid federal filing status '{args.federal_filing_status}'. "
                 f"Valid: {VALID_FILING_STATUSES}"
             )
+
+    # Validate email format if provided
+    _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    for field, label in [("company_email", "company-email"), ("personal_email", "personal-email")]:
+        val = getattr(args, field, None)
+        if val and not _EMAIL_RE.match(val):
+            err(f"Invalid email format for --{label}: '{val}'")
 
     # Compute full_name
     first_name = args.first_name.strip()
@@ -339,61 +359,52 @@ def add_employee(conn, args):
 
     now = _now_iso()
 
-    conn.execute(
-        """INSERT INTO employee (
-            id, naming_series, first_name, last_name, full_name,
-            date_of_birth, gender, date_of_joining, employment_type,
-            status, department_id, designation_id, employee_grade_id,
-            branch, reporting_to, company_id, company_email, personal_email,
-            cell_phone, emergency_contact, bank_details,
-            federal_filing_status, w4_allowances,
-            holiday_list_id, payroll_cost_center_id,
-            created_at, updated_at
-        ) VALUES (
-            ?, ?, ?, ?, ?,
-            ?, ?, ?, ?,
-            'active', ?, ?, ?,
-            ?, ?, ?, ?, ?,
-            ?, ?, ?,
-            ?, ?,
-            ?, ?,
-            ?, ?
-        )""",
-        (
-            employee_id, naming_series, first_name, last_name, full_name,
-            args.date_of_birth, args.gender, args.date_of_joining, employment_type,
-            args.department_id, args.designation_id, args.employee_grade_id,
-            args.branch, args.reporting_to, args.company_id,
-            args.company_email, args.personal_email,
-            args.cell_phone,
-            json.dumps(emergency_contact) if emergency_contact else None,
-            json.dumps(bank_details) if bank_details else None,
-            args.federal_filing_status,
-            int(args.w4_allowances) if args.w4_allowances else 0,
-            args.holiday_list_id, args.payroll_cost_center_id,
-            now, now,
-        ),
-    )
+    sql, _cols = insert_row("employee", {
+        "id": P(), "naming_series": P(), "first_name": P(), "last_name": P(),
+        "full_name": P(), "date_of_birth": P(), "gender": P(),
+        "date_of_joining": P(), "employment_type": P(), "status": P(),
+        "department_id": P(), "designation_id": P(), "employee_grade_id": P(),
+        "branch": P(), "reporting_to": P(), "company_id": P(),
+        "company_email": P(), "personal_email": P(), "cell_phone": P(),
+        "emergency_contact": P(), "bank_details": P(),
+        "federal_filing_status": P(), "w4_allowances": P(),
+        "holiday_list_id": P(), "payroll_cost_center_id": P(),
+        "created_at": P(), "updated_at": P(),
+    })
+    conn.execute(sql, (
+        employee_id, naming_series, first_name, last_name, full_name,
+        args.date_of_birth, args.gender, args.date_of_joining, employment_type,
+        "active",
+        args.department_id, args.designation_id, args.employee_grade_id,
+        args.branch, args.reporting_to, args.company_id,
+        args.company_email, args.personal_email,
+        args.cell_phone,
+        json.dumps(emergency_contact) if emergency_contact else None,
+        json.dumps(bank_details) if bank_details else None,
+        args.federal_filing_status,
+        int(args.w4_allowances) if args.w4_allowances else 0,
+        args.holiday_list_id, args.payroll_cost_center_id,
+        now, now,
+    ))
 
     # Record lifecycle event: hiring
-    conn.execute(
-        """INSERT INTO employee_lifecycle_event
-           (id, employee_id, event_type, event_date, details, new_values, created_at)
-           VALUES (?, ?, 'hiring', ?, ?, ?, ?)""",
-        (
-            str(uuid.uuid4()), employee_id, args.date_of_joining,
-            json.dumps({"action": "Employee created"}),
-            json.dumps({
-                "first_name": first_name,
-                "last_name": last_name,
-                "department_id": args.department_id,
-                "designation_id": args.designation_id,
-                "employment_type": employment_type,
-                "company_id": args.company_id,
-            }),
-            now,
-        ),
-    )
+    sql, _cols = insert_row("employee_lifecycle_event", {
+        "id": P(), "employee_id": P(), "event_type": P(), "event_date": P(),
+        "details": P(), "new_values": P(), "created_at": P(),
+    })
+    conn.execute(sql, (
+        str(uuid.uuid4()), employee_id, "hiring", args.date_of_joining,
+        json.dumps({"action": "Employee created"}),
+        json.dumps({
+            "first_name": first_name,
+            "last_name": last_name,
+            "department_id": args.department_id,
+            "designation_id": args.designation_id,
+            "employment_type": employment_type,
+            "company_id": args.company_id,
+        }),
+        now,
+    ))
 
     audit(conn, "erpclaw-hr", "add-employee", "employee", employee_id,
            new_values={"naming_series": naming_series, "full_name": full_name},
@@ -527,10 +538,9 @@ def update_employee(conn, args):
 
     if args.payroll_cost_center_id is not None:
         if args.payroll_cost_center_id:
-            cc = conn.execute(
-                "SELECT id FROM cost_center WHERE id = ?",
-                (args.payroll_cost_center_id,),
-            ).fetchone()
+            cct = Table("cost_center")
+            q = Q.from_(cct).select(cct.id).where(cct.id == P())
+            cc = conn.execute(q.get_sql(), (args.payroll_cost_center_id,)).fetchone()
             if not cc:
                 err(f"Cost center {args.payroll_cost_center_id} not found")
         updates["payroll_cost_center_id"] = args.payroll_cost_center_id or None
@@ -538,9 +548,14 @@ def update_employee(conn, args):
     # Simple text fields
     if args.branch is not None:
         updates["branch"] = args.branch or None
+    _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
     if args.company_email is not None:
+        if args.company_email and not _EMAIL_RE.match(args.company_email):
+            err(f"Invalid email format for --company-email: '{args.company_email}'")
         updates["company_email"] = args.company_email or None
     if args.personal_email is not None:
+        if args.personal_email and not _EMAIL_RE.match(args.personal_email):
+            err(f"Invalid email format for --personal-email: '{args.personal_email}'")
         updates["personal_email"] = args.personal_email or None
     if args.cell_phone is not None:
         updates["cell_phone"] = args.cell_phone or None
@@ -590,7 +605,7 @@ def update_employee(conn, args):
     if not updates:
         err("No fields to update. Provide at least one optional flag.")
 
-    # Build the SET clause
+    # raw SQL — dynamic column building (columns determined at runtime)
     updates["updated_at"] = _now_iso()
     set_clause = ", ".join(f"{col} = ?" for col in updates.keys())
     params = list(updates.values()) + [args.employee_id]
@@ -631,20 +646,23 @@ def get_employee(conn, args):
         err("--employee-id is required")
 
     # Fetch employee with joined department and designation names
-    row = conn.execute(
-        """SELECT e.*,
-               d.name AS department_name,
-               des.name AS designation_name,
-               eg.name AS employee_grade_name,
-               hl.name AS holiday_list_name
-           FROM employee e
-           LEFT JOIN department d ON d.id = e.department_id
-           LEFT JOIN designation des ON des.id = e.designation_id
-           LEFT JOIN employee_grade eg ON eg.id = e.employee_grade_id
-           LEFT JOIN holiday_list hl ON hl.id = e.holiday_list_id
-           WHERE e.id = ?""",
-        (args.employee_id,),
-    ).fetchone()
+    e = Table("employee").as_("e")
+    d = Table("department").as_("d")
+    des = Table("designation").as_("des")
+    eg = Table("employee_grade").as_("eg")
+    hl = Table("holiday_list").as_("hl")
+    q = (Q.from_(e)
+         .select(e.star,
+                 d.name.as_("department_name"),
+                 des.name.as_("designation_name"),
+                 eg.name.as_("employee_grade_name"),
+                 hl.name.as_("holiday_list_name"))
+         .left_join(d).on(d.id == e.department_id)
+         .left_join(des).on(des.id == e.designation_id)
+         .left_join(eg).on(eg.id == e.employee_grade_id)
+         .left_join(hl).on(hl.id == e.holiday_list_id)
+         .where(e.id == P()))
+    row = conn.execute(q.get_sql(), (args.employee_id,)).fetchone()
 
     if not row:
         err(f"Employee {args.employee_id} not found")
@@ -669,16 +687,17 @@ def get_employee(conn, args):
 
     leave_balances = []
     if fiscal_year:
-        lb_rows = conn.execute(
-            """SELECT la.leave_type_id, lt.name AS leave_type_name,
-                  la.total_leaves, la.used_leaves, la.remaining_leaves,
-                  la.fiscal_year
-               FROM leave_allocation la
-               JOIN leave_type lt ON lt.id = la.leave_type_id
-               WHERE la.employee_id = ? AND la.fiscal_year = ?
-               ORDER BY lt.name""",
-            (args.employee_id, fiscal_year),
-        ).fetchall()
+        la = Table("leave_allocation").as_("la")
+        lt = Table("leave_type").as_("lt")
+        q = (Q.from_(la)
+             .join(lt).on(lt.id == la.leave_type_id)
+             .select(la.leave_type_id, lt.name.as_("leave_type_name"),
+                     la.total_leaves, la.used_leaves, la.remaining_leaves,
+                     la.fiscal_year)
+             .where(la.employee_id == P())
+             .where(la.fiscal_year == P())
+             .orderby(lt.name))
+        lb_rows = conn.execute(q.get_sql(), (args.employee_id, fiscal_year)).fetchall()
         leave_balances = [row_to_dict(r) for r in lb_rows]
 
     employee["leave_balances"] = leave_balances
@@ -687,39 +706,43 @@ def get_employee(conn, args):
     month_start = date.today().replace(day=1).isoformat()
     month_end = date.today().isoformat()
 
-    att_summary = conn.execute(
-        """SELECT
-               COUNT(*) AS total_records,
-               SUM(CASE WHEN status = 'present' THEN 1 ELSE 0 END) AS present_days,
-               SUM(CASE WHEN status = 'absent' THEN 1 ELSE 0 END) AS absent_days,
-               SUM(CASE WHEN status = 'half_day' THEN 1 ELSE 0 END) AS half_days,
-               SUM(CASE WHEN status = 'on_leave' THEN 1 ELSE 0 END) AS on_leave_days,
-               SUM(CASE WHEN status = 'work_from_home' THEN 1 ELSE 0 END) AS wfh_days,
-               SUM(CASE WHEN late_entry = 1 THEN 1 ELSE 0 END) AS late_entries,
-               SUM(CASE WHEN early_exit = 1 THEN 1 ELSE 0 END) AS early_exits
-           FROM attendance
-           WHERE employee_id = ?
-             AND attendance_date >= ? AND attendance_date <= ?""",
-        (args.employee_id, month_start, month_end),
-    ).fetchone()
+    at = Table("attendance")
+    q = (Q.from_(at)
+         .select(
+             fn.Count("*").as_("total_records"),
+             fn.Sum(Case().when(at.status == "present", 1).else_(0)).as_("present_days"),
+             fn.Sum(Case().when(at.status == "absent", 1).else_(0)).as_("absent_days"),
+             fn.Sum(Case().when(at.status == "half_day", 1).else_(0)).as_("half_days"),
+             fn.Sum(Case().when(at.status == "on_leave", 1).else_(0)).as_("on_leave_days"),
+             fn.Sum(Case().when(at.status == "work_from_home", 1).else_(0)).as_("wfh_days"),
+             fn.Sum(Case().when(at.late_entry == 1, 1).else_(0)).as_("late_entries"),
+             fn.Sum(Case().when(at.early_exit == 1, 1).else_(0)).as_("early_exits"),
+         )
+         .where(at.employee_id == P())
+         .where(at.attendance_date >= P())
+         .where(at.attendance_date <= P()))
+    att_summary = conn.execute(q.get_sql(), (args.employee_id, month_start, month_end)).fetchone()
 
     employee["attendance_summary"] = row_to_dict(att_summary) if att_summary else {}
 
     # Reporting chain: who this employee reports to
     if employee.get("reporting_to"):
-        mgr = conn.execute(
-            "SELECT id, full_name, designation_id FROM employee WHERE id = ?",
-            (employee["reporting_to"],),
-        ).fetchone()
+        et2 = Table("employee")
+        q = (Q.from_(et2)
+             .select(et2.id, et2.full_name, et2.designation_id)
+             .where(et2.id == P()))
+        mgr = conn.execute(q.get_sql(), (employee["reporting_to"],)).fetchone()
         employee["reporting_to_name"] = mgr["full_name"] if mgr else None
     else:
         employee["reporting_to_name"] = None
 
     # Direct reports count
-    direct_reports_count = conn.execute(
-        "SELECT COUNT(*) FROM employee WHERE reporting_to = ? AND status = 'active'",
-        (args.employee_id,),
-    ).fetchone()
+    et3 = Table("employee")
+    q = (Q.from_(et3)
+         .select(fn.Count("*"))
+         .where(et3.reporting_to == P())
+         .where(et3.status == "active"))
+    direct_reports_count = conn.execute(q.get_sql(), (args.employee_id,)).fetchone()
     employee["direct_reports_count"] = direct_reports_count[0] if direct_reports_count else 0
 
     ok({"employee": employee})
@@ -735,22 +758,33 @@ def list_employees(conn, args):
     Optional: --company-id, --department-id, --designation-id, --status,
               --employment-type, --search, --limit (20), --offset (0)
     """
-    conditions = ["1=1"]
+    e = Table("employee").as_("e")
+    d = Table("department").as_("d")
+    des_t = Table("designation").as_("des")
+
+    base = (Q.from_(e)
+            .left_join(d).on(d.id == e.department_id)
+            .left_join(des_t).on(des_t.id == e.designation_id))
+
     params = []
+    crit = None
+
+    def _and(c, new):
+        return new if c is None else c & new
 
     if args.company_id:
-        conditions.append("e.company_id = ?")
+        crit = _and(crit, e.company_id == P())
         params.append(args.company_id)
     if args.department_id:
-        conditions.append("e.department_id = ?")
+        crit = _and(crit, e.department_id == P())
         params.append(args.department_id)
     if args.designation_id:
-        conditions.append("e.designation_id = ?")
+        crit = _and(crit, e.designation_id == P())
         params.append(args.designation_id)
     if args.status:
         if args.status not in VALID_EMPLOYEE_STATUSES:
             err(f"Invalid status '{args.status}'. Valid: {VALID_EMPLOYEE_STATUSES}")
-        conditions.append("e.status = ?")
+        crit = _and(crit, e.status == P())
         params.append(args.status)
     if args.employment_type:
         if args.employment_type not in VALID_EMPLOYMENT_TYPES:
@@ -758,46 +792,39 @@ def list_employees(conn, args):
                 f"Invalid employment type '{args.employment_type}'. "
                 f"Valid: {VALID_EMPLOYMENT_TYPES}"
             )
-        conditions.append("e.employment_type = ?")
+        crit = _and(crit, e.employment_type == P())
         params.append(args.employment_type)
     if args.search:
-        conditions.append(
-            "(e.full_name LIKE ? OR e.naming_series LIKE ? "
-            "OR e.company_email LIKE ? OR e.cell_phone LIKE ?)"
-        )
         search_term = f"%{args.search}%"
+        search_crit = (
+            e.full_name.like(P()) | e.naming_series.like(P())
+            | e.company_email.like(P()) | e.cell_phone.like(P())
+        )
+        crit = _and(crit, search_crit)
         params.extend([search_term, search_term, search_term, search_term])
 
-    where = " AND ".join(conditions)
-
     # Total count
-    count_row = conn.execute(
-        f"""SELECT COUNT(*) FROM employee e
-            LEFT JOIN department d ON d.id = e.department_id
-            LEFT JOIN designation des ON des.id = e.designation_id
-            WHERE {where}""",
-        params,
-    ).fetchone()
+    count_q = base.select(fn.Count("*"))
+    if crit is not None:
+        count_q = count_q.where(crit)
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"""SELECT e.id, e.naming_series, e.full_name, e.date_of_joining,
-               e.employment_type, e.status, e.company_id, e.branch,
-               e.company_email, e.cell_phone,
-               d.name AS department_name,
-               des.name AS designation_name
-           FROM employee e
-           LEFT JOIN department d ON d.id = e.department_id
-           LEFT JOIN designation des ON des.id = e.designation_id
-           WHERE {where}
-           ORDER BY e.full_name ASC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    list_q = (base
+              .select(e.id, e.naming_series, e.full_name, e.date_of_joining,
+                      e.employment_type, e.status, e.company_id, e.branch,
+                      e.company_email, e.cell_phone,
+                      d.name.as_("department_name"),
+                      des_t.name.as_("designation_name"))
+              .orderby(e.full_name)
+              .limit(P()).offset(P()))
+    if crit is not None:
+        list_q = list_q.where(crit)
+    list_params = params + [limit, offset]
+    rows = conn.execute(list_q.get_sql(), list_params).fetchall()
 
     ok({
         "employees": [row_to_dict(r) for r in rows],
@@ -826,10 +853,9 @@ def add_department(conn, args):
 
     # Validate parent department if provided
     if args.parent_id:
-        parent = conn.execute(
-            "SELECT id, company_id FROM department WHERE id = ?",
-            (args.parent_id,),
-        ).fetchone()
+        dt = Table("department")
+        q = Q.from_(dt).select(dt.id, dt.company_id).where(dt.id == P())
+        parent = conn.execute(q.get_sql(), (args.parent_id,)).fetchone()
         if not parent:
             err(f"Parent department {args.parent_id} not found")
         if parent["company_id"] != args.company_id:
@@ -839,18 +865,18 @@ def add_department(conn, args):
 
     # Validate cost center if provided
     if args.cost_center_id:
-        cc = conn.execute(
-            "SELECT id FROM cost_center WHERE id = ?",
-            (args.cost_center_id,),
-        ).fetchone()
+        cct = Table("cost_center")
+        q = Q.from_(cct).select(cct.id).where(cct.id == P())
+        cc = conn.execute(q.get_sql(), (args.cost_center_id,)).fetchone()
         if not cc:
             err(f"Cost center {args.cost_center_id} not found")
 
     # Check for duplicate name within the same company
-    existing = conn.execute(
-        "SELECT id FROM department WHERE name = ? AND company_id = ?",
-        (args.name, args.company_id),
-    ).fetchone()
+    dt2 = Table("department")
+    q = (Q.from_(dt2).select(dt2.id)
+         .where(dt2.name == P())
+         .where(dt2.company_id == P()))
+    existing = conn.execute(q.get_sql(), (args.name, args.company_id)).fetchone()
     if existing:
         err(
             f"Department '{args.name}' already exists in this company "
@@ -860,13 +886,12 @@ def add_department(conn, args):
     dept_id = str(uuid.uuid4())
     now = _now_iso()
 
-    conn.execute(
-        """INSERT INTO department (id, name, parent_id, company_id,
-               cost_center_id, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (dept_id, args.name, args.parent_id, args.company_id,
-         args.cost_center_id, now, now),
-    )
+    sql, _cols = insert_row("department", {
+        "id": P(), "name": P(), "parent_id": P(), "company_id": P(),
+        "cost_center_id": P(), "created_at": P(), "updated_at": P(),
+    })
+    conn.execute(sql, (dept_id, args.name, args.parent_id, args.company_id,
+                        args.cost_center_id, now, now))
 
     audit(conn, "erpclaw-hr", "add-department", "department", dept_id,
            new_values={"name": args.name, "company_id": args.company_id},
@@ -891,49 +916,58 @@ def list_departments(conn, args):
     Optional: --company-id, --parent-id, --limit, --offset
     Returns: list of departments with parent name and cost center name.
     """
-    conditions = ["1=1"]
+    d = Table("department").as_("d")
+    p = Table("department").as_("p")
+    c = Table("company").as_("c")
+
+    base = (Q.from_(d)
+            .left_join(p).on(p.id == d.parent_id)
+            .left_join(c).on(c.id == d.company_id))
+
     params = []
+    crit = None
+
+    def _and(c_arg, new):
+        return new if c_arg is None else c_arg & new
 
     if args.company_id:
-        conditions.append("d.company_id = ?")
+        crit = _and(crit, d.company_id == P())
         params.append(args.company_id)
     if args.parent_id:
-        conditions.append("d.parent_id = ?")
+        crit = _and(crit, d.parent_id == P())
         params.append(args.parent_id)
 
-    where = " AND ".join(conditions)
-
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM department d WHERE {where}", params
-    ).fetchone()
+    count_q = Q.from_(d).select(fn.Count("*"))
+    if crit is not None:
+        count_q = count_q.where(crit)
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"""SELECT d.id, d.name, d.parent_id, d.company_id,
-               d.cost_center_id,
-               p.name AS parent_name,
-               c.name AS company_name
-           FROM department d
-           LEFT JOIN department p ON p.id = d.parent_id
-           LEFT JOIN company c ON c.id = d.company_id
-           WHERE {where}
-           ORDER BY d.name ASC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    list_q = (base
+              .select(d.id, d.name, d.parent_id, d.company_id,
+                      d.cost_center_id,
+                      p.name.as_("parent_name"),
+                      c.name.as_("company_name"))
+              .orderby(d.name)
+              .limit(P()).offset(P()))
+    if crit is not None:
+        list_q = list_q.where(crit)
+    list_params = params + [limit, offset]
+    rows = conn.execute(list_q.get_sql(), list_params).fetchall()
 
     # Count employees per department
+    emp_t = Table("employee")
     departments = []
     for row in rows:
         dept = row_to_dict(row)
-        emp_count = conn.execute(
-            "SELECT COUNT(*) FROM employee WHERE department_id = ? AND status = 'active'",
-            (dept["id"],),
-        ).fetchone()
+        eq = (Q.from_(emp_t)
+              .select(fn.Count("*"))
+              .where(emp_t.department_id == P())
+              .where(emp_t.status == "active"))
+        emp_count = conn.execute(eq.get_sql(), (dept["id"],)).fetchone()
         dept["employee_count"] = emp_count[0] if emp_count else 0
         departments.append(dept)
 
@@ -955,20 +989,20 @@ def add_designation(conn, args):
         err("--name is required")
 
     # Check for duplicate name (designation.name is UNIQUE)
-    existing = conn.execute(
-        "SELECT id FROM designation WHERE name = ?", (args.name,),
-    ).fetchone()
+    dt = Table("designation")
+    q = Q.from_(dt).select(dt.id).where(dt.name == P())
+    existing = conn.execute(q.get_sql(), (args.name,)).fetchone()
     if existing:
         err(f"Designation '{args.name}' already exists (id: {existing['id']})")
 
     desig_id = str(uuid.uuid4())
     now = _now_iso()
 
-    conn.execute(
-        """INSERT INTO designation (id, name, description, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?)""",
-        (desig_id, args.name, args.description, now, now),
-    )
+    sql, _cols = insert_row("designation", {
+        "id": P(), "name": P(), "description": P(),
+        "created_at": P(), "updated_at": P(),
+    })
+    conn.execute(sql, (desig_id, args.name, args.description, now, now))
 
     audit(conn, "erpclaw-hr", "add-designation", "designation", desig_id,
            new_values={"name": args.name},
@@ -993,27 +1027,30 @@ def list_designations(conn, args):
     Optional: --limit, --offset
     Returns: list of designations with employee counts.
     """
-    count_row = conn.execute("SELECT COUNT(*) FROM designation").fetchone()
+    dt = Table("designation")
+    count_row = conn.execute(
+        Q.from_(dt).select(fn.Count("*")).get_sql()
+    ).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
 
-    rows = conn.execute(
-        """SELECT id, name, description, created_at, updated_at
-           FROM designation
-           ORDER BY name ASC
-           LIMIT ? OFFSET ?""",
-        (limit, offset),
-    ).fetchall()
+    q = (Q.from_(dt)
+         .select(dt.id, dt.name, dt.description, dt.created_at, dt.updated_at)
+         .orderby(dt.name)
+         .limit(P()).offset(P()))
+    rows = conn.execute(q.get_sql(), (limit, offset)).fetchall()
 
+    emp_t = Table("employee")
     designations = []
     for row in rows:
         desig = row_to_dict(row)
-        emp_count = conn.execute(
-            "SELECT COUNT(*) FROM employee WHERE designation_id = ? AND status = 'active'",
-            (desig["id"],),
-        ).fetchone()
+        eq = (Q.from_(emp_t)
+              .select(fn.Count("*"))
+              .where(emp_t.designation_id == P())
+              .where(emp_t.status == "active"))
+        emp_count = conn.execute(eq.get_sql(), (desig["id"],)).fetchone()
         desig["employee_count"] = emp_count[0] if emp_count else 0
         designations.append(desig)
 
@@ -1047,9 +1084,9 @@ def add_leave_type(conn, args):
         err(f"Invalid max-days-allowed value: {args.max_days_allowed}")
 
     # Check for duplicate name (leave_type.name is UNIQUE)
-    existing = conn.execute(
-        "SELECT id FROM leave_type WHERE name = ?", (args.name,),
-    ).fetchone()
+    ltt = Table("leave_type")
+    q = Q.from_(ltt).select(ltt.id).where(ltt.name == P())
+    existing = conn.execute(q.get_sql(), (args.name,)).fetchone()
     if existing:
         err(f"Leave type '{args.name}' already exists (id: {existing['id']})")
 
@@ -1087,18 +1124,16 @@ def add_leave_type(conn, args):
     lt_id = str(uuid.uuid4())
     now = _now_iso()
 
-    conn.execute(
-        """INSERT INTO leave_type (
-            id, name, max_days_allowed, is_carry_forward,
-            max_carry_forward_days, is_paid_leave, is_compensatory,
-            applicable_after_days, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            lt_id, args.name, str(max_days), is_carry_forward,
-            max_carry_forward_days, is_paid_leave, is_compensatory,
-            applicable_after_days, now, now,
-        ),
-    )
+    sql, _cols = insert_row("leave_type", {
+        "id": P(), "name": P(), "max_days_allowed": P(), "is_carry_forward": P(),
+        "max_carry_forward_days": P(), "is_paid_leave": P(), "is_compensatory": P(),
+        "applicable_after_days": P(), "created_at": P(), "updated_at": P(),
+    })
+    conn.execute(sql, (
+        lt_id, args.name, str(max_days), is_carry_forward,
+        max_carry_forward_days, is_paid_leave, is_compensatory,
+        applicable_after_days, now, now,
+    ))
 
     audit(conn, "erpclaw-hr", "add-leave-type", "leave_type", lt_id,
            new_values={"name": args.name, "max_days_allowed": str(max_days)},
@@ -1124,21 +1159,22 @@ def list_leave_types(conn, args):
     Optional: --limit, --offset
     Returns: list of leave types.
     """
-    count_row = conn.execute("SELECT COUNT(*) FROM leave_type").fetchone()
+    ltt = Table("leave_type")
+    count_row = conn.execute(
+        Q.from_(ltt).select(fn.Count("*")).get_sql()
+    ).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
 
-    rows = conn.execute(
-        """SELECT id, name, max_days_allowed, is_carry_forward,
-               max_carry_forward_days, is_paid_leave, is_compensatory,
-               applicable_after_days, created_at, updated_at
-           FROM leave_type
-           ORDER BY name ASC
-           LIMIT ? OFFSET ?""",
-        (limit, offset),
-    ).fetchall()
+    q = (Q.from_(ltt)
+         .select(ltt.id, ltt.name, ltt.max_days_allowed, ltt.is_carry_forward,
+                 ltt.max_carry_forward_days, ltt.is_paid_leave, ltt.is_compensatory,
+                 ltt.applicable_after_days, ltt.created_at, ltt.updated_at)
+         .orderby(ltt.name)
+         .limit(P()).offset(P()))
+    rows = conn.execute(q.get_sql(), (limit, offset)).fetchall()
 
     ok({
         "leave_types": [row_to_dict(r) for r in rows],
@@ -1182,19 +1218,20 @@ def add_leave_allocation(conn, args):
         err(f"Invalid total-leaves value: {args.total_leaves}")
 
     # Validate fiscal year exists
-    fy_row = conn.execute(
-        "SELECT id, name FROM fiscal_year WHERE name = ?",
-        (args.fiscal_year,),
-    ).fetchone()
+    fyt = Table("fiscal_year")
+    q = Q.from_(fyt).select(fyt.id, fyt.name).where(fyt.name == P())
+    fy_row = conn.execute(q.get_sql(), (args.fiscal_year,)).fetchone()
     if not fy_row:
         err(f"Fiscal year '{args.fiscal_year}' not found")
 
     # Check for existing allocation for same employee + leave type + fiscal year
-    existing = conn.execute(
-        """SELECT id FROM leave_allocation
-           WHERE employee_id = ? AND leave_type_id = ? AND fiscal_year = ?""",
-        (args.employee_id, args.leave_type_id, args.fiscal_year),
-    ).fetchone()
+    lat = Table("leave_allocation")
+    q = (Q.from_(lat).select(lat.id)
+         .where(lat.employee_id == P())
+         .where(lat.leave_type_id == P())
+         .where(lat.fiscal_year == P()))
+    existing = conn.execute(q.get_sql(),
+                            (args.employee_id, args.leave_type_id, args.fiscal_year)).fetchone()
     if existing:
         err(
             f"Leave allocation already exists for employee {args.employee_id}, "
@@ -1208,11 +1245,16 @@ def add_leave_allocation(conn, args):
 
     if lt["is_carry_forward"]:
         # Find the previous fiscal year's allocation for this employee/leave type
+        lat2 = Table("leave_allocation")
+        q = (Q.from_(lat2)
+             .select(lat2.id, lat2.remaining_leaves, lat2.fiscal_year)
+             .where(lat2.employee_id == P())
+             .where(lat2.leave_type_id == P())
+             .where(lat2.fiscal_year != P())
+             .orderby(lat2.fiscal_year, order=Order.desc)
+             .limit(1))
         prev_alloc = conn.execute(
-            """SELECT id, remaining_leaves, fiscal_year
-               FROM leave_allocation
-               WHERE employee_id = ? AND leave_type_id = ? AND fiscal_year != ?
-               ORDER BY fiscal_year DESC LIMIT 1""",
+            q.get_sql(),
             (args.employee_id, args.leave_type_id, args.fiscal_year),
         ).fetchone()
 
@@ -1235,19 +1277,17 @@ def add_leave_allocation(conn, args):
     alloc_id = str(uuid.uuid4())
     now = _now_iso()
 
-    conn.execute(
-        """INSERT INTO leave_allocation (
-            id, employee_id, leave_type_id, fiscal_year,
-            total_leaves, used_leaves, remaining_leaves,
-            carry_forwarded_from, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            alloc_id, args.employee_id, args.leave_type_id,
-            args.fiscal_year,
-            str(total_leaves), str(used_leaves), str(remaining_leaves),
-            carry_forwarded_from, now, now,
-        ),
-    )
+    sql, _cols = insert_row("leave_allocation", {
+        "id": P(), "employee_id": P(), "leave_type_id": P(), "fiscal_year": P(),
+        "total_leaves": P(), "used_leaves": P(), "remaining_leaves": P(),
+        "carry_forwarded_from": P(), "created_at": P(), "updated_at": P(),
+    })
+    conn.execute(sql, (
+        alloc_id, args.employee_id, args.leave_type_id,
+        args.fiscal_year,
+        str(total_leaves), str(used_leaves), str(remaining_leaves),
+        carry_forwarded_from, now, now,
+    ))
 
     audit(conn, "erpclaw-hr", "add-leave-allocation", "leave_allocation", alloc_id,
            new_values={
@@ -1302,37 +1342,39 @@ def get_leave_balance(conn, args):
         if not fiscal_year:
             err("No open fiscal year found for today's date")
 
-    conditions = ["la.employee_id = ?", "la.fiscal_year = ?"]
+    la = Table("leave_allocation").as_("la")
+    lt = Table("leave_type").as_("lt")
+
+    q = (Q.from_(la)
+         .join(lt).on(lt.id == la.leave_type_id)
+         .select(la.id.as_("allocation_id"), la.leave_type_id,
+                 lt.name.as_("leave_type_name"), lt.is_paid_leave,
+                 la.total_leaves, la.used_leaves, la.remaining_leaves,
+                 la.carry_forwarded_from, la.fiscal_year)
+         .where(la.employee_id == P())
+         .where(la.fiscal_year == P())
+         .orderby(lt.name))
     params = [args.employee_id, fiscal_year]
 
     if args.leave_type_id:
         _validate_leave_type_exists(conn, args.leave_type_id)
-        conditions.append("la.leave_type_id = ?")
+        q = q.where(la.leave_type_id == P())
         params.append(args.leave_type_id)
 
-    where = " AND ".join(conditions)
-
-    rows = conn.execute(
-        f"""SELECT la.id AS allocation_id, la.leave_type_id,
-               lt.name AS leave_type_name, lt.is_paid_leave,
-               la.total_leaves, la.used_leaves, la.remaining_leaves,
-               la.carry_forwarded_from, la.fiscal_year
-           FROM leave_allocation la
-           JOIN leave_type lt ON lt.id = la.leave_type_id
-           WHERE {where}
-           ORDER BY lt.name ASC""",
-        params,
-    ).fetchall()
+    rows = conn.execute(q.get_sql(), params).fetchall()
 
     balances = [row_to_dict(r) for r in rows]
 
     # Also count pending leave applications (draft/approved not yet deducted)
+    la_app = Table("leave_application")
     for balance in balances:
+        pq = (Q.from_(la_app)
+              .select(fn.Coalesce(DecimalSum(la_app.total_days), ValueWrapper("0")).as_("pending_days"))
+              .where(la_app.employee_id == P())
+              .where(la_app.leave_type_id == P())
+              .where(la_app.status == "draft"))
         pending = conn.execute(
-            """SELECT COALESCE(decimal_sum(total_days), '0') AS pending_days
-               FROM leave_application
-               WHERE employee_id = ? AND leave_type_id = ? AND status = 'draft'""",
-            (args.employee_id, balance["leave_type_id"]),
+            pq.get_sql(), (args.employee_id, balance["leave_type_id"])
         ).fetchone()
         balance["pending_days"] = str(
             round_currency(to_decimal(str(pending["pending_days"])))
@@ -1444,10 +1486,14 @@ def add_leave_application(conn, args):
     # Check that sufficient leave balance exists
     fiscal_year = _get_fiscal_year(conn, args.from_date)
     if fiscal_year:
+        lat = Table("leave_allocation")
+        q = (Q.from_(lat)
+             .select(lat.id, lat.remaining_leaves)
+             .where(lat.employee_id == P())
+             .where(lat.leave_type_id == P())
+             .where(lat.fiscal_year == P()))
         alloc = conn.execute(
-            """SELECT id, remaining_leaves FROM leave_allocation
-               WHERE employee_id = ? AND leave_type_id = ? AND fiscal_year = ?""",
-            (args.employee_id, args.leave_type_id, fiscal_year),
+            q.get_sql(), (args.employee_id, args.leave_type_id, fiscal_year)
         ).fetchone()
         if alloc:
             remaining = to_decimal(alloc["remaining_leaves"])
@@ -1463,12 +1509,15 @@ def add_leave_application(conn, args):
             )
 
     # Check for overlapping leave applications (approved or draft)
+    lap = Table("leave_application")
+    q = (Q.from_(lap)
+         .select(lap.id, lap.from_date, lap.to_date, lap.status)
+         .where(lap.employee_id == P())
+         .where(lap.status.isin(["draft", "approved"]))
+         .where(lap.from_date <= P())
+         .where(lap.to_date >= P()))
     overlapping = conn.execute(
-        """SELECT id, from_date, to_date, status FROM leave_application
-           WHERE employee_id = ?
-             AND status IN ('draft', 'approved')
-             AND from_date <= ? AND to_date >= ?""",
-        (args.employee_id, args.to_date, args.from_date),
+        q.get_sql(), (args.employee_id, args.to_date, args.from_date)
     ).fetchone()
     if overlapping:
         err(
@@ -1483,20 +1532,18 @@ def add_leave_application(conn, args):
                                   company_id=emp["company_id"])
     now = _now_iso()
 
-    conn.execute(
-        """INSERT INTO leave_application (
-            id, naming_series, employee_id, leave_type_id,
-            from_date, to_date, total_days,
-            half_day, half_day_date, reason,
-            status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)""",
-        (
-            app_id, naming_series, args.employee_id, args.leave_type_id,
-            args.from_date, args.to_date, str(total_days),
-            1 if half_day else 0, half_day_date, args.reason,
-            now, now,
-        ),
-    )
+    sql, _cols = insert_row("leave_application", {
+        "id": P(), "naming_series": P(), "employee_id": P(), "leave_type_id": P(),
+        "from_date": P(), "to_date": P(), "total_days": P(),
+        "half_day": P(), "half_day_date": P(), "reason": P(),
+        "status": P(), "created_at": P(), "updated_at": P(),
+    })
+    conn.execute(sql, (
+        app_id, naming_series, args.employee_id, args.leave_type_id,
+        args.from_date, args.to_date, str(total_days),
+        1 if half_day else 0, half_day_date, args.reason,
+        "draft", now, now,
+    ))
 
     audit(conn, "erpclaw-hr", "add-leave-application", "leave_application", app_id,
            new_values={
@@ -1543,10 +1590,9 @@ def approve_leave(conn, args):
         err("--approved-by is required")
 
     # Fetch application
-    app = conn.execute(
-        "SELECT * FROM leave_application WHERE id = ?",
-        (args.leave_application_id,),
-    ).fetchone()
+    lap = Table("leave_application")
+    q = Q.from_(lap).select(lap.star).where(lap.id == P())
+    app = conn.execute(q.get_sql(), (args.leave_application_id,)).fetchone()
     if not app:
         err(f"Leave application {args.leave_application_id} not found")
 
@@ -1567,21 +1613,22 @@ def approve_leave(conn, args):
     now = _now_iso()
 
     # Update leave application status
-    conn.execute(
-        """UPDATE leave_application
-           SET status = 'approved', approved_by = ?, updated_at = ?
-           WHERE id = ?""",
-        (args.approved_by, now, args.leave_application_id),
-    )
+    sql = update_row("leave_application",
+                     data={"status": P(), "approved_by": P(), "updated_at": P()},
+                     where={"id": P()})
+    conn.execute(sql, ("approved", args.approved_by, now, args.leave_application_id))
 
     # Deduct from leave allocation
     fiscal_year = _get_fiscal_year(conn, app["from_date"])
     if fiscal_year:
+        lat = Table("leave_allocation")
+        q = (Q.from_(lat)
+             .select(lat.id, lat.used_leaves, lat.remaining_leaves)
+             .where(lat.employee_id == P())
+             .where(lat.leave_type_id == P())
+             .where(lat.fiscal_year == P()))
         alloc = conn.execute(
-            """SELECT id, used_leaves, remaining_leaves
-               FROM leave_allocation
-               WHERE employee_id = ? AND leave_type_id = ? AND fiscal_year = ?""",
-            (app["employee_id"], app["leave_type_id"], fiscal_year),
+            q.get_sql(), (app["employee_id"], app["leave_type_id"], fiscal_year)
         ).fetchone()
 
         if alloc:
@@ -1598,12 +1645,10 @@ def approve_leave(conn, args):
                     f"Remaining: {old_remaining}, Requested: {total_days}"
                 )
 
-            conn.execute(
-                """UPDATE leave_allocation
-                   SET used_leaves = ?, remaining_leaves = ?, updated_at = ?
-                   WHERE id = ?""",
-                (str(new_used), str(new_remaining), now, alloc["id"]),
-            )
+            sql = update_row("leave_allocation",
+                             data={"used_leaves": P(), "remaining_leaves": P(), "updated_at": P()},
+                             where={"id": P()})
+            conn.execute(sql, (str(new_used), str(new_remaining), now, alloc["id"]))
         else:
             # No allocation found -- this should not normally happen
             # since add-leave-application checks for it, but handle gracefully
@@ -1621,10 +1666,9 @@ def approve_leave(conn, args):
         )
 
     # Get leave type name for response
-    lt = conn.execute(
-        "SELECT name FROM leave_type WHERE id = ?",
-        (app["leave_type_id"],),
-    ).fetchone()
+    ltt = Table("leave_type")
+    q = Q.from_(ltt).select(ltt.name).where(ltt.id == P())
+    lt = conn.execute(q.get_sql(), (app["leave_type_id"],)).fetchone()
     leave_type_name = lt["name"] if lt else app["leave_type_id"]
 
     audit(conn, "erpclaw-hr", "approve-leave", "leave_application",
@@ -1665,10 +1709,9 @@ def reject_leave(conn, args):
         err("--leave-application-id is required")
 
     # Fetch application
-    app = conn.execute(
-        "SELECT * FROM leave_application WHERE id = ?",
-        (args.leave_application_id,),
-    ).fetchone()
+    lap = Table("leave_application")
+    q = Q.from_(lap).select(lap.star).where(lap.id == P())
+    app = conn.execute(q.get_sql(), (args.leave_application_id,)).fetchone()
     if not app:
         err(f"Leave application {args.leave_application_id} not found")
 
@@ -1681,18 +1724,15 @@ def reject_leave(conn, args):
     now = _now_iso()
 
     # Update status to rejected
-    conn.execute(
-        """UPDATE leave_application
-           SET status = 'rejected', updated_at = ?
-           WHERE id = ?""",
-        (now, args.leave_application_id),
-    )
+    sql = update_row("leave_application",
+                     data={"status": P(), "updated_at": P()},
+                     where={"id": P()})
+    conn.execute(sql, ("rejected", now, args.leave_application_id))
 
     # Get leave type name for audit
-    lt = conn.execute(
-        "SELECT name FROM leave_type WHERE id = ?",
-        (app["leave_type_id"],),
-    ).fetchone()
+    ltt = Table("leave_type")
+    q = Q.from_(ltt).select(ltt.name).where(ltt.id == P())
+    lt = conn.execute(q.get_sql(), (app["leave_type_id"],)).fetchone()
     leave_type_name = lt["name"] if lt else app["leave_type_id"]
 
     rejection_reason = args.reason or "No reason provided"
@@ -1725,60 +1765,64 @@ def list_leave_applications(conn, args):
     Optional: --employee-id, --status, --from-date, --to-date,
               --leave-type-id, --limit (20), --offset (0)
     """
-    conditions = ["1=1"]
+    la = Table("leave_application").as_("la")
+    e = Table("employee").as_("e")
+    lt = Table("leave_type").as_("lt")
+    approver = Table("employee").as_("approver")
+
     params = []
+    crit = None
+
+    def _and(c, new):
+        return new if c is None else c & new
 
     if args.employee_id:
-        conditions.append("la.employee_id = ?")
+        crit = _and(crit, la.employee_id == P())
         params.append(args.employee_id)
     if args.status:
         if args.status not in VALID_LEAVE_STATUSES:
             err(f"Invalid leave status '{args.status}'. Valid: {VALID_LEAVE_STATUSES}")
-        conditions.append("la.status = ?")
+        crit = _and(crit, la.status == P())
         params.append(args.status)
     if args.leave_type_id:
-        conditions.append("la.leave_type_id = ?")
+        crit = _and(crit, la.leave_type_id == P())
         params.append(args.leave_type_id)
     if args.from_date:
-        conditions.append("la.from_date >= ?")
+        crit = _and(crit, la.from_date >= P())
         params.append(args.from_date)
     if args.to_date:
-        conditions.append("la.to_date <= ?")
+        crit = _and(crit, la.to_date <= P())
         params.append(args.to_date)
 
-    where = " AND ".join(conditions)
-
     # Total count
-    count_row = conn.execute(
-        f"""SELECT COUNT(*) FROM leave_application la
-            WHERE {where}""",
-        params,
-    ).fetchone()
+    count_q = Q.from_(la).select(fn.Count("*"))
+    if crit is not None:
+        count_q = count_q.where(crit)
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"""SELECT la.id, la.naming_series, la.employee_id,
-               la.leave_type_id, la.from_date, la.to_date,
-               la.total_days, la.half_day, la.half_day_date,
-               la.reason, la.status, la.approved_by,
-               la.created_at, la.updated_at,
-               e.full_name AS employee_name,
-               e.naming_series AS employee_series,
-               lt.name AS leave_type_name,
-               approver.full_name AS approved_by_name
-           FROM leave_application la
-           JOIN employee e ON e.id = la.employee_id
-           JOIN leave_type lt ON lt.id = la.leave_type_id
-           LEFT JOIN employee approver ON approver.id = la.approved_by
-           WHERE {where}
-           ORDER BY la.created_at DESC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    list_q = (Q.from_(la)
+              .join(e).on(e.id == la.employee_id)
+              .join(lt).on(lt.id == la.leave_type_id)
+              .left_join(approver).on(approver.id == la.approved_by)
+              .select(la.id, la.naming_series, la.employee_id,
+                      la.leave_type_id, la.from_date, la.to_date,
+                      la.total_days, la.half_day, la.half_day_date,
+                      la.reason, la.status, la.approved_by,
+                      la.created_at, la.updated_at,
+                      e.full_name.as_("employee_name"),
+                      e.naming_series.as_("employee_series"),
+                      lt.name.as_("leave_type_name"),
+                      approver.full_name.as_("approved_by_name"))
+              .orderby(la.created_at, order=Order.desc)
+              .limit(P()).offset(P()))
+    if crit is not None:
+        list_q = list_q.where(crit)
+    list_params = params + [limit, offset]
+    rows = conn.execute(list_q.get_sql(), list_params).fetchall()
 
     ok({
         "leave_applications": [row_to_dict(r) for r in rows],
@@ -1834,10 +1878,11 @@ def mark_attendance(conn, args):
         err("--early-exit must be 0 or 1")
 
     # Check for duplicate (UNIQUE employee_id + attendance_date)
-    existing = conn.execute(
-        "SELECT id FROM attendance WHERE employee_id = ? AND attendance_date = ?",
-        (args.employee_id, args.date),
-    ).fetchone()
+    at = Table("attendance")
+    q = (Q.from_(at).select(at.id)
+         .where(at.employee_id == P())
+         .where(at.attendance_date == P()))
+    existing = conn.execute(q.get_sql(), (args.employee_id, args.date)).fetchone()
     if existing:
         err(
             f"Attendance already marked for employee {args.employee_id} on "
@@ -1846,19 +1891,17 @@ def mark_attendance(conn, args):
 
     att_id = str(uuid.uuid4())
 
-    conn.execute(
-        """INSERT INTO attendance (
-            id, employee_id, attendance_date, status,
-            shift, check_in_time, check_out_time, working_hours,
-            late_entry, early_exit, source, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            att_id, args.employee_id, args.date, args.status,
-            args.shift, args.check_in_time, args.check_out_time,
-            args.working_hours,
-            late_entry, early_exit, source, _now_iso(),
-        ),
-    )
+    sql, _cols = insert_row("attendance", {
+        "id": P(), "employee_id": P(), "attendance_date": P(), "status": P(),
+        "shift": P(), "check_in_time": P(), "check_out_time": P(), "working_hours": P(),
+        "late_entry": P(), "early_exit": P(), "source": P(), "created_at": P(),
+    })
+    conn.execute(sql, (
+        att_id, args.employee_id, args.date, args.status,
+        args.shift, args.check_in_time, args.check_out_time,
+        args.working_hours,
+        late_entry, early_exit, source, _now_iso(),
+    ))
 
     audit(conn, "erpclaw-hr", "mark-attendance", "attendance", att_id,
            new_values={
@@ -1927,30 +1970,29 @@ def bulk_mark_attendance(conn, args):
             continue
 
         # Validate employee exists
-        emp = conn.execute(
-            "SELECT id, full_name FROM employee WHERE id = ?", (emp_id,),
-        ).fetchone()
+        emp_t = Table("employee")
+        q = Q.from_(emp_t).select(emp_t.id, emp_t.full_name).where(emp_t.id == P())
+        emp = conn.execute(q.get_sql(), (emp_id,)).fetchone()
         if not emp:
             errors.append(f"Entry {i}: employee {emp_id} not found")
             continue
 
         # Check for duplicate
-        existing = conn.execute(
-            "SELECT id FROM attendance WHERE employee_id = ? AND attendance_date = ?",
-            (emp_id, args.date),
-        ).fetchone()
+        at = Table("attendance")
+        q = (Q.from_(at).select(at.id)
+             .where(at.employee_id == P())
+             .where(at.attendance_date == P()))
+        existing = conn.execute(q.get_sql(), (emp_id, args.date)).fetchone()
         if existing:
             skipped_duplicates += 1
             continue
 
         att_id = str(uuid.uuid4())
-        conn.execute(
-            """INSERT INTO attendance (
-                id, employee_id, attendance_date, status,
-                late_entry, early_exit, source, created_at
-            ) VALUES (?, ?, ?, ?, 0, 0, ?, ?)""",
-            (att_id, emp_id, args.date, status, source, _now_iso()),
-        )
+        sql, _cols = insert_row("attendance", {
+            "id": P(), "employee_id": P(), "attendance_date": P(), "status": P(),
+            "late_entry": P(), "early_exit": P(), "source": P(), "created_at": P(),
+        })
+        conn.execute(sql, (att_id, emp_id, args.date, status, 0, 0, source, _now_iso()))
         created += 1
 
     conn.commit()
@@ -1977,65 +2019,68 @@ def list_attendance(conn, args):
               --limit (20), --offset (0)
     Returns: list with employee name JOIN, attendance summary counts.
     """
-    conditions = ["1=1"]
+    a = Table("attendance").as_("a")
+    e = Table("employee").as_("e")
+
     params = []
+    crit = None
+
+    def _and(c, new):
+        return new if c is None else c & new
 
     if args.employee_id:
-        conditions.append("a.employee_id = ?")
+        crit = _and(crit, a.employee_id == P())
         params.append(args.employee_id)
     if args.from_date:
-        conditions.append("a.attendance_date >= ?")
+        crit = _and(crit, a.attendance_date >= P())
         params.append(args.from_date)
     if args.to_date:
-        conditions.append("a.attendance_date <= ?")
+        crit = _and(crit, a.attendance_date <= P())
         params.append(args.to_date)
     if args.status:
         if args.status not in VALID_ATTENDANCE_STATUSES:
             err(f"Invalid attendance status '{args.status}'. Valid: {VALID_ATTENDANCE_STATUSES}")
-        conditions.append("a.status = ?")
+        crit = _and(crit, a.status == P())
         params.append(args.status)
 
-    where = " AND ".join(conditions)
-
     # Total count
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM attendance a WHERE {where}",
-        params,
-    ).fetchone()
+    count_q = Q.from_(a).select(fn.Count("*"))
+    if crit is not None:
+        count_q = count_q.where(crit)
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
-    # Summary counts (using same filters, excluding status filter for breakdown)
-    summary_params = [p for p in params]
-    summary = conn.execute(
-        f"""SELECT
-               COUNT(*) AS total_records,
-               SUM(CASE WHEN a.status = 'present' THEN 1 ELSE 0 END) AS present,
-               SUM(CASE WHEN a.status = 'absent' THEN 1 ELSE 0 END) AS absent,
-               SUM(CASE WHEN a.status = 'half_day' THEN 1 ELSE 0 END) AS half_day,
-               SUM(CASE WHEN a.status = 'on_leave' THEN 1 ELSE 0 END) AS on_leave,
-               SUM(CASE WHEN a.status = 'work_from_home' THEN 1 ELSE 0 END) AS work_from_home
-           FROM attendance a
-           WHERE {where}""",
-        summary_params,
-    ).fetchone()
+    # Summary counts (using same filters)
+    summary_q = (Q.from_(a)
+                 .select(
+                     fn.Count("*").as_("total_records"),
+                     fn.Sum(Case().when(a.status == "present", 1).else_(0)).as_("present"),
+                     fn.Sum(Case().when(a.status == "absent", 1).else_(0)).as_("absent"),
+                     fn.Sum(Case().when(a.status == "half_day", 1).else_(0)).as_("half_day"),
+                     fn.Sum(Case().when(a.status == "on_leave", 1).else_(0)).as_("on_leave"),
+                     fn.Sum(Case().when(a.status == "work_from_home", 1).else_(0)).as_("work_from_home"),
+                 ))
+    if crit is not None:
+        summary_q = summary_q.where(crit)
+    summary = conn.execute(summary_q.get_sql(), list(params)).fetchone()
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"""SELECT a.id, a.employee_id, a.attendance_date, a.status,
-               a.shift, a.check_in_time, a.check_out_time, a.working_hours,
-               a.late_entry, a.early_exit, a.source, a.created_at,
-               e.full_name AS employee_name,
-               e.naming_series AS employee_series
-           FROM attendance a
-           JOIN employee e ON e.id = a.employee_id
-           WHERE {where}
-           ORDER BY a.attendance_date DESC, e.full_name ASC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    list_q = (Q.from_(a)
+              .join(e).on(e.id == a.employee_id)
+              .select(a.id, a.employee_id, a.attendance_date, a.status,
+                      a.shift, a.check_in_time, a.check_out_time, a.working_hours,
+                      a.late_entry, a.early_exit, a.source, a.created_at,
+                      e.full_name.as_("employee_name"),
+                      e.naming_series.as_("employee_series"))
+              .orderby(a.attendance_date, order=Order.desc)
+              .orderby(e.full_name)
+              .limit(P()).offset(P()))
+    if crit is not None:
+        list_q = list_q.where(crit)
+    list_params = params + [limit, offset]
+    rows = conn.execute(list_q.get_sql(), list_params).fetchall()
 
     ok({
         "attendance": [row_to_dict(r) for r in rows],
@@ -2082,22 +2127,21 @@ def add_holiday_list(conn, args):
         err(f"from-date ({args.from_date}) must be on or before to-date ({args.to_date})")
 
     # Check for duplicate name (holiday_list.name is UNIQUE)
-    existing = conn.execute(
-        "SELECT id FROM holiday_list WHERE name = ?", (args.name,),
-    ).fetchone()
+    hlt = Table("holiday_list")
+    q = Q.from_(hlt).select(hlt.id).where(hlt.name == P())
+    existing = conn.execute(q.get_sql(), (args.name,)).fetchone()
     if existing:
         err(f"Holiday list '{args.name}' already exists (id: {existing['id']})")
 
     hl_id = str(uuid.uuid4())
     now = _now_iso()
 
-    conn.execute(
-        """INSERT INTO holiday_list (id, name, from_date, to_date, company_id,
-               created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (hl_id, args.name, args.from_date, args.to_date, args.company_id,
-         now, now),
-    )
+    sql, _cols = insert_row("holiday_list", {
+        "id": P(), "name": P(), "from_date": P(), "to_date": P(),
+        "company_id": P(), "created_at": P(), "updated_at": P(),
+    })
+    conn.execute(sql, (hl_id, args.name, args.from_date, args.to_date,
+                        args.company_id, now, now))
 
     # Insert holiday child rows
     holiday_count = 0
@@ -2119,11 +2163,10 @@ def add_holiday_list(conn, args):
             if h_dt < from_dt or h_dt > to_dt:
                 continue  # skip out-of-range dates
 
-            conn.execute(
-                """INSERT INTO holiday (id, holiday_list_id, holiday_date, description)
-                   VALUES (?, ?, ?, ?)""",
-                (str(uuid.uuid4()), hl_id, h_date, h_desc),
-            )
+            h_sql, _hcols = insert_row("holiday", {
+                "id": P(), "holiday_list_id": P(), "holiday_date": P(), "description": P(),
+            })
+            conn.execute(h_sql, (str(uuid.uuid4()), hl_id, h_date, h_desc))
             holiday_count += 1
 
     audit(conn, "erpclaw-hr", "add-holiday-list", "holiday_list", hl_id,
@@ -2211,10 +2254,9 @@ def add_expense_claim(conn, args):
 
         # Validate account_id if provided
         if account_id:
-            acct = conn.execute(
-                "SELECT id, is_group, company_id FROM account WHERE id = ?",
-                (account_id,),
-            ).fetchone()
+            acct_t = Table("account")
+            q = Q.from_(acct_t).select(acct_t.id, acct_t.is_group, acct_t.company_id).where(acct_t.id == P())
+            acct = conn.execute(q.get_sql(), (account_id,)).fetchone()
             if not acct:
                 err(f"Item {i}: account {account_id} not found")
             if acct["is_group"]:
@@ -2235,31 +2277,27 @@ def add_expense_claim(conn, args):
     naming_series = get_next_name(conn, "expense_claim", company_id=args.company_id)
     now = _now_iso()
 
-    conn.execute(
-        """INSERT INTO expense_claim (
-            id, naming_series, employee_id, expense_date,
-            total_amount, status, company_id,
-            created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?)""",
-        (
-            claim_id, naming_series, args.employee_id, args.expense_date,
-            str(round_currency(total_amount)), args.company_id,
-            now, now,
-        ),
-    )
+    sql, _cols = insert_row("expense_claim", {
+        "id": P(), "naming_series": P(), "employee_id": P(), "expense_date": P(),
+        "total_amount": P(), "status": P(), "company_id": P(),
+        "created_at": P(), "updated_at": P(),
+    })
+    conn.execute(sql, (
+        claim_id, naming_series, args.employee_id, args.expense_date,
+        str(round_currency(total_amount)), "draft", args.company_id,
+        now, now,
+    ))
 
     # Insert expense_claim_item rows
+    item_sql, _icols = insert_row("expense_claim_item", {
+        "id": P(), "expense_claim_id": P(), "expense_type": P(),
+        "description": P(), "amount": P(), "account_id": P(),
+    })
     for item in validated_items:
-        conn.execute(
-            """INSERT INTO expense_claim_item (
-                id, expense_claim_id, expense_type, description,
-                amount, account_id
-            ) VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                str(uuid.uuid4()), claim_id, item["expense_type"],
-                item["description"], item["amount"], item["account_id"],
-            ),
-        )
+        conn.execute(item_sql, (
+            str(uuid.uuid4()), claim_id, item["expense_type"],
+            item["description"], item["amount"], item["account_id"],
+        ))
 
     audit(conn, "erpclaw-hr", "add-expense-claim", "expense_claim", claim_id,
            new_values={
@@ -2297,10 +2335,9 @@ def submit_expense_claim(conn, args):
     if not args.expense_claim_id:
         err("--expense-claim-id is required")
 
-    claim = conn.execute(
-        "SELECT * FROM expense_claim WHERE id = ?",
-        (args.expense_claim_id,),
-    ).fetchone()
+    ect = Table("expense_claim")
+    q = Q.from_(ect).select(ect.star).where(ect.id == P())
+    claim = conn.execute(q.get_sql(), (args.expense_claim_id,)).fetchone()
     if not claim:
         err(f"Expense claim {args.expense_claim_id} not found")
 
@@ -2312,12 +2349,10 @@ def submit_expense_claim(conn, args):
 
     now = _now_iso()
 
-    conn.execute(
-        """UPDATE expense_claim
-           SET status = 'submitted', updated_at = ?
-           WHERE id = ?""",
-        (now, args.expense_claim_id),
-    )
+    sql = update_row("expense_claim",
+                     data={"status": P(), "updated_at": P()},
+                     where={"id": P()})
+    conn.execute(sql, ("submitted", now, args.expense_claim_id))
 
     audit(conn, "erpclaw-hr", "submit-expense-claim", "expense_claim",
            args.expense_claim_id,
@@ -2356,10 +2391,9 @@ def approve_expense_claim(conn, args):
         err("--approved-by is required")
 
     # Fetch expense claim
-    claim = conn.execute(
-        "SELECT * FROM expense_claim WHERE id = ?",
-        (args.expense_claim_id,),
-    ).fetchone()
+    ect = Table("expense_claim")
+    q = Q.from_(ect).select(ect.star).where(ect.id == P())
+    claim = conn.execute(q.get_sql(), (args.expense_claim_id,)).fetchone()
     if not claim:
         err(f"Expense claim {args.expense_claim_id} not found")
 
@@ -2382,20 +2416,18 @@ def approve_expense_claim(conn, args):
     now = _now_iso()
 
     # Fetch expense claim items
-    items = conn.execute(
-        "SELECT * FROM expense_claim_item WHERE expense_claim_id = ?",
-        (args.expense_claim_id,),
-    ).fetchall()
+    ecit = Table("expense_claim_item")
+    q = Q.from_(ecit).select(ecit.star).where(ecit.expense_claim_id == P())
+    items = conn.execute(q.get_sql(), (args.expense_claim_id,)).fetchall()
 
     if not items:
         err(f"Expense claim {args.expense_claim_id} has no items")
 
     # Find a payable account for the CR side
     # First try company's default_payable_account_id
-    company_row = conn.execute(
-        "SELECT default_payable_account_id FROM company WHERE id = ?",
-        (company_id,),
-    ).fetchone()
+    co_t = Table("company")
+    q = Q.from_(co_t).select(co_t.default_payable_account_id).where(co_t.id == P())
+    company_row = conn.execute(q.get_sql(), (company_id,)).fetchone()
 
     payable_acct = None
     if company_row:
@@ -2403,20 +2435,24 @@ def approve_expense_claim(conn, args):
 
     if not payable_acct:
         # Fallback: find any payable account for this company
-        payable_row = conn.execute(
-            "SELECT id FROM account WHERE account_type = 'payable' "
-            "AND company_id = ? AND is_group = 0 LIMIT 1",
-            (company_id,),
-        ).fetchone()
+        acct_t = Table("account")
+        q = (Q.from_(acct_t).select(acct_t.id)
+             .where(acct_t.account_type == "payable")
+             .where(acct_t.company_id == P())
+             .where(acct_t.is_group == 0)
+             .limit(1))
+        payable_row = conn.execute(q.get_sql(), (company_id,)).fetchone()
         payable_acct = payable_row["id"] if payable_row else None
 
     if not payable_acct:
         # Last resort: find any liability account
-        liability_row = conn.execute(
-            "SELECT id FROM account WHERE root_type = 'liability' "
-            "AND company_id = ? AND is_group = 0 LIMIT 1",
-            (company_id,),
-        ).fetchone()
+        acct_t2 = Table("account")
+        q = (Q.from_(acct_t2).select(acct_t2.id)
+             .where(acct_t2.root_type == "liability")
+             .where(acct_t2.company_id == P())
+             .where(acct_t2.is_group == 0)
+             .limit(1))
+        liability_row = conn.execute(q.get_sql(), (company_id,)).fetchone()
         payable_acct = liability_row["id"] if liability_row else None
 
     if not payable_acct:
@@ -2437,19 +2473,20 @@ def approve_expense_claim(conn, args):
 
     # If an item has no account_id, try to find a default expense account
     default_expense_acct = None
-    company_detail = conn.execute(
-        "SELECT default_expense_account_id FROM company WHERE id = ?",
-        (company_id,),
-    ).fetchone()
+    co_t2 = Table("company")
+    q = Q.from_(co_t2).select(co_t2.default_expense_account_id).where(co_t2.id == P())
+    company_detail = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if company_detail:
         default_expense_acct = company_detail["default_expense_account_id"]
 
     if not default_expense_acct:
-        expense_row = conn.execute(
-            "SELECT id FROM account WHERE account_type = 'expense' "
-            "AND company_id = ? AND is_group = 0 LIMIT 1",
-            (company_id,),
-        ).fetchone()
+        acct_t3 = Table("account")
+        q = (Q.from_(acct_t3).select(acct_t3.id)
+             .where(acct_t3.account_type == "expense")
+             .where(acct_t3.company_id == P())
+             .where(acct_t3.is_group == 0)
+             .limit(1))
+        expense_row = conn.execute(q.get_sql(), (company_id,)).fetchone()
         if expense_row:
             default_expense_acct = expense_row["id"]
 
@@ -2502,13 +2539,10 @@ def approve_expense_claim(conn, args):
         err(f"GL posting failed: {e}")
 
     # Update expense claim status
-    conn.execute(
-        """UPDATE expense_claim
-           SET status = 'approved', approved_by = ?, approval_date = ?,
-               updated_at = ?
-           WHERE id = ?""",
-        (args.approved_by, now, now, args.expense_claim_id),
-    )
+    sql = update_row("expense_claim",
+                     data={"status": P(), "approved_by": P(), "approval_date": P(), "updated_at": P()},
+                     where={"id": P()})
+    conn.execute(sql, ("approved", args.approved_by, now, now, args.expense_claim_id))
 
     audit(conn, "erpclaw-hr", "approve-expense-claim", "expense_claim",
            args.expense_claim_id,
@@ -2552,10 +2586,9 @@ def reject_expense_claim(conn, args):
     if not args.expense_claim_id:
         err("--expense-claim-id is required")
 
-    claim = conn.execute(
-        "SELECT * FROM expense_claim WHERE id = ?",
-        (args.expense_claim_id,),
-    ).fetchone()
+    ect = Table("expense_claim")
+    q = Q.from_(ect).select(ect.star).where(ect.id == P())
+    claim = conn.execute(q.get_sql(), (args.expense_claim_id,)).fetchone()
     if not claim:
         err(f"Expense claim {args.expense_claim_id} not found")
 
@@ -2568,12 +2601,10 @@ def reject_expense_claim(conn, args):
     now = _now_iso()
     rejection_reason = args.reason or "No reason provided"
 
-    conn.execute(
-        """UPDATE expense_claim
-           SET status = 'rejected', updated_at = ?
-           WHERE id = ?""",
-        (now, args.expense_claim_id),
-    )
+    sql = update_row("expense_claim",
+                     data={"status": P(), "updated_at": P()},
+                     where={"id": P()})
+    conn.execute(sql, ("rejected", now, args.expense_claim_id))
 
     audit(conn, "erpclaw-hr", "reject-expense-claim", "expense_claim",
            args.expense_claim_id,
@@ -2612,16 +2643,16 @@ def update_expense_claim_status(conn, args):
     if args.status not in VALID_EXPENSE_STATUSES:
         err(f"Invalid expense claim status '{args.status}'. Valid: {VALID_EXPENSE_STATUSES}")
 
-    claim = conn.execute(
-        "SELECT * FROM expense_claim WHERE id = ?",
-        (args.expense_claim_id,),
-    ).fetchone()
+    ect = Table("expense_claim")
+    q = Q.from_(ect).select(ect.star).where(ect.id == P())
+    claim = conn.execute(q.get_sql(), (args.expense_claim_id,)).fetchone()
     if not claim:
         err(f"Expense claim {args.expense_claim_id} not found")
 
     old_status = claim["status"]
     now = _now_iso()
 
+    # raw SQL — dynamic column building (columns determined at runtime)
     updates = {"status": args.status, "updated_at": now}
     if args.payment_entry_id:
         updates["payment_entry_id"] = args.payment_entry_id
@@ -2663,39 +2694,63 @@ def list_expense_claims(conn, args):
               --limit (20), --offset (0)
     Returns: list with employee name, items count, total amount.
     """
-    conditions = ["1=1"]
+    ec = Table("expense_claim").as_("ec")
+    e = Table("employee").as_("e")
+
     params = []
+    crit = None
+
+    def _and(c, new):
+        return new if c is None else c & new
 
     if args.employee_id:
-        conditions.append("ec.employee_id = ?")
+        crit = _and(crit, ec.employee_id == P())
         params.append(args.employee_id)
     if args.status:
         if args.status not in VALID_EXPENSE_STATUSES:
             err(f"Invalid expense claim status '{args.status}'. Valid: {VALID_EXPENSE_STATUSES}")
-        conditions.append("ec.status = ?")
+        crit = _and(crit, ec.status == P())
         params.append(args.status)
     if args.company_id:
-        conditions.append("ec.company_id = ?")
+        crit = _and(crit, ec.company_id == P())
         params.append(args.company_id)
     if args.from_date:
-        conditions.append("ec.expense_date >= ?")
+        crit = _and(crit, ec.expense_date >= P())
         params.append(args.from_date)
     if args.to_date:
-        conditions.append("ec.expense_date <= ?")
+        crit = _and(crit, ec.expense_date <= P())
         params.append(args.to_date)
 
-    where = " AND ".join(conditions)
-
     # Total count
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM expense_claim ec WHERE {where}",
-        params,
-    ).fetchone()
+    count_q = Q.from_(ec).select(fn.Count("*"))
+    if crit is not None:
+        count_q = count_q.where(crit)
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
+
+    # raw SQL — correlated subquery for item_count not supported by PyPika
+    conditions = ["1=1"]
+    raw_params = []
+    if args.employee_id:
+        conditions.append("ec.employee_id = ?")
+        raw_params.append(args.employee_id)
+    if args.status:
+        conditions.append("ec.status = ?")
+        raw_params.append(args.status)
+    if args.company_id:
+        conditions.append("ec.company_id = ?")
+        raw_params.append(args.company_id)
+    if args.from_date:
+        conditions.append("ec.expense_date >= ?")
+        raw_params.append(args.from_date)
+    if args.to_date:
+        conditions.append("ec.expense_date <= ?")
+        raw_params.append(args.to_date)
+    where = " AND ".join(conditions)
+    raw_params.extend([limit, offset])
 
     rows = conn.execute(
         f"""SELECT ec.id, ec.naming_series, ec.employee_id,
@@ -2711,7 +2766,7 @@ def list_expense_claims(conn, args):
            WHERE {where}
            ORDER BY ec.created_at DESC
            LIMIT ? OFFSET ?""",
-        params,
+        raw_params,
     ).fetchall()
 
     ok({
@@ -2763,29 +2818,25 @@ def record_lifecycle_event(conn, args):
     event_id = str(uuid.uuid4())
     now = _now_iso()
 
-    conn.execute(
-        """INSERT INTO employee_lifecycle_event
-           (id, employee_id, event_type, event_date, details, old_values,
-            new_values, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            event_id, args.employee_id, args.event_type, args.event_date,
-            json.dumps(details) if details else None,
-            json.dumps(old_values) if old_values else None,
-            json.dumps(new_values) if new_values else None,
-            now,
-        ),
-    )
+    sql, _cols = insert_row("employee_lifecycle_event", {
+        "id": P(), "employee_id": P(), "event_type": P(), "event_date": P(),
+        "details": P(), "old_values": P(), "new_values": P(), "created_at": P(),
+    })
+    conn.execute(sql, (
+        event_id, args.employee_id, args.event_type, args.event_date,
+        json.dumps(details) if details else None,
+        json.dumps(old_values) if old_values else None,
+        json.dumps(new_values) if new_values else None,
+        now,
+    ))
 
     # For termination events, update employee status to 'left' and set date_of_exit
     employee_updated = False
     if args.event_type in ("separation", "resignation", "retirement"):
-        conn.execute(
-            """UPDATE employee
-               SET status = 'left', date_of_exit = ?, updated_at = ?
-               WHERE id = ?""",
-            (args.event_date, now, args.employee_id),
-        )
+        upd_sql = update_row("employee",
+                             data={"status": P(), "date_of_exit": P(), "updated_at": P()},
+                             where={"id": P()})
+        conn.execute(upd_sql, ("left", args.event_date, now, args.employee_id))
         employee_updated = True
 
     audit(conn, "erpclaw-hr", "record-lifecycle-event", "employee_lifecycle_event", event_id,
@@ -2829,32 +2880,35 @@ def status_action(conn, args):
     Returns: employee counts by status, department counts, leave summary,
              attendance summary, expense claims by status, recent lifecycle events.
     """
-    company_filter = ""
-    params = []
-    if args.company_id:
-        company_filter = "AND company_id = ?"
-        params = [args.company_id]
+    emp_t = Table("employee")
 
     # Employee counts by status
     emp_statuses = {}
     for status in VALID_EMPLOYEE_STATUSES:
-        cnt = conn.execute(
-            f"SELECT COUNT(*) FROM employee WHERE status = ? {company_filter}",
-            [status] + params,
-        ).fetchone()[0]
+        q = Q.from_(emp_t).select(fn.Count("*")).where(emp_t.status == P())
+        p = [status]
+        if args.company_id:
+            q = q.where(emp_t.company_id == P())
+            p.append(args.company_id)
+        cnt = conn.execute(q.get_sql(), p).fetchone()[0]
         if cnt > 0:
             emp_statuses[status] = cnt
 
-    total_employees = conn.execute(
-        f"SELECT COUNT(*) FROM employee WHERE 1=1 {company_filter}",
-        params,
-    ).fetchone()[0]
+    q = Q.from_(emp_t).select(fn.Count("*"))
+    p = []
+    if args.company_id:
+        q = q.where(emp_t.company_id == P())
+        p.append(args.company_id)
+    total_employees = conn.execute(q.get_sql(), p).fetchone()[0]
 
     # Department counts
-    total_departments = conn.execute(
-        f"SELECT COUNT(*) FROM department WHERE 1=1 {company_filter}",
-        params,
-    ).fetchone()[0]
+    dept_t = Table("department")
+    q = Q.from_(dept_t).select(fn.Count("*"))
+    p = []
+    if args.company_id:
+        q = q.where(dept_t.company_id == P())
+        p.append(args.company_id)
+    total_departments = conn.execute(q.get_sql(), p).fetchone()[0]
 
     # Leave summary (current fiscal year)
     today_str = date.today().isoformat()
@@ -2862,7 +2916,7 @@ def status_action(conn, args):
 
     leave_summary = {}
     if fiscal_year:
-        # Join through employee to filter by company
+        # raw SQL — correlated subquery for fiscal year start date
         for la_status in VALID_LEAVE_STATUSES:
             cnt = conn.execute(
                 f"""SELECT COUNT(*) FROM leave_application la
@@ -2872,7 +2926,7 @@ def status_action(conn, args):
                           SELECT start_date FROM fiscal_year WHERE name = ?
                       )
                     {"AND e.company_id = ?" if args.company_id else ""}""",
-                [la_status, fiscal_year] + (params if args.company_id else []),
+                [la_status, fiscal_year] + ([args.company_id] if args.company_id else []),
             ).fetchone()[0]
             if cnt > 0:
                 leave_summary[la_status] = cnt
@@ -2881,41 +2935,51 @@ def status_action(conn, args):
     month_start = date.today().replace(day=1).isoformat()
     month_end = date.today().isoformat()
 
+    att_t = Table("attendance").as_("a")
+    emp_a = Table("employee").as_("e")
     att_summary = {}
     for att_status in VALID_ATTENDANCE_STATUSES:
-        cnt = conn.execute(
-            f"""SELECT COUNT(*) FROM attendance a
-                JOIN employee e ON e.id = a.employee_id
-                WHERE a.status = ?
-                  AND a.attendance_date >= ? AND a.attendance_date <= ?
-                {"AND e.company_id = ?" if args.company_id else ""}""",
-            [att_status, month_start, month_end] + (params if args.company_id else []),
-        ).fetchone()[0]
+        q = (Q.from_(att_t)
+             .join(emp_a).on(emp_a.id == att_t.employee_id)
+             .select(fn.Count("*"))
+             .where(att_t.status == P())
+             .where(att_t.attendance_date >= P())
+             .where(att_t.attendance_date <= P()))
+        p = [att_status, month_start, month_end]
+        if args.company_id:
+            q = q.where(emp_a.company_id == P())
+            p.append(args.company_id)
+        cnt = conn.execute(q.get_sql(), p).fetchone()[0]
         if cnt > 0:
             att_summary[att_status] = cnt
 
     # Expense claims by status
+    ec_t = Table("expense_claim")
     ec_statuses = {}
     for ec_status in VALID_EXPENSE_STATUSES:
-        cnt = conn.execute(
-            f"SELECT COUNT(*) FROM expense_claim WHERE status = ? {company_filter}",
-            [ec_status] + params,
-        ).fetchone()[0]
+        q = Q.from_(ec_t).select(fn.Count("*")).where(ec_t.status == P())
+        p = [ec_status]
+        if args.company_id:
+            q = q.where(ec_t.company_id == P())
+            p.append(args.company_id)
+        cnt = conn.execute(q.get_sql(), p).fetchone()[0]
         if cnt > 0:
             ec_statuses[ec_status] = cnt
 
     # Recent lifecycle events (last 10)
-    recent_events = conn.execute(
-        f"""SELECT el.id, el.employee_id, el.event_type, el.event_date,
-               el.created_at, e.full_name AS employee_name
-           FROM employee_lifecycle_event el
-           JOIN employee e ON e.id = el.employee_id
-           WHERE 1=1
-           {"AND e.company_id = ?" if args.company_id else ""}
-           ORDER BY el.created_at DESC
-           LIMIT 10""",
-        params if args.company_id else [],
-    ).fetchall()
+    el = Table("employee_lifecycle_event").as_("el")
+    emp_e = Table("employee").as_("e")
+    q = (Q.from_(el)
+         .join(emp_e).on(emp_e.id == el.employee_id)
+         .select(el.id, el.employee_id, el.event_type, el.event_date,
+                 el.created_at, emp_e.full_name.as_("employee_name"))
+         .orderby(el.created_at, order=Order.desc)
+         .limit(10))
+    p = []
+    if args.company_id:
+        q = q.where(emp_e.company_id == P())
+        p.append(args.company_id)
+    recent_events = conn.execute(q.get_sql(), p).fetchall()
 
     ok({
         "total_employees": total_employees,

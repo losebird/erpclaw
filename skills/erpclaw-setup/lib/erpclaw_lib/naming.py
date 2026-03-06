@@ -77,7 +77,34 @@ ENTITY_PREFIXES = {
     "maintenance_visit": "MV-",
     # erpclaw-billing
     "meter": "MTR-",
+    # educlaw (core)
+    "educlaw_student": "STU-",
+    "educlaw_student_applicant": "STUAPP-",
+    "educlaw_instructor": "INST-",
+    "educlaw_program_enrollment": "PENR-",
+    "educlaw_section": "SEC-",
+    # educlaw-k12
+    "educlaw_k12_iep": "IEP-",
+    "educlaw_k12_504_plan": "504-",
+    "educlaw_k12_sped_referral": "SPED-",
+    "educlaw_k12_discipline_incident": "DISC-",
+    # educlaw-statereport
+    "SUB": "SUB-",
+    "INC": "INC-",
 }
+
+
+def register_prefix(entity_type: str, prefix: str):
+    """Register a naming prefix for a vertical entity type.
+
+    Verticals call this at import time or during init_db to register
+    their naming prefixes without modifying shared lib source.
+
+    Args:
+        entity_type: e.g. 'propclaw_property', 'buildclaw_project'
+        prefix: e.g. 'PROP-', 'BPRJ-'
+    """
+    ENTITY_PREFIXES[entity_type] = prefix
 
 
 def get_next_name(conn: sqlite3.Connection, entity_type: str,

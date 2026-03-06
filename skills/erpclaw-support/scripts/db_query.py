@@ -26,6 +26,11 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
+    from erpclaw_lib.query import (
+        Q, P, Table, Field, fn, Case, Order, Criterion, Not, NULL,
+        DecimalSum, DecimalAbs, insert_row, update_row,
+    )
+    from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
@@ -67,7 +72,9 @@ def _resolve_company_id(conn, args):
     if not company_id:
         err("--company-id is required")
     # Validate company exists
-    comp = conn.execute("SELECT id FROM company WHERE id = ?", (company_id,)).fetchone()
+    t = Table("company")
+    q = Q.from_(t).select(t.id).where(t.id == P())
+    comp = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not comp:
         err(f"Company {company_id} not found")
     # Set on conn so get_next_name() can find it
@@ -80,7 +87,9 @@ def _resolve_company_id(conn, args):
 # ---------------------------------------------------------------------------
 
 def _validate_issue_exists(conn, issue_id: str):
-    issue = conn.execute("SELECT * FROM issue WHERE id = ?", (issue_id,)).fetchone()
+    t = Table("issue")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    issue = conn.execute(q.get_sql(), (issue_id,)).fetchone()
     if not issue:
         err(f"Issue {issue_id} not found",
              suggestion="Use 'list issues' to see available issues.")
@@ -88,16 +97,18 @@ def _validate_issue_exists(conn, issue_id: str):
 
 
 def _validate_sla_exists(conn, sla_id: str):
-    sla = conn.execute(
-        "SELECT * FROM service_level_agreement WHERE id = ?", (sla_id,),
-    ).fetchone()
+    t = Table("service_level_agreement")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    sla = conn.execute(q.get_sql(), (sla_id,)).fetchone()
     if not sla:
         err(f"SLA {sla_id} not found")
     return sla
 
 
 def _validate_customer_exists(conn, customer_id: str):
-    cust = conn.execute("SELECT * FROM customer WHERE id = ?", (customer_id,)).fetchone()
+    t = Table("customer")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    cust = conn.execute(q.get_sql(), (customer_id,)).fetchone()
     if not cust:
         err(f"Customer {customer_id} not found")
     return cust
@@ -113,9 +124,9 @@ def _calc_sla_due_dates(conn, sla_id, priority, created_at):
     Returns (response_due_str, resolution_due_str) as ISO datetime strings,
     or (None, None) if the priority has no configured hours.
     """
-    sla = conn.execute(
-        "SELECT * FROM service_level_agreement WHERE id = ?", (sla_id,),
-    ).fetchone()
+    t = Table("service_level_agreement")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    sla = conn.execute(q.get_sql(), (sla_id,)).fetchone()
     if not sla:
         return (None, None)
 
@@ -208,7 +219,9 @@ def add_issue(conn, args):
         _validate_customer_exists(conn, args.customer_id)
 
     if args.item_id:
-        item = conn.execute("SELECT id FROM item WHERE id = ?", (args.item_id,)).fetchone()
+        it = Table("item")
+        q = Q.from_(it).select(it.id).where(it.id == P())
+        item = conn.execute(q.get_sql(), (args.item_id,)).fetchone()
         if not item:
             err(f"Item {args.item_id} not found")
 
@@ -216,10 +229,11 @@ def add_issue(conn, args):
     # If customer_id provided, derive company from customer; otherwise require --company-id
     company_id = None
     if args.customer_id:
-        cust_row = conn.execute(
-            "SELECT id, company_id FROM customer WHERE id = ? OR name = ?",
-            (args.customer_id, args.customer_id),
-        ).fetchone()
+        ct = Table("customer")
+        cq = Q.from_(ct).select(ct.id, ct.company_id).where(
+            (ct.id == P()) | (ct.name == P())
+        )
+        cust_row = conn.execute(cq.get_sql(), (args.customer_id, args.customer_id)).fetchone()
         if cust_row and cust_row["company_id"]:
             company_id = cust_row["company_id"]
             conn.company_id = company_id
@@ -231,9 +245,9 @@ def add_issue(conn, args):
     # SLA: use provided or find default
     sla_id = args.sla_id
     if not sla_id:
-        default_sla = conn.execute(
-            "SELECT id FROM service_level_agreement WHERE is_default = 1",
-        ).fetchone()
+        st = Table("service_level_agreement")
+        sq = Q.from_(st).select(st.id).where(st.is_default == 1)
+        default_sla = conn.execute(sq.get_sql()).fetchone()
         if default_sla:
             sla_id = default_sla["id"]
 
@@ -247,16 +261,19 @@ def add_issue(conn, args):
     issue_id = str(uuid.uuid4())
     naming = get_next_name(conn, "issue")
 
-    conn.execute(
-        """INSERT INTO issue (id, naming_series, subject, description,
-           customer_id, item_id, serial_number_id, priority, issue_type,
-           status, assigned_to, sla_id, response_due, resolution_due)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)""",
-        (issue_id, naming, args.subject, args.description,
-         args.customer_id, args.item_id, args.serial_number_id,
-         priority, args.issue_type, args.assigned_to,
-         sla_id, response_due, resolution_due),
-    )
+    ins_sql, _ = insert_row("issue", {
+        "id": P(), "naming_series": P(), "subject": P(), "description": P(),
+        "customer_id": P(), "item_id": P(), "serial_number_id": P(),
+        "priority": P(), "issue_type": P(), "status": P(),
+        "assigned_to": P(), "sla_id": P(), "response_due": P(),
+        "resolution_due": P(),
+    })
+    conn.execute(ins_sql, (
+        issue_id, naming, args.subject, args.description,
+        args.customer_id, args.item_id, args.serial_number_id,
+        priority, args.issue_type, "open",
+        args.assigned_to, sla_id, response_due, resolution_due,
+    ))
 
     audit(conn, "erpclaw-support", "add-issue", "issue", issue_id,
            new_values={"subject": args.subject, "priority": priority},
@@ -308,7 +325,7 @@ def update_issue(conn, args):
     if args.status and args.status not in VALID_ISSUE_STATUSES:
         err(f"--status must be one of {VALID_ISSUE_STATUSES}")
 
-    updates = []
+    data = {}
     values = []
 
     field_map = {
@@ -321,24 +338,26 @@ def update_issue(conn, args):
 
     for col, val in field_map.items():
         if val is not None:
-            updates.append(f"{col} = ?")
+            data[col] = P()
             values.append(val)
 
-    if not updates:
+    if not data:
         err("No fields to update. Provide at least one optional flag.")
 
-    updates.append("updated_at = datetime('now')")
+    data["updated_at"] = LiteralValue("datetime('now')")
     values.append(args.issue_id)
 
-    sql = f"UPDATE issue SET {', '.join(updates)} WHERE id = ?"
-    conn.execute(sql, values)
+    upd_sql = update_row("issue", data, where={"id": P()})
+    conn.execute(upd_sql, values)
 
     audit(conn, "erpclaw-support", "update-issue", "issue", args.issue_id,
            old_values=old_values,
            description="Updated issue")
     conn.commit()
 
-    updated = conn.execute("SELECT * FROM issue WHERE id = ?", (args.issue_id,)).fetchone()
+    it = Table("issue")
+    rq = Q.from_(it).select(it.star).where(it.id == P())
+    updated = conn.execute(rq.get_sql(), (args.issue_id,)).fetchone()
 
     ok({
         "issue": row_to_dict(updated),
@@ -363,30 +382,28 @@ def get_issue(conn, args):
 
     # Customer info
     if issue["customer_id"]:
-        customer = conn.execute(
-            "SELECT id, name, customer_type, territory, status FROM customer WHERE id = ?",
-            (issue["customer_id"],),
-        ).fetchone()
+        ct = Table("customer")
+        cq = Q.from_(ct).select(
+            ct.id, ct.name, ct.customer_type, ct.territory, ct.status
+        ).where(ct.id == P())
+        customer = conn.execute(cq.get_sql(), (issue["customer_id"],)).fetchone()
         issue_dict["customer"] = row_to_dict(customer) if customer else None
     else:
         issue_dict["customer"] = None
 
     # SLA info
     if issue["sla_id"]:
-        sla = conn.execute(
-            "SELECT * FROM service_level_agreement WHERE id = ?",
-            (issue["sla_id"],),
-        ).fetchone()
+        st = Table("service_level_agreement")
+        sq = Q.from_(st).select(st.star).where(st.id == P())
+        sla = conn.execute(sq.get_sql(), (issue["sla_id"],)).fetchone()
         issue_dict["sla"] = row_to_dict(sla) if sla else None
     else:
         issue_dict["sla"] = None
 
     # Comments
-    comments = conn.execute(
-        """SELECT * FROM issue_comment WHERE issue_id = ?
-           ORDER BY created_at""",
-        (args.issue_id,),
-    ).fetchall()
+    ic = Table("issue_comment")
+    icq = Q.from_(ic).select(ic.star).where(ic.issue_id == P()).orderby(ic.created_at)
+    comments = conn.execute(icq.get_sql(), (args.issue_id,)).fetchall()
     issue_dict["comments"] = [row_to_dict(c) for c in comments]
 
     # SLA status check
@@ -422,45 +439,44 @@ def list_issues(conn, args):
     Optional: --status, --priority, --customer-id, --assigned-to,
               --company-id, --limit, --offset
     """
-    conditions = ["1=1"]
+    it = Table("issue")
     params = []
-    join_clause = ""
+
+    q = Q.from_(it).select(it.star)
+    q_cnt = Q.from_(it).select(fn.Count("*").as_("cnt"))
 
     if args.company_id:
-        # Join via customer to filter by company
-        join_clause = " JOIN customer c ON issue.customer_id = c.id"
-        conditions.append("c.company_id = ?")
+        ct = Table("customer")
+        q = q.join(ct).on(it.customer_id == ct.id)
+        q_cnt = q_cnt.join(ct).on(it.customer_id == ct.id)
+        q = q.where(ct.company_id == P())
+        q_cnt = q_cnt.where(ct.company_id == P())
         params.append(args.company_id)
 
     if args.status:
-        conditions.append("issue.status = ?")
+        q = q.where(it.status == P())
+        q_cnt = q_cnt.where(it.status == P())
         params.append(args.status)
     if args.priority:
-        conditions.append("issue.priority = ?")
+        q = q.where(it.priority == P())
+        q_cnt = q_cnt.where(it.priority == P())
         params.append(args.priority)
     if args.customer_id:
-        conditions.append("issue.customer_id = ?")
+        q = q.where(it.customer_id == P())
+        q_cnt = q_cnt.where(it.customer_id == P())
         params.append(args.customer_id)
     if args.assigned_to:
-        conditions.append("issue.assigned_to = ?")
+        q = q.where(it.assigned_to == P())
+        q_cnt = q_cnt.where(it.assigned_to == P())
         params.append(args.assigned_to)
 
-    where = " AND ".join(conditions)
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
 
-    rows = conn.execute(
-        f"""SELECT issue.* FROM issue{join_clause}
-            WHERE {where}
-            ORDER BY issue.created_at DESC LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
+    q = q.orderby(it.created_at, order=Order.desc).limit(P()).offset(P())
+    rows = conn.execute(q.get_sql(), params + [limit, offset]).fetchall()
 
-    total = conn.execute(
-        f"""SELECT COUNT(*) AS cnt FROM issue{join_clause}
-            WHERE {where}""",
-        params,
-    ).fetchone()["cnt"]
+    total = conn.execute(q_cnt.get_sql(), params).fetchone()["cnt"]
 
     ok({
         "issues": [row_to_dict(r) for r in rows],
@@ -499,11 +515,13 @@ def add_issue_comment(conn, args):
 
     comment_id = str(uuid.uuid4())
 
-    conn.execute(
-        """INSERT INTO issue_comment (id, issue_id, comment_by, comment_text, is_internal)
-           VALUES (?, ?, ?, ?, ?)""",
-        (comment_id, args.issue_id, comment_by, args.comment, int(is_internal)),
-    )
+    ins_sql, _ = insert_row("issue_comment", {
+        "id": P(), "issue_id": P(), "comment_by": P(),
+        "comment_text": P(), "is_internal": P(),
+    })
+    conn.execute(ins_sql, (
+        comment_id, args.issue_id, comment_by, args.comment, int(is_internal),
+    ))
 
     # Track first employee response for SLA
     if comment_by == "employee" and not issue["first_response_at"]:
@@ -514,11 +532,12 @@ def add_issue_comment(conn, args):
         if issue["response_due"] and now_str > issue["response_due"]:
             sla_breached = 1
 
-        conn.execute(
-            """UPDATE issue SET first_response_at = ?, sla_breached = ?,
-               updated_at = datetime('now') WHERE id = ?""",
-            (now_str, sla_breached, args.issue_id),
-        )
+        upd_sql = update_row("issue", {
+            "first_response_at": P(),
+            "sla_breached": P(),
+            "updated_at": LiteralValue("datetime('now')"),
+        }, where={"id": P()})
+        conn.execute(upd_sql, (now_str, sla_breached, args.issue_id))
 
     audit(conn, "erpclaw-support", "add-issue-comment", "issue_comment", comment_id,
            new_values={"issue_id": args.issue_id, "comment_by": comment_by},
@@ -562,12 +581,15 @@ def resolve_issue(conn, args):
     if issue["resolution_due"] and now_str > issue["resolution_due"]:
         sla_breached = 1
 
-    conn.execute(
-        """UPDATE issue SET status = 'resolved', resolved_at = ?,
-           resolution_notes = ?, sla_breached = ?,
-           updated_at = datetime('now') WHERE id = ?""",
-        (now_str, args.resolution_notes, sla_breached, args.issue_id),
-    )
+    upd_sql = update_row("issue", {
+        "status": P(),
+        "resolved_at": P(),
+        "resolution_notes": P(),
+        "sla_breached": P(),
+        "updated_at": LiteralValue("datetime('now')"),
+    }, where={"id": P()})
+    conn.execute(upd_sql, ("resolved", now_str, args.resolution_notes,
+                           sla_breached, args.issue_id))
 
     audit(conn, "erpclaw-support", "resolve-issue", "issue", args.issue_id,
            old_values={"status": issue["status"]},
@@ -575,7 +597,9 @@ def resolve_issue(conn, args):
            description=f"Issue resolved")
     conn.commit()
 
-    updated = conn.execute("SELECT * FROM issue WHERE id = ?", (args.issue_id,)).fetchone()
+    it = Table("issue")
+    rq = Q.from_(it).select(it.star).where(it.id == P())
+    updated = conn.execute(rq.get_sql(), (args.issue_id,)).fetchone()
 
     ok({
         "issue": row_to_dict(updated),
@@ -604,12 +628,13 @@ def reopen_issue(conn, args):
 
     # Reopen: set status to open, clear resolved_at and resolution_notes
     # Do NOT reset sla_breached (once breached, stays breached)
-    conn.execute(
-        """UPDATE issue SET status = 'open', resolved_at = NULL,
-           resolution_notes = NULL, updated_at = datetime('now')
-           WHERE id = ?""",
-        (args.issue_id,),
-    )
+    upd_sql = update_row("issue", {
+        "status": P(),
+        "resolved_at": P(),
+        "resolution_notes": P(),
+        "updated_at": LiteralValue("datetime('now')"),
+    }, where={"id": P()})
+    conn.execute(upd_sql, ("open", None, None, args.issue_id))
 
     reason = getattr(args, "reason", None) or "No reason provided"
     audit(conn, "erpclaw-support", "reopen-issue", "issue", args.issue_id,
@@ -618,7 +643,9 @@ def reopen_issue(conn, args):
            description=f"Issue reopened: {reason}")
     conn.commit()
 
-    updated = conn.execute("SELECT * FROM issue WHERE id = ?", (args.issue_id,)).fetchone()
+    it = Table("issue")
+    rq = Q.from_(it).select(it.star).where(it.id == P())
+    updated = conn.execute(rq.get_sql(), (args.issue_id,)).fetchone()
 
     ok({
         "issue": row_to_dict(updated),
@@ -657,19 +684,21 @@ def add_sla(conn, args):
 
     # If setting as default, clear existing defaults
     if is_default == "1":
-        conn.execute(
-            "UPDATE service_level_agreement SET is_default = 0 WHERE is_default = 1",
-        )
+        clear_sql = update_row("service_level_agreement",
+                               data={"is_default": P()},
+                               where={"is_default": P()})
+        conn.execute(clear_sql, (0, 1))
 
     sla_id = str(uuid.uuid4())
 
-    conn.execute(
-        """INSERT INTO service_level_agreement (id, name, priority_response_times,
-           priority_resolution_times, working_hours, is_default)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (sla_id, args.name, json.dumps(response_times),
-         json.dumps(resolution_times), args.working_hours, int(is_default)),
-    )
+    ins_sql, _ = insert_row("service_level_agreement", {
+        "id": P(), "name": P(), "priority_response_times": P(),
+        "priority_resolution_times": P(), "working_hours": P(), "is_default": P(),
+    })
+    conn.execute(ins_sql, (
+        sla_id, args.name, json.dumps(response_times),
+        json.dumps(resolution_times), args.working_hours, int(is_default),
+    ))
 
     audit(conn, "erpclaw-support", "add-sla", "service_level_agreement", sla_id,
            new_values={"name": args.name, "is_default": is_default},
@@ -701,15 +730,13 @@ def list_slas(conn, args):
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
 
-    rows = conn.execute(
-        """SELECT * FROM service_level_agreement
-           ORDER BY name LIMIT ? OFFSET ?""",
-        (limit, offset),
-    ).fetchall()
+    st = Table("service_level_agreement")
+    q = (Q.from_(st).select(st.star)
+         .orderby(st.name).limit(P()).offset(P()))
+    rows = conn.execute(q.get_sql(), (limit, offset)).fetchall()
 
-    total = conn.execute(
-        "SELECT COUNT(*) AS cnt FROM service_level_agreement",
-    ).fetchone()["cnt"]
+    q_cnt = Q.from_(st).select(fn.Count("*").as_("cnt"))
+    total = conn.execute(q_cnt.get_sql()).fetchone()["cnt"]
 
     slas = []
     for r in rows:
@@ -752,10 +779,9 @@ def add_warranty_claim(conn, args):
         err("--complaint-description is required")
 
     # Validate customer exists and resolve company_id for naming
-    cust = conn.execute(
-        "SELECT id, company_id, name FROM customer WHERE id = ?",
-        (args.customer_id,),
-    ).fetchone()
+    ct = Table("customer")
+    cq = Q.from_(ct).select(ct.id, ct.company_id, ct.name).where(ct.id == P())
+    cust = conn.execute(cq.get_sql(), (args.customer_id,)).fetchone()
     if not cust:
         err(f"Customer {args.customer_id} not found")
 
@@ -765,15 +791,16 @@ def add_warranty_claim(conn, args):
     claim_id = str(uuid.uuid4())
     naming = get_next_name(conn, "warranty_claim")
 
-    conn.execute(
-        """INSERT INTO warranty_claim
-           (id, naming_series, customer_id, item_id, serial_number_id,
-            warranty_expiry_date, complaint_description)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (claim_id, naming, args.customer_id, args.item_id,
-         args.serial_number_id, args.warranty_expiry_date,
-         args.complaint_description),
-    )
+    ins_sql, _ = insert_row("warranty_claim", {
+        "id": P(), "naming_series": P(), "customer_id": P(),
+        "item_id": P(), "serial_number_id": P(),
+        "warranty_expiry_date": P(), "complaint_description": P(),
+    })
+    conn.execute(ins_sql, (
+        claim_id, naming, args.customer_id, args.item_id,
+        args.serial_number_id, args.warranty_expiry_date,
+        args.complaint_description,
+    ))
 
     audit(conn, "erpclaw-support", "add-warranty-claim", "warranty_claim", claim_id,
            new_values={"customer_id": args.customer_id,
@@ -781,9 +808,9 @@ def add_warranty_claim(conn, args):
            description=f"Created warranty claim {naming}")
     conn.commit()
 
-    claim = conn.execute(
-        "SELECT * FROM warranty_claim WHERE id = ?", (claim_id,),
-    ).fetchone()
+    wt = Table("warranty_claim")
+    rq = Q.from_(wt).select(wt.star).where(wt.id == P())
+    claim = conn.execute(rq.get_sql(), (claim_id,)).fetchone()
 
     ok({
         "warranty_claim": row_to_dict(claim),
@@ -804,10 +831,9 @@ def update_warranty_claim(conn, args):
     if not args.warranty_claim_id:
         err("--warranty-claim-id is required")
 
-    claim = conn.execute(
-        "SELECT * FROM warranty_claim WHERE id = ?",
-        (args.warranty_claim_id,),
-    ).fetchone()
+    wt = Table("warranty_claim")
+    wq = Q.from_(wt).select(wt.star).where(wt.id == P())
+    claim = conn.execute(wq.get_sql(), (args.warranty_claim_id,)).fetchone()
     if not claim:
         err(f"Warranty claim {args.warranty_claim_id} not found")
 
@@ -817,23 +843,23 @@ def update_warranty_claim(conn, args):
 
     old_values = row_to_dict(claim)
 
-    updates = []
+    data = {}
     values = []
 
     if args.status is not None:
         if args.status not in VALID_WARRANTY_STATUSES:
             err(f"--status must be one of {VALID_WARRANTY_STATUSES}")
-        updates.append("status = ?")
+        data["status"] = P()
         values.append(args.status)
 
     if args.resolution is not None:
         if args.resolution not in VALID_WARRANTY_RESOLUTIONS:
             err(f"--resolution must be one of {VALID_WARRANTY_RESOLUTIONS}")
-        updates.append("resolution = ?")
+        data["resolution"] = P()
         values.append(args.resolution)
 
     if args.resolution_date is not None:
-        updates.append("resolution_date = ?")
+        data["resolution_date"] = P()
         values.append(args.resolution_date)
 
     if args.cost is not None:
@@ -841,16 +867,16 @@ def update_warranty_claim(conn, args):
             to_decimal(args.cost)
         except Exception:
             err(f"--cost must be a valid decimal value, got: {args.cost}")
-        updates.append("cost = ?")
+        data["cost"] = P()
         values.append(args.cost)
 
-    if not updates:
+    if not data:
         err("No fields to update. Provide at least one optional flag.")
 
-    updates.append("updated_at = datetime('now')")
+    data["updated_at"] = LiteralValue("datetime('now')")
     values.append(args.warranty_claim_id)
-    sql = f"UPDATE warranty_claim SET {', '.join(updates)} WHERE id = ?"
-    conn.execute(sql, values)
+    upd_sql = update_row("warranty_claim", data, where={"id": P()})
+    conn.execute(upd_sql, values)
 
     audit(conn, "erpclaw-support", "update-warranty-claim", "warranty_claim",
            args.warranty_claim_id,
@@ -858,10 +884,9 @@ def update_warranty_claim(conn, args):
            description="Updated warranty claim")
     conn.commit()
 
-    updated = conn.execute(
-        "SELECT * FROM warranty_claim WHERE id = ?",
-        (args.warranty_claim_id,),
-    ).fetchone()
+    wt2 = Table("warranty_claim")
+    rq = Q.from_(wt2).select(wt2.star).where(wt2.id == P())
+    updated = conn.execute(rq.get_sql(), (args.warranty_claim_id,)).fetchone()
 
     ok({
         "warranty_claim": row_to_dict(updated),
@@ -878,34 +903,31 @@ def list_warranty_claims(conn, args):
 
     Optional: --customer-id, --status, --limit, --offset
     """
-    conditions = ["1=1"]
+    wc = Table("warranty_claim")
+    ct = Table("customer")
     params = []
 
+    q = (Q.from_(wc)
+         .left_join(ct).on(ct.id == wc.customer_id)
+         .select(wc.star, ct.name.as_("customer_name")))
+    q_cnt = Q.from_(wc).select(fn.Count("*").as_("cnt"))
+
     if args.customer_id:
-        conditions.append("wc.customer_id = ?")
+        q = q.where(wc.customer_id == P())
+        q_cnt = q_cnt.where(wc.customer_id == P())
         params.append(args.customer_id)
     if args.status:
-        conditions.append("wc.status = ?")
+        q = q.where(wc.status == P())
+        q_cnt = q_cnt.where(wc.status == P())
         params.append(args.status)
 
-    where = " AND ".join(conditions)
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
 
-    rows = conn.execute(
-        f"""SELECT wc.*, c.name AS customer_name
-            FROM warranty_claim wc
-            LEFT JOIN customer c ON c.id = wc.customer_id
-            WHERE {where}
-            ORDER BY wc.created_at DESC
-            LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
+    q = q.orderby(wc.created_at, order=Order.desc).limit(P()).offset(P())
+    rows = conn.execute(q.get_sql(), params + [limit, offset]).fetchall()
 
-    total = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM warranty_claim wc WHERE {where}",
-        params,
-    ).fetchone()["cnt"]
+    total = conn.execute(q_cnt.get_sql(), params).fetchone()["cnt"]
 
     ok({
         "warranty_claims": [row_to_dict(r) for r in rows],
@@ -939,10 +961,9 @@ def add_maintenance_schedule(conn, args):
         err(f"--schedule-frequency must be one of {VALID_SCHEDULE_FREQUENCIES}")
 
     # Validate customer exists and resolve company_id for naming
-    cust = conn.execute(
-        "SELECT id, company_id, name FROM customer WHERE id = ?",
-        (args.customer_id,),
-    ).fetchone()
+    ct = Table("customer")
+    cq = Q.from_(ct).select(ct.id, ct.company_id, ct.name).where(ct.id == P())
+    cust = conn.execute(cq.get_sql(), (args.customer_id,)).fetchone()
     if not cust:
         err(f"Customer {args.customer_id} not found")
 
@@ -952,16 +973,17 @@ def add_maintenance_schedule(conn, args):
     naming = get_next_name(conn, "maintenance_schedule")
     next_due = _calc_next_due_date(args.start_date, frequency)
 
-    conn.execute(
-        """INSERT INTO maintenance_schedule
-           (id, naming_series, customer_id, item_id, serial_number_id,
-            schedule_frequency, start_date, end_date,
-            next_due_date, status, assigned_to)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
-        (schedule_id, naming, args.customer_id, args.item_id,
-         args.serial_number_id, frequency, args.start_date, args.end_date,
-         next_due, args.assigned_to),
-    )
+    ins_sql, _ = insert_row("maintenance_schedule", {
+        "id": P(), "naming_series": P(), "customer_id": P(),
+        "item_id": P(), "serial_number_id": P(),
+        "schedule_frequency": P(), "start_date": P(), "end_date": P(),
+        "next_due_date": P(), "status": P(), "assigned_to": P(),
+    })
+    conn.execute(ins_sql, (
+        schedule_id, naming, args.customer_id, args.item_id,
+        args.serial_number_id, frequency, args.start_date, args.end_date,
+        next_due, "active", args.assigned_to,
+    ))
 
     audit(conn, "erpclaw-support", "add-maintenance-schedule", "maintenance_schedule", schedule_id,
            new_values={"customer_id": args.customer_id,
@@ -971,9 +993,9 @@ def add_maintenance_schedule(conn, args):
            description=f"Created maintenance schedule {naming}")
     conn.commit()
 
-    sched = conn.execute(
-        "SELECT * FROM maintenance_schedule WHERE id = ?", (schedule_id,),
-    ).fetchone()
+    ms = Table("maintenance_schedule")
+    rq = Q.from_(ms).select(ms.star).where(ms.id == P())
+    sched = conn.execute(rq.get_sql(), (schedule_id,)).fetchone()
 
     ok({
         "maintenance_schedule": row_to_dict(sched),
@@ -990,37 +1012,35 @@ def list_maintenance_schedules(conn, args):
 
     Optional: --customer-id, --item-id, --status, --limit, --offset
     """
-    conditions = ["1=1"]
+    ms = Table("maintenance_schedule")
+    ct = Table("customer")
     params = []
 
+    q = (Q.from_(ms)
+         .left_join(ct).on(ct.id == ms.customer_id)
+         .select(ms.star, ct.name.as_("customer_name")))
+    q_cnt = Q.from_(ms).select(fn.Count("*").as_("cnt"))
+
     if args.customer_id:
-        conditions.append("ms.customer_id = ?")
+        q = q.where(ms.customer_id == P())
+        q_cnt = q_cnt.where(ms.customer_id == P())
         params.append(args.customer_id)
     if args.item_id:
-        conditions.append("ms.item_id = ?")
+        q = q.where(ms.item_id == P())
+        q_cnt = q_cnt.where(ms.item_id == P())
         params.append(args.item_id)
     if args.status:
-        conditions.append("ms.status = ?")
+        q = q.where(ms.status == P())
+        q_cnt = q_cnt.where(ms.status == P())
         params.append(args.status)
 
-    where = " AND ".join(conditions)
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
 
-    rows = conn.execute(
-        f"""SELECT ms.*, c.name AS customer_name
-            FROM maintenance_schedule ms
-            LEFT JOIN customer c ON c.id = ms.customer_id
-            WHERE {where}
-            ORDER BY ms.created_at DESC
-            LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
+    q = q.orderby(ms.created_at, order=Order.desc).limit(P()).offset(P())
+    rows = conn.execute(q.get_sql(), params + [limit, offset]).fetchall()
 
-    total = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM maintenance_schedule ms WHERE {where}",
-        params,
-    ).fetchone()["cnt"]
+    total = conn.execute(q_cnt.get_sql(), params).fetchone()["cnt"]
 
     ok({
         "maintenance_schedules": [row_to_dict(r) for r in rows],
@@ -1052,33 +1072,32 @@ def record_maintenance_visit(conn, args):
         err(f"--status must be one of {VALID_VISIT_STATUSES}")
 
     # Validate schedule exists
-    sched = conn.execute(
-        "SELECT * FROM maintenance_schedule WHERE id = ?",
-        (args.schedule_id,),
-    ).fetchone()
+    mst = Table("maintenance_schedule")
+    sq = Q.from_(mst).select(mst.star).where(mst.id == P())
+    sched = conn.execute(sq.get_sql(), (args.schedule_id,)).fetchone()
     if not sched:
         err(f"Maintenance schedule {args.schedule_id} not found")
 
     # Resolve company_id from schedule's customer for naming
-    cust = conn.execute(
-        "SELECT company_id FROM customer WHERE id = ?",
-        (sched["customer_id"],),
-    ).fetchone()
+    ct = Table("customer")
+    cq = Q.from_(ct).select(ct.company_id).where(ct.id == P())
+    cust = conn.execute(cq.get_sql(), (sched["customer_id"],)).fetchone()
     if cust:
         conn.company_id = cust["company_id"]
 
     visit_id = str(uuid.uuid4())
     naming = get_next_name(conn, "maintenance_visit")
 
-    conn.execute(
-        """INSERT INTO maintenance_visit
-           (id, naming_series, maintenance_schedule_id, customer_id,
-            visit_date, completed_by, observations, work_done, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (visit_id, naming, args.schedule_id, sched["customer_id"],
-         args.visit_date, args.completed_by, args.observations,
-         args.work_done, visit_status),
-    )
+    ins_sql, _ = insert_row("maintenance_visit", {
+        "id": P(), "naming_series": P(), "maintenance_schedule_id": P(),
+        "customer_id": P(), "visit_date": P(), "completed_by": P(),
+        "observations": P(), "work_done": P(), "status": P(),
+    })
+    conn.execute(ins_sql, (
+        visit_id, naming, args.schedule_id, sched["customer_id"],
+        args.visit_date, args.completed_by, args.observations,
+        args.work_done, visit_status,
+    ))
 
     schedule_updated = False
 
@@ -1089,21 +1108,22 @@ def record_maintenance_visit(conn, args):
         )
 
         if new_next_due > sched["end_date"]:
-            conn.execute(
-                """UPDATE maintenance_schedule
-                   SET last_completed_date = ?, next_due_date = ?,
-                       status = 'expired', updated_at = datetime('now')
-                   WHERE id = ?""",
-                (args.visit_date, new_next_due, args.schedule_id),
-            )
+            upd_sql = update_row("maintenance_schedule", {
+                "last_completed_date": P(),
+                "next_due_date": P(),
+                "status": P(),
+                "updated_at": LiteralValue("datetime('now')"),
+            }, where={"id": P()})
+            conn.execute(upd_sql, (args.visit_date, new_next_due, "expired",
+                                   args.schedule_id))
         else:
-            conn.execute(
-                """UPDATE maintenance_schedule
-                   SET last_completed_date = ?, next_due_date = ?,
-                       updated_at = datetime('now')
-                   WHERE id = ?""",
-                (args.visit_date, new_next_due, args.schedule_id),
-            )
+            upd_sql = update_row("maintenance_schedule", {
+                "last_completed_date": P(),
+                "next_due_date": P(),
+                "updated_at": LiteralValue("datetime('now')"),
+            }, where={"id": P()})
+            conn.execute(upd_sql, (args.visit_date, new_next_due,
+                                   args.schedule_id))
         schedule_updated = True
 
     audit(conn, "erpclaw-support", "record-maintenance-visit", "maintenance_visit", visit_id,
@@ -1113,9 +1133,9 @@ def record_maintenance_visit(conn, args):
            description=f"Recorded maintenance visit {naming}")
     conn.commit()
 
-    visit = conn.execute(
-        "SELECT * FROM maintenance_visit WHERE id = ?", (visit_id,),
-    ).fetchone()
+    mvt = Table("maintenance_visit")
+    vq = Q.from_(mvt).select(mvt.star).where(mvt.id == P())
+    visit = conn.execute(vq.get_sql(), (visit_id,)).fetchone()
 
     resp = {
         "visit": row_to_dict(visit),
@@ -1124,10 +1144,9 @@ def record_maintenance_visit(conn, args):
     }
 
     if schedule_updated:
-        updated_sched = conn.execute(
-            "SELECT * FROM maintenance_schedule WHERE id = ?",
-            (args.schedule_id,),
-        ).fetchone()
+        mst2 = Table("maintenance_schedule")
+        sq2 = Q.from_(mst2).select(mst2.star).where(mst2.id == P())
+        updated_sched = conn.execute(sq2.get_sql(), (args.schedule_id,)).fetchone()
         resp["schedule"] = row_to_dict(updated_sched)
 
     ok(resp)
@@ -1142,36 +1161,39 @@ def sla_compliance_report(conn, args):
 
     Optional: --company-id, --from-date, --to-date
     """
-    conditions = ["i.sla_id IS NOT NULL"]
+    i = Table("issue")
     params = []
 
+    breached_case = Case().when(i.sla_breached == 1, 1).else_(0)
+    compliant_case = (Case()
+                      .when((i.sla_breached == 0) & i.status.isin(["resolved", "closed"]), 1)
+                      .else_(0))
+    in_progress_case = (Case()
+                        .when(Not(i.status.isin(["resolved", "closed"])), 1)
+                        .else_(0))
+
+    q = (Q.from_(i)
+         .select(
+             fn.Count("*").as_("total_with_sla"),
+             fn.Sum(breached_case).as_("breached"),
+             fn.Sum(compliant_case).as_("compliant"),
+             fn.Sum(in_progress_case).as_("in_progress"),
+         )
+         .where(i.sla_id.isnotnull()))
+
     if args.company_id:
-        conditions.append(
-            "i.customer_id IN (SELECT id FROM customer WHERE company_id = ?)"
-        )
+        ct = Table("customer")
+        sub = Q.from_(ct).select(ct.id).where(ct.company_id == P())
+        q = q.where(i.customer_id.isin(sub))
         params.append(args.company_id)
     if args.from_date:
-        conditions.append("i.created_at >= ?")
+        q = q.where(i.created_at >= P())
         params.append(args.from_date)
     if args.to_date:
-        conditions.append("i.created_at <= ?")
+        q = q.where(i.created_at <= P())
         params.append(args.to_date + " 23:59:59")
 
-    where = " AND ".join(conditions)
-
-    row = conn.execute(
-        f"""SELECT
-                COUNT(*) AS total_with_sla,
-                SUM(CASE WHEN i.sla_breached = 1 THEN 1 ELSE 0 END) AS breached,
-                SUM(CASE WHEN i.sla_breached = 0
-                         AND i.status IN ('resolved', 'closed')
-                    THEN 1 ELSE 0 END) AS compliant,
-                SUM(CASE WHEN i.status NOT IN ('resolved', 'closed')
-                    THEN 1 ELSE 0 END) AS in_progress
-            FROM issue i
-            WHERE {where}""",
-        params,
-    ).fetchone()
+    row = conn.execute(q.get_sql(), params).fetchone()
 
     total_with_sla = row["total_with_sla"] or 0
     breached = row["breached"] or 0
@@ -1216,29 +1238,29 @@ def overdue_issues_report(conn, args):
     """
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-    conditions = [
-        "i.status NOT IN ('resolved', 'closed')",
-        "((i.response_due IS NOT NULL AND i.response_due < ? AND i.first_response_at IS NULL)"
-        " OR (i.resolution_due IS NOT NULL AND i.resolution_due < ?))",
-    ]
+    it = Table("issue")
+    ct = Table("customer")
     params = [now, now]
 
+    response_overdue = (it.response_due.isnotnull()
+                        & (it.response_due < P())
+                        & it.first_response_at.isnull())
+    resolution_overdue = it.resolution_due.isnotnull() & (it.resolution_due < P())
+
+    q = (Q.from_(it)
+         .left_join(ct).on(ct.id == it.customer_id)
+         .select(it.star, ct.name.as_("customer_name"))
+         .where(Not(it.status.isin(["resolved", "closed"])))
+         .where(response_overdue | resolution_overdue)
+         .orderby(it.created_at))
+
     if args.company_id:
-        conditions.append(
-            "i.customer_id IN (SELECT id FROM customer WHERE company_id = ?)"
-        )
+        cust_t = Table("customer")
+        sub = Q.from_(cust_t).select(cust_t.id).where(cust_t.company_id == P())
+        q = q.where(it.customer_id.isin(sub))
         params.append(args.company_id)
 
-    where = " AND ".join(conditions)
-
-    rows = conn.execute(
-        f"""SELECT i.*, c.name AS customer_name
-            FROM issue i
-            LEFT JOIN customer c ON c.id = i.customer_id
-            WHERE {where}
-            ORDER BY i.created_at ASC""",
-        params,
-    ).fetchall()
+    rows = conn.execute(q.get_sql(), params).fetchall()
 
     overdue_list = []
     for r in rows:
@@ -1274,116 +1296,87 @@ def status_action(conn, args):
 
     Optional: --company-id
     """
-    company_filter = ""
+    # Build optional company subquery filter
+    company_sub = None
     company_params = []
-
     if args.company_id:
-        company_filter = (
-            "AND customer_id IN (SELECT id FROM customer WHERE company_id = ?)"
-        )
+        cust_t = Table("customer")
+        company_sub = Q.from_(cust_t).select(cust_t.id).where(cust_t.company_id == P())
         company_params = [args.company_id]
 
+    def _count(table_name, extra_where=None):
+        """Count rows with optional company filter and extra condition."""
+        t = Table(table_name)
+        q = Q.from_(t).select(fn.Count("*").as_("cnt"))
+        if extra_where is not None:
+            q = q.where(extra_where(t))
+        p = list(company_params)
+        if company_sub is not None:
+            q = q.where(t.customer_id.isin(company_sub))
+        return conn.execute(q.get_sql(), p).fetchone()["cnt"]
+
     # Issues
-    issue_total = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM issue WHERE 1=1 {company_filter}",
-        company_params,
-    ).fetchone()["cnt"]
-    issue_open = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM issue WHERE status = 'open' {company_filter}",
-        company_params,
-    ).fetchone()["cnt"]
-    issue_in_progress = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM issue WHERE status = 'in_progress' {company_filter}",
-        company_params,
-    ).fetchone()["cnt"]
-    issue_resolved = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM issue WHERE status = 'resolved' {company_filter}",
-        company_params,
-    ).fetchone()["cnt"]
-    issue_closed = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM issue WHERE status = 'closed' {company_filter}",
-        company_params,
-    ).fetchone()["cnt"]
-    issue_breached = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM issue WHERE sla_breached = 1 {company_filter}",
-        company_params,
-    ).fetchone()["cnt"]
+    issue_total = _count("issue")
+    issue_open = _count("issue", lambda t: t.status == "open")
+    issue_in_progress = _count("issue", lambda t: t.status == "in_progress")
+    issue_resolved = _count("issue", lambda t: t.status == "resolved")
+    issue_closed = _count("issue", lambda t: t.status == "closed")
+    issue_breached = _count("issue", lambda t: t.sla_breached == 1)
 
     # Warranty claims
-    wc_total = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM warranty_claim WHERE 1=1 {company_filter}",
-        company_params,
-    ).fetchone()["cnt"]
-    wc_open = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM warranty_claim WHERE status = 'open' {company_filter}",
-        company_params,
-    ).fetchone()["cnt"]
-    wc_in_progress = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM warranty_claim WHERE status = 'in_progress' {company_filter}",
-        company_params,
-    ).fetchone()["cnt"]
-    wc_resolved = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM warranty_claim WHERE status = 'resolved' {company_filter}",
-        company_params,
-    ).fetchone()["cnt"]
+    wc_total = _count("warranty_claim")
+    wc_open = _count("warranty_claim", lambda t: t.status == "open")
+    wc_in_progress = _count("warranty_claim", lambda t: t.status == "in_progress")
+    wc_resolved = _count("warranty_claim", lambda t: t.status == "resolved")
 
     # Maintenance schedules
-    ms_total = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM maintenance_schedule WHERE 1=1 {company_filter}",
-        company_params,
-    ).fetchone()["cnt"]
-    ms_active = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM maintenance_schedule WHERE status = 'active' {company_filter}",
-        company_params,
-    ).fetchone()["cnt"]
-    ms_expired = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM maintenance_schedule WHERE status = 'expired' {company_filter}",
-        company_params,
-    ).fetchone()["cnt"]
+    ms_total = _count("maintenance_schedule")
+    ms_active = _count("maintenance_schedule", lambda t: t.status == "active")
+    ms_expired = _count("maintenance_schedule", lambda t: t.status == "expired")
 
     # Maintenance visits (filter via schedule → customer)
-    mv_filter = ""
+    mvt = Table("maintenance_visit")
     mv_params = []
-    if args.company_id:
-        mv_filter = (
-            "AND maintenance_schedule_id IN "
-            "(SELECT id FROM maintenance_schedule "
-            "WHERE customer_id IN (SELECT id FROM customer WHERE company_id = ?))"
-        )
-        mv_params = [args.company_id]
 
-    mv_total = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM maintenance_visit WHERE 1=1 {mv_filter}",
-        mv_params,
-    ).fetchone()["cnt"]
-    mv_scheduled = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM maintenance_visit WHERE status = 'scheduled' {mv_filter}",
-        mv_params,
-    ).fetchone()["cnt"]
-    mv_completed = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM maintenance_visit WHERE status = 'completed' {mv_filter}",
-        mv_params,
-    ).fetchone()["cnt"]
+    def _mv_count(extra_where=None):
+        q = Q.from_(mvt).select(fn.Count("*").as_("cnt"))
+        if extra_where is not None:
+            q = q.where(extra_where(mvt))
+        p = list(mv_params)
+        if args.company_id:
+            mst = Table("maintenance_schedule")
+            cust_t2 = Table("customer")
+            inner_sub = Q.from_(cust_t2).select(cust_t2.id).where(cust_t2.company_id == P())
+            sched_sub = Q.from_(mst).select(mst.id).where(mst.customer_id.isin(inner_sub))
+            q = q.where(mvt.maintenance_schedule_id.isin(sched_sub))
+            p.append(args.company_id)
+        return conn.execute(q.get_sql(), p).fetchone()["cnt"]
+
+    mv_total = _mv_count()
+    mv_scheduled = _mv_count(lambda t: t.status == "scheduled")
+    mv_completed = _mv_count(lambda t: t.status == "completed")
 
     # Overdue issues count
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    overdue_conds = [
-        "status NOT IN ('resolved', 'closed')",
-        f"((response_due IS NOT NULL AND response_due < '{now}' AND first_response_at IS NULL)"
-        f" OR (resolution_due IS NOT NULL AND resolution_due < '{now}'))",
-    ]
-    overdue_params = []
+    it = Table("issue")
+    overdue_params = [now, now]
+
+    response_overdue = (it.response_due.isnotnull()
+                        & (it.response_due < P())
+                        & it.first_response_at.isnull())
+    resolution_overdue = it.resolution_due.isnotnull() & (it.resolution_due < P())
+
+    oq = (Q.from_(it).select(fn.Count("*").as_("cnt"))
+           .where(Not(it.status.isin(["resolved", "closed"])))
+           .where(response_overdue | resolution_overdue))
+
     if args.company_id:
-        overdue_conds.append(
-            "customer_id IN (SELECT id FROM customer WHERE company_id = ?)"
-        )
+        cust_t3 = Table("customer")
+        co_sub = Q.from_(cust_t3).select(cust_t3.id).where(cust_t3.company_id == P())
+        oq = oq.where(it.customer_id.isin(co_sub))
         overdue_params.append(args.company_id)
 
-    overdue_where = " AND ".join(overdue_conds)
-    overdue_count = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM issue WHERE {overdue_where}",
-        overdue_params,
-    ).fetchone()["cnt"]
+    overdue_count = conn.execute(oq.get_sql(), overdue_params).fetchone()["cnt"]
 
     ok({
         "support_status": {

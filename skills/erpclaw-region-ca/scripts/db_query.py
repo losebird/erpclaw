@@ -30,6 +30,8 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
+    from erpclaw_lib.query import Q, P, Table, Field, fn, Case, Order, Criterion, Not, NULL, DecimalSum, DecimalAbs
+    from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
@@ -54,12 +56,15 @@ def _load_json_asset(filename):
 
 
 def _get_company(conn, company_id):
+    _co = Table("company")
     if not company_id:
-        row = conn.execute("SELECT * FROM company LIMIT 1").fetchone()
+        q = Q.from_(_co).select(_co.star).limit(1)
+        row = conn.execute(q.get_sql()).fetchone()
         if not row:
             err("No company found. Create one with erpclaw-setup first.")
         return row_to_dict(row)
-    row = conn.execute("SELECT * FROM company WHERE id = ?", (company_id,)).fetchone()
+    q = Q.from_(_co).select(_co.star).where(_co.id == P())
+    row = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not row:
         err(f"Company not found: {company_id}")
     return row_to_dict(row)
@@ -80,10 +85,11 @@ def _get_company_province(conn, company):
     if province:
         return province.upper()
     try:
-        row = conn.execute(
-            "SELECT value FROM regional_settings WHERE company_id = ? AND key = 'province'",
-            (company["id"],),
-        ).fetchone()
+        _rs = Table("regional_settings")
+        q = Q.from_(_rs).select(_rs.value).where(
+            (_rs.company_id == P()) & (_rs.key == P())
+        )
+        row = conn.execute(q.get_sql(), (company["id"], "province")).fetchone()
         if row:
             return row["value"].upper()
     except Exception:
@@ -917,14 +923,14 @@ def compute_itc(conn, args):
     start_date = f"{year}-{month:02d}-01"
     end_date = f"{year}-{month + 1:02d}-01" if month < 12 else f"{year + 1}-01-01"
 
-    result = conn.execute(
-        """SELECT COALESCE(SUM(CAST(tax_amount AS REAL)), 0) as tax_amount,
-                  COUNT(*) as invoice_count
-           FROM purchase_invoice
-           WHERE company_id = ? AND status = 'submitted'
-             AND posting_date >= ? AND posting_date < ?""",
-        (company["id"], start_date, end_date),
-    ).fetchone()
+    _pi = Table("purchase_invoice")
+    q = (Q.from_(_pi)
+         .select(
+             fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("tax_amount"),
+             fn.Count("*").as_("invoice_count"))
+         .where((_pi.company_id == P()) & (_pi.status == P())
+                & (_pi.posting_date >= P()) & (_pi.posting_date < P())))
+    result = conn.execute(q.get_sql(), (company["id"], "submitted", start_date, end_date)).fetchone()
 
     total_purchase_tax = round_currency(to_decimal(str(result["tax_amount"])))
     eligible_itc = total_purchase_tax  # Full amount eligible (simplified)
@@ -970,18 +976,15 @@ def seed_ca_defaults(conn, args):
         tax_accounts.append(("QST Collected", "liability"))
         tax_accounts.append(("QST Paid on Purchases", "asset"))
 
+    _acct = Table("account")
+    _acct_sel = Q.from_(_acct).select(_acct.id).where((_acct.name == P()) & (_acct.company_id == P()))
+    _acct_ins = (Q.into(_acct)
+                 .columns("id", "name", "account_type", "root_type", "company_id", "is_group")
+                 .insert(P(), P(), P(), P(), P(), P()))
     for name, root_type in tax_accounts:
-        existing = conn.execute(
-            "SELECT id FROM account WHERE name = ? AND company_id = ?",
-            (name, company_id),
-        ).fetchone()
+        existing = conn.execute(_acct_sel.get_sql(), (name, company_id)).fetchone()
         if not existing:
-            conn.execute(
-                """INSERT INTO account (id, name, account_type, root_type, company_id,
-                   is_group)
-                   VALUES (?, ?, 'tax', ?, ?, 0)""",
-                (str(uuid.uuid4()), name, root_type, company_id),
-            )
+            conn.execute(_acct_ins.get_sql(), (str(uuid.uuid4()), name, "tax", root_type, company_id, 0))
             created["accounts"] += 1
 
     # 2. Create tax categories
@@ -990,15 +993,13 @@ def seed_ca_defaults(conn, args):
         "PST-BC 7%", "PST-SK 6%", "RST-MB 7%", "QST-QC 9.975%",
         "Zero-rated", "Exempt",
     ]
+    _tc = Table("tax_category")
+    _tc_sel = Q.from_(_tc).select(_tc.id).where(_tc.name == P())
+    _tc_ins = Q.into(_tc).columns("id", "name", "description").insert(P(), P(), P())
     for cat_name in categories:
-        existing = conn.execute(
-            "SELECT id FROM tax_category WHERE name = ?", (cat_name,)
-        ).fetchone()
+        existing = conn.execute(_tc_sel.get_sql(), (cat_name,)).fetchone()
         if not existing:
-            conn.execute(
-                "INSERT INTO tax_category (id, name, description) VALUES (?, ?, ?)",
-                (str(uuid.uuid4()), cat_name, f"Canada tax category: {cat_name}"),
-            )
+            conn.execute(_tc_ins.get_sql(), (str(uuid.uuid4()), cat_name, f"Canada tax category: {cat_name}"))
             created["categories"] += 1
 
     # 3. Create tax templates
@@ -1015,30 +1016,28 @@ def seed_ca_defaults(conn, args):
         ("Canada QST-QC 9.975% Sales", "sales", "9.975"),
         ("Canada QST-QC 9.975% Purchase", "purchase", "9.975"),
     ]
+    _tt = Table("tax_template")
+    _tt_sel = Q.from_(_tt).select(_tt.id).where((_tt.name == P()) & (_tt.company_id == P()))
+    _tt_ins = (Q.into(_tt).columns("id", "name", "tax_type", "is_default", "company_id")
+               .insert(P(), P(), P(), P(), P()))
+    _ttl = Table("tax_template_line")
+    _ttl_ins = (Q.into(_ttl)
+                .columns("id", "tax_template_id", "tax_account_id", "rate", "charge_type", "row_order", "add_deduct")
+                .insert(P(), P(), P(), P(), P(), P(), P()))
     for tpl_name, tax_type, rate in templates:
-        existing = conn.execute(
-            "SELECT id FROM tax_template WHERE name = ? AND company_id = ?",
-            (tpl_name, company_id),
-        ).fetchone()
+        existing = conn.execute(_tt_sel.get_sql(), (tpl_name, company_id)).fetchone()
         if not existing:
             tid = str(uuid.uuid4())
-            conn.execute(
-                """INSERT INTO tax_template (id, name, tax_type, is_default, company_id)
-                   VALUES (?, ?, ?, 0, ?)""",
-                (tid, tpl_name, tax_type, company_id),
-            )
+            conn.execute(_tt_ins.get_sql(), (tid, tpl_name, tax_type, 0, company_id))
             # Add template line with rate
+            # raw SQL — LIKE pattern in WHERE clause
             gst_acct = conn.execute(
                 "SELECT id FROM account WHERE name LIKE 'GST%' AND company_id = ? LIMIT 1",
                 (company_id,),
             ).fetchone()
             if gst_acct:
-                conn.execute(
-                    """INSERT INTO tax_template_line
-                       (id, tax_template_id, tax_account_id, rate, charge_type, row_order, add_deduct)
-                       VALUES (?, ?, ?, ?, 'on_net_total', 0, 'add')""",
-                    (str(uuid.uuid4()), tid, gst_acct["id"], rate),
-                )
+                conn.execute(_ttl_ins.get_sql(),
+                             (str(uuid.uuid4()), tid, gst_acct["id"], rate, "on_net_total", 0, "add"))
             created["templates"] += 1
 
     audit(conn, "erpclaw-region-ca", "seed-ca-defaults", "company", company_id,
@@ -1097,21 +1096,19 @@ def setup_gst_hst(conn, args):
         "tax_type": rates[province]["tax_type"],
         "gst_hst_configured": "1",
     }
+    _rs = Table("regional_settings")
+    _rs_sel = Q.from_(_rs).select(_rs.id).where((_rs.company_id == P()) & (_rs.key == P()))
+    _rs_upd = (Q.update(_rs).set(_rs.value, P())
+               .set(_rs.updated_at, LiteralValue("datetime('now')"))
+               .where(_rs.id == P()))
+    _rs_ins = (Q.into(_rs).columns("id", "company_id", "key", "value")
+               .insert(P(), P(), P(), P()))
     for key, val in settings.items():
-        existing = conn.execute(
-            "SELECT id FROM regional_settings WHERE company_id = ? AND key = ?",
-            (company_id, key),
-        ).fetchone()
+        existing = conn.execute(_rs_sel.get_sql(), (company_id, key)).fetchone()
         if existing:
-            conn.execute(
-                "UPDATE regional_settings SET value = ?, updated_at = datetime('now') WHERE id = ?",
-                (val, existing["id"]),
-            )
+            conn.execute(_rs_upd.get_sql(), (val, existing["id"]))
         else:
-            conn.execute(
-                "INSERT INTO regional_settings (id, company_id, key, value) VALUES (?, ?, ?, ?)",
-                (str(uuid.uuid4()), company_id, key, val),
-            )
+            conn.execute(_rs_ins.get_sql(), (str(uuid.uuid4()), company_id, key, val))
 
     audit(conn, "erpclaw-region-ca", "setup-gst-hst", "company", company_id,
            new_values=settings, description="Configured GST/HST for company")
@@ -1183,23 +1180,23 @@ def seed_ca_coa(conn, args):
     accounts = coa if isinstance(coa, list) else coa.get("accounts", [])
     created_count = 0
 
+    _acct2 = Table("account")
+    _acct2_sel = Q.from_(_acct2).select(_acct2.id).where((_acct2.name == P()) & (_acct2.company_id == P()))
+    _acct2_ins = (Q.into(_acct2)
+                  .columns("id", "name", "account_type", "root_type", "company_id",
+                           "parent_id", "is_group", "account_number")
+                  .insert(P(), P(), P(), P(), P(), P(), P(), P()))
     for acct in accounts:
         name = acct.get("account_name", acct.get("name", ""))
         if not name:
             continue
-        existing = conn.execute(
-            "SELECT id FROM account WHERE name = ? AND company_id = ?",
-            (name, company_id),
-        ).fetchone()
+        existing = conn.execute(_acct2_sel.get_sql(), (name, company_id)).fetchone()
         if not existing:
             aid = str(uuid.uuid4())
             parent_id = None
             parent_name = acct.get("parent_account", acct.get("parent", ""))
             if parent_name:
-                parent = conn.execute(
-                    "SELECT id FROM account WHERE name = ? AND company_id = ?",
-                    (parent_name, company_id),
-                ).fetchone()
+                parent = conn.execute(_acct2_sel.get_sql(), (parent_name, company_id)).fetchone()
                 if parent:
                     parent_id = parent["id"]
 
@@ -1218,14 +1215,10 @@ def seed_ca_coa(conn, args):
             }
             if acct_type and acct_type not in _valid_acct_types:
                 acct_type = None
-            conn.execute(
-                """INSERT INTO account (id, name, account_type, root_type, company_id,
-                   parent_id, is_group, account_number)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (aid, name, acct_type, root_type, company_id,
-                 parent_id, 1 if acct.get("is_group") else 0,
-                 acct.get("account_number", "")),
-            )
+            conn.execute(_acct2_ins.get_sql(),
+                         (aid, name, acct_type, root_type, company_id,
+                          parent_id, 1 if acct.get("is_group") else 0,
+                          acct.get("account_number", "")))
             created_count += 1
 
     audit(conn, "erpclaw-region-ca", "seed-ca-coa", "company", company_id,
@@ -1266,15 +1259,15 @@ def seed_ca_payroll(conn, args):
             ("QPIP Employer", "employer_contribution", "Quebec Parental Insurance Plan — employer premium", 1),
         ])
 
+    _sc = Table("salary_component")
+    _sc_sel = Q.from_(_sc).select(_sc.id).where(_sc.name == P())
+    _sc_ins = (Q.into(_sc)
+               .columns("id", "name", "component_type", "description", "is_statutory")
+               .insert(P(), P(), P(), P(), P()))
     for name, comp_type, desc, is_statutory in components:
-        existing = conn.execute(
-            "SELECT id FROM salary_component WHERE name = ?", (name,)
-        ).fetchone()
+        existing = conn.execute(_sc_sel.get_sql(), (name,)).fetchone()
         if not existing:
-            conn.execute(
-                "INSERT INTO salary_component (id, name, component_type, description, is_statutory) VALUES (?, ?, ?, ?, ?)",
-                (str(uuid.uuid4()), name, comp_type, desc, is_statutory),
-            )
+            conn.execute(_sc_ins.get_sql(), (str(uuid.uuid4()), name, comp_type, desc, is_statutory))
             created_count += 1
 
     audit(conn, "erpclaw-region-ca", "seed-ca-payroll", "company", company_id,
@@ -1692,10 +1685,9 @@ def ca_payroll_summary(conn, args):
     company_province = _get_company_province(conn, company)
     periods = int(args.pay_periods or 12)
 
-    employees = conn.execute(
-        "SELECT * FROM employee WHERE company_id = ? AND status = 'active'",
-        (company_id,),
-    ).fetchall()
+    _emp = Table("employee")
+    _emp_q = Q.from_(_emp).select(_emp.star).where((_emp.company_id == P()) & (_emp.status == P()))
+    employees = conn.execute(_emp_q.get_sql(), (company_id, "active")).fetchall()
 
     emp_list = []
     totals = {
@@ -1717,10 +1709,10 @@ def ca_payroll_summary(conn, args):
 
         # Look up latest salary slip for the period
         period_str = f"{args.year}-{int(args.month):02d}"
-        slip = conn.execute(
-            "SELECT * FROM salary_slip WHERE employee_id = ? AND period_start = ? AND status = 'submitted'",
-            (emp["id"], period_str),
-        ).fetchone()
+        _ss = Table("salary_slip")
+        _ss_q = (Q.from_(_ss).select(_ss.star)
+                 .where((_ss.employee_id == P()) & (_ss.period_start == P()) & (_ss.status == P())))
+        slip = conn.execute(_ss_q.get_sql(), (emp["id"], period_str, "submitted")).fetchone()
 
         if slip:
             slip_dict = row_to_dict(slip)
@@ -1863,25 +1855,25 @@ def generate_gst_hst_return(conn, args):
     end_date = f"{year}-{month + 1:02d}-01" if month < 12 else f"{year + 1}-01-01"
 
     # Sales (GST/HST collected)
-    sales = conn.execute(
-        """SELECT COALESCE(SUM(CAST(total_amount AS REAL)), 0) as revenue,
-                  COALESCE(SUM(CAST(tax_amount AS REAL)), 0) as tax_collected,
-                  COUNT(*) as invoice_count
-           FROM sales_invoice
-           WHERE company_id = ? AND status = 'submitted'
-             AND posting_date >= ? AND posting_date < ?""",
-        (company_id, start_date, end_date),
-    ).fetchone()
+    _si = Table("sales_invoice")
+    _si_q = (Q.from_(_si)
+             .select(
+                 fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS REAL)")), 0).as_("revenue"),
+                 fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("tax_collected"),
+                 fn.Count("*").as_("invoice_count"))
+             .where((_si.company_id == P()) & (_si.status == P())
+                    & (_si.posting_date >= P()) & (_si.posting_date < P())))
+    sales = conn.execute(_si_q.get_sql(), (company_id, "submitted", start_date, end_date)).fetchone()
 
     # Purchases (ITC)
-    purchases = conn.execute(
-        """SELECT COALESCE(SUM(CAST(tax_amount AS REAL)), 0) as tax_paid,
-                  COUNT(*) as invoice_count
-           FROM purchase_invoice
-           WHERE company_id = ? AND status = 'submitted'
-             AND posting_date >= ? AND posting_date < ?""",
-        (company_id, start_date, end_date),
-    ).fetchone()
+    _pi2 = Table("purchase_invoice")
+    _pi2_q = (Q.from_(_pi2)
+              .select(
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("tax_paid"),
+                  fn.Count("*").as_("invoice_count"))
+              .where((_pi2.company_id == P()) & (_pi2.status == P())
+                     & (_pi2.posting_date >= P()) & (_pi2.posting_date < P())))
+    purchases = conn.execute(_pi2_q.get_sql(), (company_id, "submitted", start_date, end_date)).fetchone()
 
     revenue = round_currency(to_decimal(str(sales["revenue"])))
     tax_collected = round_currency(to_decimal(str(sales["tax_collected"])))
@@ -1890,10 +1882,9 @@ def generate_gst_hst_return(conn, args):
 
     # Get BN from regional_settings
     try:
-        bn_row = conn.execute(
-            "SELECT value FROM regional_settings WHERE company_id = ? AND key = 'bn'",
-            (company_id,),
-        ).fetchone()
+        _rs2 = Table("regional_settings")
+        _rs2_q = Q.from_(_rs2).select(_rs2.value).where((_rs2.company_id == P()) & (_rs2.key == P()))
+        bn_row = conn.execute(_rs2_q.get_sql(), (company_id, "bn")).fetchone()
     except Exception:
         bn_row = None
 
@@ -1934,25 +1925,25 @@ def generate_qst_return(conn, args):
     end_date = f"{year}-{month + 1:02d}-01" if month < 12 else f"{year + 1}-01-01"
 
     # Sales QST collected
-    sales = conn.execute(
-        """SELECT COALESCE(SUM(CAST(total_amount AS REAL)), 0) as revenue,
-                  COALESCE(SUM(CAST(tax_amount AS REAL)), 0) as tax_collected,
-                  COUNT(*) as invoice_count
-           FROM sales_invoice
-           WHERE company_id = ? AND status = 'submitted'
-             AND posting_date >= ? AND posting_date < ?""",
-        (company_id, start_date, end_date),
-    ).fetchone()
+    _si3 = Table("sales_invoice")
+    _si3_q = (Q.from_(_si3)
+              .select(
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS REAL)")), 0).as_("revenue"),
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("tax_collected"),
+                  fn.Count("*").as_("invoice_count"))
+              .where((_si3.company_id == P()) & (_si3.status == P())
+                     & (_si3.posting_date >= P()) & (_si3.posting_date < P())))
+    sales = conn.execute(_si3_q.get_sql(), (company_id, "submitted", start_date, end_date)).fetchone()
 
     # Purchase QST ITR
-    purchases = conn.execute(
-        """SELECT COALESCE(SUM(CAST(tax_amount AS REAL)), 0) as tax_paid,
-                  COUNT(*) as invoice_count
-           FROM purchase_invoice
-           WHERE company_id = ? AND status = 'submitted'
-             AND posting_date >= ? AND posting_date < ?""",
-        (company_id, start_date, end_date),
-    ).fetchone()
+    _pi3 = Table("purchase_invoice")
+    _pi3_q = (Q.from_(_pi3)
+              .select(
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("tax_paid"),
+                  fn.Count("*").as_("invoice_count"))
+              .where((_pi3.company_id == P()) & (_pi3.status == P())
+                     & (_pi3.posting_date >= P()) & (_pi3.posting_date < P())))
+    purchases = conn.execute(_pi3_q.get_sql(), (company_id, "submitted", start_date, end_date)).fetchone()
 
     revenue = round_currency(to_decimal(str(sales["revenue"])))
     # Estimate QST portion (QST is 9.975 / 14.975 of total tax for QC)
@@ -1988,7 +1979,9 @@ def generate_t4(conn, args):
     if not year_val:
         err("--tax-year (or --year) is required")
 
-    emp = conn.execute("SELECT * FROM employee WHERE id = ?", (args.employee_id,)).fetchone()
+    _emp2 = Table("employee")
+    _emp2_q = Q.from_(_emp2).select(_emp2.star).where(_emp2.id == P())
+    emp = conn.execute(_emp2_q.get_sql(), (args.employee_id,)).fetchone()
     if not emp:
         err(f"Employee not found: {args.employee_id}")
     emp_dict = row_to_dict(emp)
@@ -1998,6 +1991,7 @@ def generate_t4(conn, args):
     is_quebec = emp_province == "QC"
 
     # Sum salary slips for the year
+    # raw SQL — LIKE pattern with dynamic year prefix
     slips = conn.execute(
         """SELECT COALESCE(SUM(CAST(gross_pay AS REAL)), 0) as total_gross,
                   COALESCE(SUM(CAST(total_deductions AS REAL)), 0) as total_deductions,
@@ -2103,7 +2097,9 @@ def generate_roe(conn, args):
     if not args.employee_id:
         err("--employee-id is required")
 
-    emp = conn.execute("SELECT * FROM employee WHERE id = ?", (args.employee_id,)).fetchone()
+    _emp3 = Table("employee")
+    _emp3_q = Q.from_(_emp3).select(_emp3.star).where(_emp3.id == P())
+    emp = conn.execute(_emp3_q.get_sql(), (args.employee_id,)).fetchone()
     if not emp:
         err(f"Employee not found: {args.employee_id}")
     emp_dict = row_to_dict(emp)
@@ -2128,14 +2124,13 @@ def generate_roe(conn, args):
     reason_desc = reason_map.get(reason_code.upper(), "Unknown")
 
     # Get insurable earnings from salary slips (last 26 weeks)
-    slips = conn.execute(
-        """SELECT gross_pay, period_start
-           FROM salary_slip
-           WHERE employee_id = ? AND status = 'submitted'
-           ORDER BY period_start DESC
-           LIMIT 26""",
-        (args.employee_id,),
-    ).fetchall()
+    _ss2 = Table("salary_slip")
+    _ss2_q = (Q.from_(_ss2)
+              .select(_ss2.gross_pay, _ss2.period_start)
+              .where((_ss2.employee_id == P()) & (_ss2.status == P()))
+              .orderby(_ss2.period_start, order=Order.desc)
+              .limit(26))
+    slips = conn.execute(_ss2_q.get_sql(), (args.employee_id, "submitted")).fetchall()
 
     insurable_earnings = []
     total_insurable = Decimal("0")
@@ -2179,14 +2174,14 @@ def generate_pd7a(conn, args):
     company_province = _get_company_province(conn, company)
 
     # Get all employees with salary slips for this period
-    slips = conn.execute(
-        """SELECT ss.employee_id, ss.gross_pay, e.province
-           FROM salary_slip ss
-           LEFT JOIN employee e ON e.id = ss.employee_id
-           WHERE ss.company_id = ? AND ss.status = 'submitted'
-             AND ss.period_start = ?""",
-        (company_id, period_str),
-    ).fetchall()
+    _ss3 = Table("salary_slip").as_("ss")
+    _e3 = Table("employee").as_("e")
+    _pd7a_q = (Q.from_(_ss3)
+               .left_join(_e3).on(_e3.id == _ss3.employee_id)
+               .select(_ss3.employee_id, _ss3.gross_pay, _e3.province)
+               .where((_ss3.company_id == P()) & (_ss3.status == P())
+                      & (_ss3.period_start == P())))
+    slips = conn.execute(_pd7a_q.get_sql(), (company_id, "submitted", period_str)).fetchall()
 
     total_cpp_employee = Decimal("0")
     total_cpp_employer = Decimal("0")
@@ -2285,40 +2280,40 @@ def ca_tax_summary(conn, args):
     company_id = company["id"]
 
     # GST/HST collected (sales)
-    sales_tax = conn.execute(
-        """SELECT COALESCE(SUM(CAST(tax_amount AS REAL)), 0) as total,
-                  COALESCE(SUM(CAST(total_amount AS REAL)), 0) as revenue,
-                  COUNT(*) as count
-           FROM sales_invoice
-           WHERE company_id = ? AND status = 'submitted'
-             AND posting_date >= ? AND posting_date <= ?""",
-        (company_id, args.from_date, args.to_date),
-    ).fetchone()
+    _si4 = Table("sales_invoice")
+    _si4_q = (Q.from_(_si4)
+              .select(
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("total"),
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS REAL)")), 0).as_("revenue"),
+                  fn.Count("*").as_("count"))
+              .where((_si4.company_id == P()) & (_si4.status == P())
+                     & (_si4.posting_date >= P()) & (_si4.posting_date <= P())))
+    sales_tax = conn.execute(_si4_q.get_sql(), (company_id, "submitted", args.from_date, args.to_date)).fetchone()
 
     # ITC (purchases)
-    purchase_tax = conn.execute(
-        """SELECT COALESCE(SUM(CAST(tax_amount AS REAL)), 0) as total,
-                  COUNT(*) as count
-           FROM purchase_invoice
-           WHERE company_id = ? AND status = 'submitted'
-             AND posting_date >= ? AND posting_date <= ?""",
-        (company_id, args.from_date, args.to_date),
-    ).fetchone()
+    _pi4 = Table("purchase_invoice")
+    _pi4_q = (Q.from_(_pi4)
+              .select(
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("total"),
+                  fn.Count("*").as_("count"))
+              .where((_pi4.company_id == P()) & (_pi4.status == P())
+                     & (_pi4.posting_date >= P()) & (_pi4.posting_date <= P())))
+    purchase_tax = conn.execute(_pi4_q.get_sql(), (company_id, "submitted", args.from_date, args.to_date)).fetchone()
 
     gst_collected = round_currency(to_decimal(str(sales_tax["total"])))
     gst_paid = round_currency(to_decimal(str(purchase_tax["total"])))
     net_gst = gst_collected - gst_paid
 
     # Payroll totals (salary slips in the period)
-    payroll = conn.execute(
-        """SELECT COALESCE(SUM(CAST(gross_pay AS REAL)), 0) as total_gross,
-                  COALESCE(SUM(CAST(total_deductions AS REAL)), 0) as total_deductions,
-                  COUNT(*) as slip_count
-           FROM salary_slip
-           WHERE company_id = ? AND status = 'submitted'
-             AND period_start >= ? AND period_start <= ?""",
-        (company_id, args.from_date, args.to_date),
-    ).fetchone()
+    _ss4 = Table("salary_slip")
+    _ss4_q = (Q.from_(_ss4)
+              .select(
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"gross_pay\" AS REAL)")), 0).as_("total_gross"),
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_deductions\" AS REAL)")), 0).as_("total_deductions"),
+                  fn.Count("*").as_("slip_count"))
+              .where((_ss4.company_id == P()) & (_ss4.status == P())
+                     & (_ss4.period_start >= P()) & (_ss4.period_start <= P())))
+    payroll = conn.execute(_ss4_q.get_sql(), (company_id, "submitted", args.from_date, args.to_date)).fetchone()
 
     total_payroll_gross = round_currency(to_decimal(str(payroll["total_gross"])))
     total_payroll_ded = round_currency(to_decimal(str(payroll["total_deductions"])))
@@ -2379,31 +2374,25 @@ def status_action(conn, args):
 
         # Check GST/HST configuration
         try:
-            bn_row = conn.execute(
-                "SELECT value FROM regional_settings WHERE company_id = ? AND key = 'bn'",
-                (company["id"],),
-            ).fetchone()
+            _rs3 = Table("regional_settings")
+            _rs3_q = Q.from_(_rs3).select(_rs3.value).where((_rs3.company_id == P()) & (_rs3.key == P()))
+            bn_row = conn.execute(_rs3_q.get_sql(), (company["id"], "bn")).fetchone()
             result["bn_configured"] = bn_row is not None
             if bn_row:
                 result["business_number"] = bn_row["value"]
 
-            prov_row = conn.execute(
-                "SELECT value FROM regional_settings WHERE company_id = ? AND key = 'province'",
-                (company["id"],),
-            ).fetchone()
+            prov_row = conn.execute(_rs3_q.get_sql(), (company["id"], "province")).fetchone()
             if prov_row:
                 result["configured_province"] = prov_row["value"]
 
-            config_row = conn.execute(
-                "SELECT value FROM regional_settings WHERE company_id = ? AND key = 'gst_hst_configured'",
-                (company["id"],),
-            ).fetchone()
+            config_row = conn.execute(_rs3_q.get_sql(), (company["id"], "gst_hst_configured")).fetchone()
             result["gst_hst_configured"] = config_row is not None
         except Exception:
             result["bn_configured"] = False
             result["gst_hst_configured"] = False
 
         # Count templates
+        # raw SQL — LIKE pattern in WHERE clause
         templates = conn.execute(
             "SELECT COUNT(*) as cnt FROM tax_template WHERE company_id = ? AND name LIKE 'Canada%'",
             (company["id"],),
@@ -2411,6 +2400,7 @@ def status_action(conn, args):
         result["ca_tax_templates"] = templates["cnt"]
 
         # Count accounts
+        # raw SQL — multiple LIKE patterns with OR in WHERE clause
         accounts = conn.execute(
             "SELECT COUNT(*) as cnt FROM account WHERE company_id = ? AND (name LIKE '%GST%' OR name LIKE '%HST%' OR name LIKE '%PST%' OR name LIKE '%QST%')",
             (company["id"],),

@@ -37,6 +37,10 @@ try:
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
     from erpclaw_lib.query_helpers import resolve_company_id
+    from erpclaw_lib.query import (
+        Q, P, Table, Field, fn, Order, DecimalSum, insert_row, update_row,
+    )
+    from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
@@ -47,6 +51,19 @@ REQUIRED_TABLES = ["company", "account"]
 VALID_PAYMENT_TYPES = ("receive", "pay", "internal_transfer")
 VALID_PARTY_TYPES = ("customer", "supplier", "employee")
 
+# ── PyPika table aliases ──
+PE = Table("payment_entry")
+PA = Table("payment_allocation")
+PLE = Table("payment_ledger_entry")
+COMPANY = Table("company")
+ACCOUNT = Table("account")
+GL = Table("gl_entry")
+CC = Table("cost_center")
+PT = Table("payment_terms")
+SI = Table("sales_invoice")
+PI = Table("purchase_invoice")
+PD = Table("payment_deduction")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -54,9 +71,8 @@ VALID_PARTY_TYPES = ("customer", "supplier", "employee")
 
 def _get_pe_or_err(conn, payment_entry_id: str) -> dict:
     """Fetch a payment entry by ID. Calls err() if not found."""
-    row = conn.execute(
-        "SELECT * FROM payment_entry WHERE id = ?", (payment_entry_id,)
-    ).fetchone()
+    q = Q.from_(PE).select(PE.star).where(PE.id == P())
+    row = conn.execute(q.get_sql(), (payment_entry_id,)).fetchone()
     if not row:
         err(f"Payment entry {payment_entry_id} not found",
              suggestion="Use 'list payments' to see available payment entries.")
@@ -65,49 +81,46 @@ def _get_pe_or_err(conn, payment_entry_id: str) -> dict:
 
 def _get_allocations(conn, payment_entry_id: str) -> list[dict]:
     """Fetch allocations for a payment entry."""
-    rows = conn.execute(
-        "SELECT * FROM payment_allocation WHERE payment_entry_id = ? ORDER BY rowid",
-        (payment_entry_id,),
-    ).fetchall()
+    q = (Q.from_(PA).select(PA.star)
+         .where(PA.payment_entry_id == P())
+         .orderby(LiteralValue("rowid")))
+    rows = conn.execute(q.get_sql(), (payment_entry_id,)).fetchall()
     return [row_to_dict(r) for r in rows]
 
 
 def _insert_allocations(conn, payment_entry_id: str, allocations: list[dict]):
     """Insert payment allocation rows and return total allocated."""
+    sql, _ = insert_row("payment_allocation", {
+        "id": P(), "payment_entry_id": P(), "voucher_type": P(),
+        "voucher_id": P(), "allocated_amount": P(),
+    })
     total_allocated = Decimal("0")
     for alloc in allocations:
         alloc_id = str(uuid.uuid4())
         amount = round_currency(to_decimal(alloc.get("allocated_amount", "0")))
         total_allocated += amount
-        conn.execute(
-            """INSERT INTO payment_allocation
-               (id, payment_entry_id, voucher_type, voucher_id, allocated_amount)
-               VALUES (?, ?, ?, ?, ?)""",
-            (alloc_id, payment_entry_id,
-             alloc["voucher_type"], alloc["voucher_id"], str(amount)),
-        )
+        conn.execute(sql, (alloc_id, payment_entry_id,
+                           alloc["voucher_type"], alloc["voucher_id"], str(amount)))
     return total_allocated
 
 
 def _recalc_unallocated(conn, payment_entry_id: str):
     """Recalculate and update unallocated_amount on a payment entry."""
-    pe = conn.execute(
-        "SELECT paid_amount FROM payment_entry WHERE id = ?", (payment_entry_id,)
-    ).fetchone()
+    q = Q.from_(PE).select(PE.paid_amount).where(PE.id == P())
+    pe = conn.execute(q.get_sql(), (payment_entry_id,)).fetchone()
     if not pe:
         return
     paid = to_decimal(pe["paid_amount"])
-    row = conn.execute(
-        """SELECT COALESCE(decimal_sum(allocated_amount), '0') AS total
-           FROM payment_allocation WHERE payment_entry_id = ?""",
-        (payment_entry_id,),
-    ).fetchone()
+    q2 = (Q.from_(PA)
+          .select(fn.Coalesce(DecimalSum(PA.allocated_amount), ValueWrapper("0")).as_("total"))
+          .where(PA.payment_entry_id == P()))
+    row = conn.execute(q2.get_sql(), (payment_entry_id,)).fetchone()
     allocated = to_decimal(str(row["total"]))
     unallocated = round_currency(paid - allocated)
-    conn.execute(
-        "UPDATE payment_entry SET unallocated_amount = ?, updated_at = datetime('now') WHERE id = ?",
-        (str(unallocated), payment_entry_id),
-    )
+    sql = update_row("payment_entry",
+                     data={"unallocated_amount": P(), "updated_at": LiteralValue("datetime('now')")},
+                     where={"id": P()})
+    conn.execute(sql, (str(unallocated), payment_entry_id))
 
 
 # ---------------------------------------------------------------------------
@@ -143,12 +156,14 @@ def add_payment(conn, args):
         err("--paid-amount is required")
 
     # Validate company
-    if not conn.execute("SELECT id FROM company WHERE id = ?", (company_id,)).fetchone():
+    q = Q.from_(COMPANY).select(COMPANY.id).where(COMPANY.id == P())
+    if not conn.execute(q.get_sql(), (company_id,)).fetchone():
         err(f"Company {company_id} not found")
 
     # Validate accounts exist
+    qa = Q.from_(ACCOUNT).select(ACCOUNT.id).where(ACCOUNT.id == P())
     for acct_id, label in [(paid_from, "paid-from-account"), (paid_to, "paid-to-account")]:
-        if not conn.execute("SELECT id FROM account WHERE id = ?", (acct_id,)).fetchone():
+        if not conn.execute(qa.get_sql(), (acct_id,)).fetchone():
             err(f"Account {acct_id} ({label}) not found")
 
     amount = round_currency(to_decimal(paid_amount))
@@ -162,21 +177,23 @@ def add_payment(conn, args):
     pe_id = str(uuid.uuid4())
     naming = get_next_name(conn, "payment_entry", company_id=company_id)
 
-    conn.execute(
-        """INSERT INTO payment_entry
-           (id, naming_series, payment_type, posting_date, party_type, party_id,
-            paid_from_account, paid_to_account, paid_amount, received_amount,
-            payment_currency, exchange_rate, reference_number, reference_date,
-            status, unallocated_amount, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)""",
+    sql, _ = insert_row("payment_entry", {
+        "id": P(), "naming_series": P(), "payment_type": P(),
+        "posting_date": P(), "party_type": P(), "party_id": P(),
+        "paid_from_account": P(), "paid_to_account": P(),
+        "paid_amount": P(), "received_amount": P(),
+        "payment_currency": P(), "exchange_rate": P(),
+        "reference_number": P(), "reference_date": P(),
+        "status": P(), "unallocated_amount": P(), "company_id": P(),
+    })
+    conn.execute(sql,
         (pe_id, naming, payment_type, posting_date,
          party_type, party_id, paid_from, paid_to,
          str(amount), str(received_amount),
          payment_currency, str(exchange_rate),
          args.reference_number, args.reference_date,
-         str(amount),  # unallocated = full amount initially
-         company_id),
-    )
+         "draft", str(amount),  # unallocated = full amount initially
+         company_id))
 
     # Insert allocations if provided
     if args.allocations:
@@ -221,19 +238,20 @@ def update_payment(conn, args):
         old_values["paid_amount"] = pe["paid_amount"]
         exchange_rate = to_decimal(pe["exchange_rate"])
         received = round_currency(amount * exchange_rate)
-        conn.execute(
-            """UPDATE payment_entry SET paid_amount = ?, received_amount = ?,
-               updated_at = datetime('now') WHERE id = ?""",
-            (str(amount), str(received), pe_id),
-        )
+        sql = update_row("payment_entry",
+                         data={"paid_amount": P(), "received_amount": P(),
+                               "updated_at": LiteralValue("datetime('now')")},
+                         where={"id": P()})
+        conn.execute(sql, (str(amount), str(received), pe_id))
         updated_fields.append("paid_amount")
 
     if args.reference_number is not None:
         old_values["reference_number"] = pe["reference_number"]
-        conn.execute(
-            "UPDATE payment_entry SET reference_number = ?, updated_at = datetime('now') WHERE id = ?",
-            (args.reference_number, pe_id),
-        )
+        sql = update_row("payment_entry",
+                         data={"reference_number": P(),
+                               "updated_at": LiteralValue("datetime('now')")},
+                         where={"id": P()})
+        conn.execute(sql, (args.reference_number, pe_id))
         updated_fields.append("reference_number")
 
     if args.allocations:
@@ -241,7 +259,8 @@ def update_payment(conn, args):
             allocs = json.loads(args.allocations) if isinstance(args.allocations, str) else args.allocations
         except json.JSONDecodeError as e:
             err("Invalid JSON format in --allocations")
-        conn.execute("DELETE FROM payment_allocation WHERE payment_entry_id = ?", (pe_id,))
+        dq = Q.from_(PA).delete().where(PA.payment_entry_id == P())
+        conn.execute(dq.get_sql(), (pe_id,))
         _insert_allocations(conn, pe_id, allocs)
         _recalc_unallocated(conn, pe_id)
         updated_fields.append("allocations")
@@ -308,48 +327,45 @@ def list_payments(conn, args):
     """List payment entries with filtering."""
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
-    conditions = ["pe.company_id = ?"]
+    pe = Table("payment_entry")
+    base = Q.from_(pe).where(pe.company_id == P())
     params = [company_id]
 
     if args.payment_type:
-        conditions.append("pe.payment_type = ?")
+        base = base.where(pe.payment_type == P())
         params.append(args.payment_type)
     if args.party_type:
-        conditions.append("pe.party_type = ?")
+        base = base.where(pe.party_type == P())
         params.append(args.party_type)
     if args.party_id:
-        conditions.append("pe.party_id = ?")
+        base = base.where(pe.party_id == P())
         params.append(args.party_id)
     if args.pe_status:
-        conditions.append("pe.status = ?")
+        base = base.where(pe.status == P())
         params.append(args.pe_status)
     if args.from_date:
-        conditions.append("pe.posting_date >= ?")
+        base = base.where(pe.posting_date >= P())
         params.append(args.from_date)
     if args.to_date:
-        conditions.append("pe.posting_date <= ?")
+        base = base.where(pe.posting_date <= P())
         params.append(args.to_date)
 
-    where = " AND ".join(conditions)
-
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM payment_entry pe WHERE {where}", params
-    ).fetchone()
+    count_q = base.select(fn.Count("*"))
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
+    list_params = params + [limit, offset]
 
+    data_q = (base.select(
+                  pe.id, pe.naming_series, pe.payment_type, pe.posting_date,
+                  pe.party_type, pe.party_id, pe.paid_amount, pe.status,
+                  pe.unallocated_amount)
+              .orderby(pe.posting_date, order=Order.desc)
+              .orderby(pe.created_at, order=Order.desc))
     rows = conn.execute(
-        f"""SELECT pe.id, pe.naming_series, pe.payment_type, pe.posting_date,
-               pe.party_type, pe.party_id, pe.paid_amount, pe.status,
-               pe.unallocated_amount
-           FROM payment_entry pe
-           WHERE {where}
-           ORDER BY pe.posting_date DESC, pe.created_at DESC
-           LIMIT ? OFFSET ?""",
-        params,
+        data_q.get_sql() + " LIMIT ? OFFSET ?", list_params
     ).fetchall()
 
     ok({"payments": [row_to_dict(r) for r in rows], "total_count": total_count,
@@ -385,22 +401,16 @@ def _calc_early_payment_discount(conn, pe, allocations):
             continue
 
         if vtype == "sales_invoice":
-            inv = conn.execute(
-                "SELECT posting_date, payment_terms_id FROM sales_invoice WHERE id = ?",
-                (vid,),
-            ).fetchone()
+            qi = Q.from_(SI).select(SI.posting_date, SI.payment_terms_id).where(SI.id == P())
+            inv = conn.execute(qi.get_sql(), (vid,)).fetchone()
         else:
-            inv = conn.execute(
-                "SELECT posting_date, payment_terms_id FROM purchase_invoice WHERE id = ?",
-                (vid,),
-            ).fetchone()
+            qi = Q.from_(PI).select(PI.posting_date, PI.payment_terms_id).where(PI.id == P())
+            inv = conn.execute(qi.get_sql(), (vid,)).fetchone()
         if not inv or not inv["payment_terms_id"]:
             continue
 
-        pt = conn.execute(
-            "SELECT discount_percentage, discount_days FROM payment_terms WHERE id = ?",
-            (inv["payment_terms_id"],),
-        ).fetchone()
+        qt = Q.from_(PT).select(PT.discount_percentage, PT.discount_days).where(PT.id == P())
+        pt = conn.execute(qt.get_sql(), (inv["payment_terms_id"],)).fetchone()
         if not pt or not pt["discount_percentage"] or not pt["discount_days"]:
             continue
 
@@ -429,17 +439,15 @@ def _calc_early_payment_discount(conn, pe, allocations):
     cost_center_id = None
     if total_discount > 0:
         disc_name = "Sales Discounts" if pe["payment_type"] == "receive" else "Purchase Discounts"
-        acct = conn.execute(
-            "SELECT id FROM account WHERE name = ? AND company_id = ?",
-            (disc_name, pe["company_id"]),
-        ).fetchone()
+        qa = (Q.from_(ACCOUNT).select(ACCOUNT.id)
+              .where(ACCOUNT.name == P()).where(ACCOUNT.company_id == P()))
+        acct = conn.execute(qa.get_sql(), (disc_name, pe["company_id"])).fetchone()
         if acct:
             discount_account_id = acct["id"]
         # Get default cost center for P&L tracking
-        cc = conn.execute(
-            "SELECT id FROM cost_center WHERE company_id = ? AND is_group = 0 LIMIT 1",
-            (pe["company_id"],),
-        ).fetchone()
+        qc = (Q.from_(CC).select(CC.id)
+              .where(CC.company_id == P()).where(CC.is_group == P()))
+        cc = conn.execute(qc.get_sql() + " LIMIT 1", (pe["company_id"], 0)).fetchone()
         if cc:
             cost_center_id = cc["id"]
 
@@ -508,27 +516,21 @@ def submit_payment(conn, args):
     # Compute FX gain/loss on allocated invoices
     fx_gain_loss_total = Decimal("0")
     if allocations and payment_rate != Decimal("1"):
-        company = conn.execute(
-            "SELECT exchange_gain_loss_account_id FROM company WHERE id = ?",
-            (pe["company_id"],),
-        ).fetchone()
+        qc = Q.from_(COMPANY).select(COMPANY.exchange_gain_loss_account_id).where(COMPANY.id == P())
+        company = conn.execute(qc.get_sql(), (pe["company_id"],)).fetchone()
         fx_account_id = company["exchange_gain_loss_account_id"] if company else None
 
         for alloc in allocations:
             inv_rate = Decimal("1")
             # Try to get original invoice exchange rate
             if alloc.get("reference_type") == "sales_invoice":
-                inv_row = conn.execute(
-                    "SELECT exchange_rate FROM sales_invoice WHERE id = ?",
-                    (alloc["reference_id"],),
-                ).fetchone()
+                qi = Q.from_(SI).select(SI.exchange_rate).where(SI.id == P())
+                inv_row = conn.execute(qi.get_sql(), (alloc["reference_id"],)).fetchone()
                 if inv_row and inv_row["exchange_rate"]:
                     inv_rate = to_decimal(inv_row["exchange_rate"])
             elif alloc.get("reference_type") == "purchase_invoice":
-                inv_row = conn.execute(
-                    "SELECT exchange_rate FROM purchase_invoice WHERE id = ?",
-                    (alloc["reference_id"],),
-                ).fetchone()
+                qi = Q.from_(PI).select(PI.exchange_rate).where(PI.id == P())
+                inv_row = conn.execute(qi.get_sql(), (alloc["reference_id"],)).fetchone()
                 if inv_row and inv_row["exchange_rate"]:
                     inv_rate = to_decimal(inv_row["exchange_rate"])
 
@@ -539,10 +541,10 @@ def submit_payment(conn, args):
                 )
                 fx_gain_loss_total += gl
                 # Update allocation record
-                conn.execute(
-                    "UPDATE payment_allocation SET exchange_gain_loss = ? WHERE id = ?",
-                    (str(gl), alloc["id"]),
-                )
+                sql = update_row("payment_allocation",
+                                 data={"exchange_gain_loss": P()},
+                                 where={"id": P()})
+                conn.execute(sql, (str(gl), alloc["id"]))
 
         # Post FX gain/loss GL entries if there's a net amount
         if fx_gain_loss_total != 0 and fx_account_id:
@@ -552,10 +554,8 @@ def submit_payment(conn, args):
             # FX entry needs a cost center for P&L tracking
             if gl_entries[-1].get("account_id") == fx_account_id:
                 # Use the first cost center found, or look up default
-                default_cc = conn.execute(
-                    "SELECT default_cost_center_id FROM company WHERE id = ?",
-                    (pe["company_id"],),
-                ).fetchone()
+                qcc = Q.from_(COMPANY).select(COMPANY.default_cost_center_id).where(COMPANY.id == P())
+                default_cc = conn.execute(qcc.get_sql(), (pe["company_id"],)).fetchone()
                 if default_cc and default_cc["default_cost_center_id"]:
                     gl_entries[-1]["cost_center_id"] = default_cc["default_cost_center_id"]
                 # Also need to add offsetting base amount difference to AR/AP entry
@@ -586,24 +586,24 @@ def submit_payment(conn, args):
     if pe["party_type"] and pe["party_id"]:
         # Determine the account for PLE (receivable for receive, payable for pay)
         ple_account = pe["paid_from_account"] if pe["payment_type"] == "receive" else pe["paid_to_account"]
-        conn.execute(
-            """INSERT INTO payment_ledger_entry
-               (id, posting_date, account_id, party_type, party_id,
-                voucher_type, voucher_id, amount, amount_in_account_currency,
-                currency, remarks)
-               VALUES (?, ?, ?, ?, ?, 'payment_entry', ?, ?, ?, ?, ?)""",
+        ple_sql, _ = insert_row("payment_ledger_entry", {
+            "id": P(), "posting_date": P(), "account_id": P(),
+            "party_type": P(), "party_id": P(),
+            "voucher_type": P(), "voucher_id": P(),
+            "amount": P(), "amount_in_account_currency": P(),
+            "currency": P(), "remarks": P(),
+        })
+        conn.execute(ple_sql,
             (ple_id, pe["posting_date"], ple_account,
              pe["party_type"], pe["party_id"],
-             pe_id, ple_amount, ple_amount,
+             "payment_entry", pe_id, ple_amount, ple_amount,
              pe["payment_currency"],
-             f"Payment {pe['naming_series']}"),
-        )
+             f"Payment {pe['naming_series']}"))
 
-    conn.execute(
-        """UPDATE payment_entry SET status = 'submitted',
-           updated_at = datetime('now') WHERE id = ?""",
-        (pe_id,),
-    )
+    sql = update_row("payment_entry",
+                     data={"status": P(), "updated_at": LiteralValue("datetime('now')")},
+                     where={"id": P()})
+    conn.execute(sql, ("submitted", pe_id))
 
     result = {"status": "submitted", "payment_entry_id": pe_id,
               "gl_entries_created": len(gl_ids), "outstanding_updated": True}
@@ -651,37 +651,37 @@ def cancel_payment(conn, args):
         err(f"GL reversal failed: {e}")
 
     # Reverse PLE: mark existing as delinked, create offsetting entry
-    ple_rows = conn.execute(
-        """SELECT * FROM payment_ledger_entry
-           WHERE voucher_type = 'payment_entry' AND voucher_id = ? AND delinked = 0""",
-        (pe_id,),
-    ).fetchall()
+    q_ple = (Q.from_(PLE).select(PLE.star)
+             .where(PLE.voucher_type == P())
+             .where(PLE.voucher_id == P())
+             .where(PLE.delinked == P()))
+    ple_rows = conn.execute(q_ple.get_sql(), ("payment_entry", pe_id, 0)).fetchall()
+    delink_sql = update_row("payment_ledger_entry",
+                            data={"delinked": P(), "updated_at": LiteralValue("datetime('now')")},
+                            where={"id": P()})
+    ple_ins_sql, _ = insert_row("payment_ledger_entry", {
+        "id": P(), "posting_date": P(), "account_id": P(),
+        "party_type": P(), "party_id": P(),
+        "voucher_type": P(), "voucher_id": P(),
+        "amount": P(), "amount_in_account_currency": P(),
+        "currency": P(), "remarks": P(),
+    })
     for ple in ple_rows:
         ple_dict = row_to_dict(ple)
-        conn.execute(
-            "UPDATE payment_ledger_entry SET delinked = 1, updated_at = datetime('now') WHERE id = ?",
-            (ple_dict["id"],),
-        )
+        conn.execute(delink_sql, (1, ple_dict["id"]))
         # Create reversing PLE
         reversal_amount = str(round_currency(-to_decimal(ple_dict["amount"])))
-        conn.execute(
-            """INSERT INTO payment_ledger_entry
-               (id, posting_date, account_id, party_type, party_id,
-                voucher_type, voucher_id, amount, amount_in_account_currency,
-                currency, remarks)
-               VALUES (?, ?, ?, ?, ?, 'payment_entry', ?, ?, ?, ?, ?)""",
+        conn.execute(ple_ins_sql,
             (str(uuid.uuid4()), pe["posting_date"], ple_dict["account_id"],
              ple_dict["party_type"], ple_dict["party_id"],
-             pe_id, reversal_amount, reversal_amount,
+             "payment_entry", pe_id, reversal_amount, reversal_amount,
              ple_dict["currency"],
-             f"Reversal: Payment {pe['naming_series']}"),
-        )
+             f"Reversal: Payment {pe['naming_series']}"))
 
-    conn.execute(
-        """UPDATE payment_entry SET status = 'cancelled',
-           updated_at = datetime('now') WHERE id = ?""",
-        (pe_id,),
-    )
+    sql = update_row("payment_entry",
+                     data={"status": P(), "updated_at": LiteralValue("datetime('now')")},
+                     where={"id": P()})
+    conn.execute(sql, ("cancelled", pe_id))
 
     audit(conn, "erpclaw-payments", "cancel-payment", "payment_entry", pe_id,
            new_values={"reversed": True})
@@ -706,9 +706,9 @@ def delete_payment(conn, args):
              suggestion="Cancel the document first, then delete.")
 
     naming = pe["naming_series"]
-    conn.execute("DELETE FROM payment_allocation WHERE payment_entry_id = ?", (pe_id,))
-    conn.execute("DELETE FROM payment_deduction WHERE payment_entry_id = ?", (pe_id,))
-    conn.execute("DELETE FROM payment_entry WHERE id = ?", (pe_id,))
+    conn.execute(Q.from_(PA).delete().where(PA.payment_entry_id == P()).get_sql(), (pe_id,))
+    conn.execute(Q.from_(PD).delete().where(PD.payment_entry_id == P()).get_sql(), (pe_id,))
+    conn.execute(Q.from_(PE).delete().where(PE.id == P()).get_sql(), (pe_id,))
 
     audit(conn, "erpclaw-payments", "delete-payment", "payment_entry", pe_id,
            old_values={"naming_series": naming})
@@ -748,17 +748,18 @@ def create_payment_ledger_entry(conn, args):
     ple_id = str(uuid.uuid4())
     dec_amount = round_currency(to_decimal(amount))
 
-    conn.execute(
-        """INSERT INTO payment_ledger_entry
-           (id, posting_date, account_id, party_type, party_id,
-            voucher_type, voucher_id, against_voucher_type, against_voucher_id,
-            amount, amount_in_account_currency, currency)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'USD')""",
+    sql, _ = insert_row("payment_ledger_entry", {
+        "id": P(), "posting_date": P(), "account_id": P(),
+        "party_type": P(), "party_id": P(),
+        "voucher_type": P(), "voucher_id": P(),
+        "against_voucher_type": P(), "against_voucher_id": P(),
+        "amount": P(), "amount_in_account_currency": P(), "currency": P(),
+    })
+    conn.execute(sql,
         (ple_id, posting_date, account_id, party_type, party_id,
          voucher_type, voucher_id,
          args.against_voucher_type, args.against_voucher_id,
-         str(dec_amount), str(dec_amount)),
-    )
+         str(dec_amount), str(dec_amount), "USD"))
 
     audit(conn, "erpclaw-payments", "create-payment-ledger-entry", "payment_ledger_entry", ple_id,
            new_values={"voucher_type": voucher_type, "amount": str(dec_amount)})
@@ -780,30 +781,29 @@ def get_outstanding(conn, args):
     if not party_id:
         err("--party-id is required")
 
-    conditions = ["ple.party_type = ?", "ple.party_id = ?", "ple.delinked = 0"]
-    params = [party_type, party_id]
+    ple = Table("payment_ledger_entry")
+    base = (Q.from_(ple)
+            .where(ple.party_type == P())
+            .where(ple.party_id == P())
+            .where(ple.delinked == P()))
+    params = [party_type, party_id, 0]
 
     if args.voucher_type:
-        conditions.append("ple.voucher_type = ?")
+        base = base.where(ple.voucher_type == P())
         params.append(args.voucher_type)
     if args.voucher_id:
-        conditions.append("ple.voucher_id = ?")
+        base = base.where(ple.voucher_id == P())
         params.append(args.voucher_id)
 
-    where = " AND ".join(conditions)
-
     # Aggregate outstanding by voucher
-    rows = conn.execute(
-        f"""SELECT ple.voucher_type, ple.voucher_id,
-               decimal_sum(ple.amount) AS outstanding_amount,
-               MIN(ple.posting_date) AS posting_date
-           FROM payment_ledger_entry ple
-           WHERE {where}
-           GROUP BY ple.voucher_type, ple.voucher_id
-           HAVING decimal_sum(ple.amount) + 0 != 0
-           ORDER BY ple.posting_date""",
-        params,
-    ).fetchall()
+    q = (base.select(
+             ple.voucher_type, ple.voucher_id,
+             DecimalSum(ple.amount).as_("outstanding_amount"),
+             fn.Min(ple.posting_date).as_("posting_date"))
+         .groupby(ple.voucher_type, ple.voucher_id)
+         .having(LiteralValue('decimal_sum("amount") + 0 != 0'))
+         .orderby(ple.posting_date))
+    rows = conn.execute(q.get_sql(), params).fetchall()
 
     vouchers = []
     total_outstanding = Decimal("0")
@@ -835,15 +835,16 @@ def get_unallocated_payments(conn, args):
         err("--party-id is required")
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
-    rows = conn.execute(
-        """SELECT id, naming_series, paid_amount, unallocated_amount, posting_date
-           FROM payment_entry
-           WHERE party_type = ? AND party_id = ? AND company_id = ?
-             AND status = 'submitted'
-             AND unallocated_amount + 0 > 0
-           ORDER BY posting_date""",
-        (party_type, party_id, company_id),
-    ).fetchall()
+    q = (Q.from_(PE)
+         .select(PE.id, PE.naming_series, PE.paid_amount,
+                 PE.unallocated_amount, PE.posting_date)
+         .where(PE.party_type == P())
+         .where(PE.party_id == P())
+         .where(PE.company_id == P())
+         .where(PE.status == P())
+         .where(LiteralValue('"unallocated_amount" + 0 > 0'))
+         .orderby(PE.posting_date))
+    rows = conn.execute(q.get_sql(), (party_type, party_id, company_id, "submitted")).fetchall()
 
     ok({"payments": [row_to_dict(r) for r in rows]})
 
@@ -880,19 +881,17 @@ def allocate_payment(conn, args):
         err(f"Allocated amount ({amount}) exceeds unallocated ({unallocated})")
 
     alloc_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO payment_allocation
-           (id, payment_entry_id, voucher_type, voucher_id, allocated_amount)
-           VALUES (?, ?, ?, ?, ?)""",
-        (alloc_id, pe_id, voucher_type, voucher_id, str(amount)),
-    )
+    alloc_sql, _ = insert_row("payment_allocation", {
+        "id": P(), "payment_entry_id": P(), "voucher_type": P(),
+        "voucher_id": P(), "allocated_amount": P(),
+    })
+    conn.execute(alloc_sql, (alloc_id, pe_id, voucher_type, voucher_id, str(amount)))
 
     _recalc_unallocated(conn, pe_id)
 
     # Get updated unallocated
-    updated = conn.execute(
-        "SELECT unallocated_amount FROM payment_entry WHERE id = ?", (pe_id,)
-    ).fetchone()
+    qu = Q.from_(PE).select(PE.unallocated_amount).where(PE.id == P())
+    updated = conn.execute(qu.get_sql(), (pe_id,)).fetchone()
 
     audit(conn, "erpclaw-payments", "allocate-payment", "payment_allocation", alloc_id,
            new_values={"payment_entry_id": pe_id, "voucher_id": voucher_id,
@@ -920,6 +919,7 @@ def reconcile_payments(conn, args):
         err("--company-id is required")
 
     # Get unallocated submitted payments (FIFO by posting_date)
+    # Uses arithmetic WHERE (unallocated_amount + 0 > 0) — keep raw SQL
     payments = conn.execute(
         """SELECT id, paid_amount, unallocated_amount, posting_date
            FROM payment_entry
@@ -931,6 +931,7 @@ def reconcile_payments(conn, args):
     ).fetchall()
 
     # Get outstanding vouchers from PLE (FIFO by posting_date)
+    # Uses HAVING with decimal_sum + 0 > 0 — keep raw SQL
     outstanding_rows = conn.execute(
         """SELECT voucher_type, voucher_id,
                decimal_sum(amount) AS outstanding
@@ -971,13 +972,13 @@ def reconcile_payments(conn, args):
 
         # Create allocation
         alloc_id = str(uuid.uuid4())
-        conn.execute(
-            """INSERT INTO payment_allocation
-               (id, payment_entry_id, voucher_type, voucher_id, allocated_amount)
-               VALUES (?, ?, ?, ?, ?)""",
+        recon_sql, _ = insert_row("payment_allocation", {
+            "id": P(), "payment_entry_id": P(), "voucher_type": P(),
+            "voucher_id": P(), "allocated_amount": P(),
+        })
+        conn.execute(recon_sql,
             (alloc_id, pay["id"], inv["voucher_type"], inv["voucher_id"],
-             str(alloc_amount)),
-        )
+             str(alloc_amount)))
 
         pay["remaining"] -= alloc_amount
         inv["remaining"] -= alloc_amount
@@ -1024,33 +1025,35 @@ def bank_reconciliation(conn, args):
         err("--to-date is required")
 
     # Verify account exists
-    acct = conn.execute("SELECT id, name FROM account WHERE id = ?",
-                        (bank_account_id,)).fetchone()
+    qa = Q.from_(ACCOUNT).select(ACCOUNT.id, ACCOUNT.name).where(ACCOUNT.id == P())
+    acct = conn.execute(qa.get_sql(), (bank_account_id,)).fetchone()
     if not acct:
         err(f"Bank account {bank_account_id} not found")
 
     # Get GL entries for this bank account in date range
-    rows = conn.execute(
-        """SELECT COUNT(*) AS entry_count,
-               COALESCE(decimal_sum(debit), '0') AS total_debit,
-               COALESCE(decimal_sum(credit), '0') AS total_credit
-           FROM gl_entry
-           WHERE account_id = ? AND posting_date >= ? AND posting_date <= ?
-             AND is_cancelled = 0""",
-        (bank_account_id, from_date, to_date),
-    ).fetchone()
+    qg = (Q.from_(GL)
+          .select(fn.Count("*").as_("entry_count"),
+                  fn.Coalesce(DecimalSum(GL.debit), ValueWrapper("0")).as_("total_debit"),
+                  fn.Coalesce(DecimalSum(GL.credit), ValueWrapper("0")).as_("total_credit"))
+          .where(GL.account_id == P())
+          .where(GL.posting_date >= P())
+          .where(GL.posting_date <= P())
+          .where(GL.is_cancelled == P()))
+    rows = conn.execute(qg.get_sql(), (bank_account_id, from_date, to_date, 0)).fetchone()
 
     gl_balance = round_currency(
         to_decimal(str(rows["total_debit"])) - to_decimal(str(rows["total_credit"]))
     )
 
     # Get payment entries hitting this bank account in date range
+    pe = Table("payment_entry")
+    qp = (Q.from_(pe).select(fn.Count("*"))
+          .where((pe.paid_from_account == P()) | (pe.paid_to_account == P()))
+          .where(pe.posting_date >= P())
+          .where(pe.posting_date <= P())
+          .where(pe.status == P()))
     payment_count = conn.execute(
-        """SELECT COUNT(*) FROM payment_entry
-           WHERE (paid_from_account = ? OR paid_to_account = ?)
-             AND posting_date >= ? AND posting_date <= ?
-             AND status = 'submitted'""",
-        (bank_account_id, bank_account_id, from_date, to_date),
+        qp.get_sql(), (bank_account_id, bank_account_id, from_date, to_date, "submitted")
     ).fetchone()[0]
 
     ok({
@@ -1071,13 +1074,13 @@ def status(conn, args):
     """Show payment entry counts and totals."""
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
-    rows = conn.execute(
-        """SELECT status, COUNT(*) AS cnt,
-               COALESCE(decimal_sum(paid_amount), '0') AS total
-           FROM payment_entry
-           WHERE company_id = ? GROUP BY status""",
-        (company_id,),
-    ).fetchall()
+    pe = Table("payment_entry")
+    q1 = (Q.from_(pe)
+          .select(pe.status, fn.Count("*").as_("cnt"),
+                  fn.Coalesce(DecimalSum(pe.paid_amount), ValueWrapper("0")).as_("total"))
+          .where(pe.company_id == P())
+          .groupby(pe.status))
+    rows = conn.execute(q1.get_sql(), (company_id,)).fetchall()
 
     counts = {"total": 0, "draft": 0, "submitted": 0, "cancelled": 0}
     total_received = Decimal("0")
@@ -1087,14 +1090,13 @@ def status(conn, args):
         counts["total"] += row["cnt"]
 
     # Get totals by payment type for submitted only
-    type_rows = conn.execute(
-        """SELECT payment_type,
-               COALESCE(decimal_sum(paid_amount), '0') AS total
-           FROM payment_entry
-           WHERE company_id = ? AND status = 'submitted'
-           GROUP BY payment_type""",
-        (company_id,),
-    ).fetchall()
+    q2 = (Q.from_(pe)
+          .select(pe.payment_type,
+                  fn.Coalesce(DecimalSum(pe.paid_amount), ValueWrapper("0")).as_("total"))
+          .where(pe.company_id == P())
+          .where(pe.status == P())
+          .groupby(pe.payment_type))
+    type_rows = conn.execute(q2.get_sql(), (company_id, "submitted")).fetchall()
     for row in type_rows:
         if row["payment_type"] == "receive":
             total_received = round_currency(to_decimal(str(row["total"])))

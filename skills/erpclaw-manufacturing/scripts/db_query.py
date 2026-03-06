@@ -34,6 +34,8 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
+    from erpclaw_lib.query import Q, P, Table, Field, fn, Case, Order, Criterion, Not, NULL, DecimalSum, DecimalAbs
+    from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
@@ -71,25 +73,31 @@ def _parse_json_arg(value, name):
 
 def _get_fiscal_year(conn, posting_date: str) -> str | None:
     """Return the fiscal year name for a posting date, or None."""
-    fy = conn.execute(
-        "SELECT name FROM fiscal_year WHERE start_date <= ? AND end_date >= ? AND is_closed = 0",
-        (posting_date, posting_date),
-    ).fetchone()
+    t = Table("fiscal_year")
+    q = (Q.from_(t).select(t.name)
+         .where(t.start_date <= P())
+         .where(t.end_date >= P())
+         .where(t.is_closed == 0))
+    fy = conn.execute(q.get_sql(), (posting_date, posting_date)).fetchone()
     return fy["name"] if fy else None
 
 
 def _get_cost_center(conn, company_id: str) -> str | None:
     """Return the first non-group cost center for a company, or None."""
-    cc = conn.execute(
-        "SELECT id FROM cost_center WHERE company_id = ? AND is_group = 0 LIMIT 1",
-        (company_id,),
-    ).fetchone()
+    t = Table("cost_center")
+    q = (Q.from_(t).select(t.id)
+         .where(t.company_id == P())
+         .where(t.is_group == 0)
+         .limit(1))
+    cc = conn.execute(q.get_sql(), (company_id,)).fetchone()
     return cc["id"] if cc else None
 
 
 def _validate_item_exists(conn, item_id: str, label: str = "Item"):
     """Validate that an item exists and return the row, or error."""
-    item = conn.execute("SELECT * FROM item WHERE id = ?", (item_id,)).fetchone()
+    t = Table("item")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    item = conn.execute(q.get_sql(), (item_id,)).fetchone()
     if not item:
         err(f"{label} {item_id} not found")
     return item
@@ -97,7 +105,9 @@ def _validate_item_exists(conn, item_id: str, label: str = "Item"):
 
 def _validate_bom_exists(conn, bom_id: str):
     """Validate that a BOM exists and return the row, or error."""
-    bom = conn.execute("SELECT * FROM bom WHERE id = ?", (bom_id,)).fetchone()
+    t = Table("bom")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    bom = conn.execute(q.get_sql(), (bom_id,)).fetchone()
     if not bom:
         err(f"BOM {bom_id} not found",
              suggestion="Use 'list boms' to see available BOMs.")
@@ -106,9 +116,9 @@ def _validate_bom_exists(conn, bom_id: str):
 
 def _validate_company_exists(conn, company_id: str):
     """Validate that a company exists and return the row, or error."""
-    company = conn.execute(
-        "SELECT id FROM company WHERE id = ?", (company_id,),
-    ).fetchone()
+    t = Table("company")
+    q = Q.from_(t).select(t.id).where(t.id == P())
+    company = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not company:
         err(f"Company {company_id} not found")
     return company
@@ -116,9 +126,9 @@ def _validate_company_exists(conn, company_id: str):
 
 def _validate_operation_exists(conn, operation_id: str):
     """Validate that an operation exists and return the row, or error."""
-    op = conn.execute(
-        "SELECT * FROM operation WHERE id = ?", (operation_id,),
-    ).fetchone()
+    t = Table("operation")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    op = conn.execute(q.get_sql(), (operation_id,)).fetchone()
     if not op:
         err(f"Operation {operation_id} not found")
     return op
@@ -126,9 +136,9 @@ def _validate_operation_exists(conn, operation_id: str):
 
 def _validate_workstation_exists(conn, workstation_id: str):
     """Validate that a workstation exists and return the row, or error."""
-    ws = conn.execute(
-        "SELECT * FROM workstation WHERE id = ?", (workstation_id,),
-    ).fetchone()
+    t = Table("workstation")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    ws = conn.execute(q.get_sql(), (workstation_id,)).fetchone()
     if not ws:
         err(f"Workstation {workstation_id} not found")
     return ws
@@ -136,9 +146,9 @@ def _validate_workstation_exists(conn, workstation_id: str):
 
 def _validate_warehouse_exists(conn, warehouse_id: str, label: str = "Warehouse"):
     """Validate that a warehouse exists and return the row, or error."""
-    wh = conn.execute(
-        "SELECT * FROM warehouse WHERE id = ?", (warehouse_id,),
-    ).fetchone()
+    t = Table("warehouse")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    wh = conn.execute(q.get_sql(), (warehouse_id,)).fetchone()
     if not wh:
         err(f"{label} {warehouse_id} not found")
     return wh
@@ -175,10 +185,9 @@ def _calculate_operation_costs(conn, operations_data: list) -> Decimal:
             time_mins = to_decimal(op.get("time_in_minutes", "0"))
             ws_id = op.get("workstation_id")
             if ws_id and time_mins > 0:
-                ws = conn.execute(
-                    "SELECT operating_cost_per_hour FROM workstation WHERE id = ?",
-                    (ws_id,),
-                ).fetchone()
+                ws_t = Table("workstation")
+                ws_q = Q.from_(ws_t).select(ws_t.operating_cost_per_hour).where(ws_t.id == P())
+                ws = conn.execute(ws_q.get_sql(), (ws_id,)).fetchone()
                 if ws:
                     hour_rate = to_decimal(ws["operating_cost_per_hour"])
                     cost = round_currency((time_mins / Decimal("60")) * hour_rate)
@@ -249,9 +258,9 @@ def add_bom(conn, args):
 
         # Validate sub-BOM reference if this is a sub-assembly
         if is_sub_assembly and sub_bom_id:
-            sub_bom = conn.execute(
-                "SELECT id, item_id FROM bom WHERE id = ?", (sub_bom_id,),
-            ).fetchone()
+            bom_t = Table("bom")
+            sub_bom_q = Q.from_(bom_t).select(bom_t.id, bom_t.item_id).where(bom_t.id == P())
+            sub_bom = conn.execute(sub_bom_q.get_sql(), (sub_bom_id,)).fetchone()
             if not sub_bom:
                 err(f"Item {i}: sub_bom_id {sub_bom_id} not found")
             if sub_bom["item_id"] != rm_item_id:
@@ -295,31 +304,31 @@ def add_bom(conn, args):
 
     if routing_id:
         # Copy operations from routing
-        routing = conn.execute(
-            "SELECT id FROM routing WHERE id = ?", (routing_id,),
-        ).fetchone()
+        rt_t = Table("routing")
+        rt_q = Q.from_(rt_t).select(rt_t.id).where(rt_t.id == P())
+        routing = conn.execute(rt_q.get_sql(), (routing_id,)).fetchone()
         if not routing:
             err(f"Routing {routing_id} not found")
 
-        routing_ops = conn.execute(
-            """SELECT operation_id, workstation_id, sequence,
-                      time_in_minutes, operating_cost
-               FROM routing_operation WHERE routing_id = ?
-               ORDER BY sequence""",
-            (routing_id,),
-        ).fetchall()
+        ro_t = Table("routing_operation")
+        ro_q = (Q.from_(ro_t)
+                .select(ro_t.operation_id, ro_t.workstation_id, ro_t.sequence,
+                        ro_t.time_in_minutes, ro_t.operating_cost)
+                .where(ro_t.routing_id == P())
+                .orderby(ro_t.sequence))
+        routing_ops = conn.execute(ro_q.get_sql(), (routing_id,)).fetchall()
         if not routing_ops:
             err(f"Routing {routing_id} has no operations")
 
+        ws_t = Table("workstation")
+        ws_cost_q = Q.from_(ws_t).select(ws_t.operating_cost_per_hour).where(ws_t.id == P())
+        ws_cost_sql = ws_cost_q.get_sql()
         for ro in routing_ops:
             ro_dict = row_to_dict(ro)
             # If no explicit operating_cost, calculate from workstation
             op_cost = to_decimal(ro_dict.get("operating_cost", "0"))
             if op_cost <= 0 and ro_dict.get("workstation_id"):
-                ws = conn.execute(
-                    "SELECT operating_cost_per_hour FROM workstation WHERE id = ?",
-                    (ro_dict["workstation_id"],),
-                ).fetchone()
+                ws = conn.execute(ws_cost_sql, (ro_dict["workstation_id"],)).fetchone()
                 if ws:
                     time_mins = to_decimal(ro_dict.get("time_in_minutes", "0"))
                     op_cost = round_currency(
@@ -357,10 +366,9 @@ def add_bom(conn, args):
             # Calculate operating cost if not provided
             op_cost = to_decimal(op.get("operating_cost", "0"))
             if op_cost <= 0 and ws_id:
-                ws = conn.execute(
-                    "SELECT operating_cost_per_hour FROM workstation WHERE id = ?",
-                    (ws_id,),
-                ).fetchone()
+                ws_t2 = Table("workstation")
+                ws_cost_q2 = Q.from_(ws_t2).select(ws_t2.operating_cost_per_hour).where(ws_t2.id == P())
+                ws = conn.execute(ws_cost_q2.get_sql(), (ws_id,)).fetchone()
                 if ws:
                     time_mins = to_decimal(op.get("time_in_minutes", "0"))
                     op_cost = round_currency(
@@ -393,33 +401,41 @@ def add_bom(conn, args):
 
     # If this is the first BOM for this item in this company, make it default
     if not is_default:
-        existing_bom = conn.execute(
-            "SELECT id FROM bom WHERE item_id = ? AND company_id = ? AND is_active = 1 LIMIT 1",
-            (args.item_id, args.company_id),
-        ).fetchone()
+        bom_t = Table("bom")
+        existing_bom_q = (Q.from_(bom_t).select(bom_t.id)
+                          .where(bom_t.item_id == P())
+                          .where(bom_t.company_id == P())
+                          .where(bom_t.is_active == 1)
+                          .limit(1))
+        existing_bom = conn.execute(existing_bom_q.get_sql(), (args.item_id, args.company_id)).fetchone()
         if not existing_bom:
             is_default = 1
 
     # If setting as default, unset previous defaults for this item+company
     if is_default:
-        conn.execute(
-            """UPDATE bom SET is_default = 0, updated_at = datetime('now')
-               WHERE item_id = ? AND company_id = ? AND is_default = 1""",
-            (args.item_id, args.company_id),
-        )
+        bom_t = Table("bom")
+        unset_q = (Q.update(bom_t)
+                   .set(bom_t.is_default, 0)
+                   .set(bom_t.updated_at, LiteralValue("datetime('now')"))
+                   .where(bom_t.item_id == P())
+                   .where(bom_t.company_id == P())
+                   .where(bom_t.is_default == 1))
+        conn.execute(unset_q.get_sql(), (args.item_id, args.company_id))
 
     bom_id = str(uuid.uuid4())
     fg_dict = row_to_dict(fg_item)
     uom = args.uom or fg_dict.get("stock_uom")
 
     # Insert BOM parent
+    bom_t = Table("bom")
+    bom_ins_q = (Q.into(bom_t).columns(
+        "id", "naming_series", "item_id", "quantity", "uom", "is_active", "is_default",
+        "operating_cost", "raw_material_cost", "total_cost", "with_operations",
+        "routing_id", "company_id"
+    ).insert(P(), P(), P(), P(), P(), 1, P(), P(), P(), P(), P(), P(), P()))
     try:
         conn.execute(
-            """INSERT INTO bom
-               (id, naming_series, item_id, quantity, uom, is_active, is_default,
-                operating_cost, raw_material_cost, total_cost, with_operations,
-                routing_id, company_id)
-               VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)""",
+            bom_ins_q.get_sql(),
             (bom_id, naming, args.item_id, str(round_currency(bom_qty)),
              uom, is_default,
              str(operating_cost), str(raw_material_cost), str(total_cost),
@@ -430,12 +446,15 @@ def add_bom(conn, args):
         err("BOM creation failed — check for duplicates or invalid data")
 
     # Insert BOM item rows
+    bi_t = Table("bom_item")
+    bi_ins_q = (Q.into(bi_t).columns(
+        "id", "bom_id", "item_id", "quantity", "uom", "rate", "amount",
+        "source_warehouse_id", "is_sub_assembly", "sub_bom_id", "scrap_percentage"
+    ).insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+    bi_ins_sql = bi_ins_q.get_sql()
     for row in bom_item_rows:
         conn.execute(
-            """INSERT INTO bom_item
-               (id, bom_id, item_id, quantity, uom, rate, amount,
-                source_warehouse_id, is_sub_assembly, sub_bom_id, scrap_percentage)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            bi_ins_sql,
             (row["id"], bom_id, row["item_id"], row["quantity"],
              row["uom"], row["rate"], row["amount"],
              row["source_warehouse_id"], row["is_sub_assembly"],
@@ -443,12 +462,15 @@ def add_bom(conn, args):
         )
 
     # Insert BOM operation rows
+    bo_t = Table("bom_operation")
+    bo_ins_q = (Q.into(bo_t).columns(
+        "id", "bom_id", "operation_id", "workstation_id",
+        "time_in_minutes", "operating_cost", "sequence", "description"
+    ).insert(P(), P(), P(), P(), P(), P(), P(), P()))
+    bo_ins_sql = bo_ins_q.get_sql()
     for op_row in bom_operation_rows:
         conn.execute(
-            """INSERT INTO bom_operation
-               (id, bom_id, operation_id, workstation_id,
-                time_in_minutes, operating_cost, sequence, description)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            bo_ins_sql,
             (op_row["id"], bom_id, op_row["operation_id"],
              op_row["workstation_id"], op_row["time_in_minutes"],
              op_row["operating_cost"], op_row["sequence"],
@@ -529,11 +551,15 @@ def update_bom(conn, args):
             err("--is-default must be 0 or 1")
         if is_default:
             # Unset previous defaults for this item+company
-            conn.execute(
-                """UPDATE bom SET is_default = 0, updated_at = datetime('now')
-                   WHERE item_id = ? AND company_id = ? AND is_default = 1 AND id != ?""",
-                (item_id, company_id, args.bom_id),
-            )
+            bom_t2 = Table("bom")
+            unset_def_q = (Q.update(bom_t2)
+                           .set(bom_t2.is_default, 0)
+                           .set(bom_t2.updated_at, LiteralValue("datetime('now')"))
+                           .where(bom_t2.item_id == P())
+                           .where(bom_t2.company_id == P())
+                           .where(bom_t2.is_default == 1)
+                           .where(bom_t2.id != P()))
+            conn.execute(unset_def_q.get_sql(), (item_id, company_id, args.bom_id))
         updates.append("is_default = ?")
         params.append(is_default)
         updated_fields.append("is_default")
@@ -545,9 +571,9 @@ def update_bom(conn, args):
             updates.append("routing_id = NULL")
             updated_fields.append("routing_id")
         else:
-            routing = conn.execute(
-                "SELECT id FROM routing WHERE id = ?", (args.routing_id,),
-            ).fetchone()
+            rt_t2 = Table("routing")
+            rt_chk_q = Q.from_(rt_t2).select(rt_t2.id).where(rt_t2.id == P())
+            routing = conn.execute(rt_chk_q.get_sql(), (args.routing_id,)).fetchone()
             if not routing:
                 err(f"Routing {args.routing_id} not found")
             updates.append("routing_id = ?")
@@ -583,9 +609,9 @@ def update_bom(conn, args):
             source_warehouse_id = item.get("source_warehouse_id")
 
             if is_sub_assembly and sub_bom_id:
-                sub_bom = conn.execute(
-                    "SELECT id, item_id FROM bom WHERE id = ?", (sub_bom_id,),
-                ).fetchone()
+                bom_t3 = Table("bom")
+                sb_q = Q.from_(bom_t3).select(bom_t3.id, bom_t3.item_id).where(bom_t3.id == P())
+                sub_bom = conn.execute(sb_q.get_sql(), (sub_bom_id,)).fetchone()
                 if not sub_bom:
                     err(f"Item {i}: sub_bom_id {sub_bom_id} not found")
                 if sub_bom["item_id"] != rm_item_id:
@@ -613,13 +639,17 @@ def update_bom(conn, args):
             })
 
         # Delete old items and insert new ones
-        conn.execute("DELETE FROM bom_item WHERE bom_id = ?", (args.bom_id,))
+        bi_t2 = Table("bom_item")
+        del_bi_q = Q.from_(bi_t2).delete().where(bi_t2.bom_id == P())
+        conn.execute(del_bi_q.get_sql(), (args.bom_id,))
+        bi_ins_q2 = (Q.into(bi_t2).columns(
+            "id", "bom_id", "item_id", "quantity", "uom", "rate", "amount",
+            "source_warehouse_id", "is_sub_assembly", "sub_bom_id", "scrap_percentage"
+        ).insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+        bi_ins_sql2 = bi_ins_q2.get_sql()
         for row in new_bom_items:
             conn.execute(
-                """INSERT INTO bom_item
-                   (id, bom_id, item_id, quantity, uom, rate, amount,
-                    source_warehouse_id, is_sub_assembly, sub_bom_id, scrap_percentage)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                bi_ins_sql2,
                 (row["id"], args.bom_id, row["item_id"], row["quantity"],
                  row["uom"], row["rate"], row["amount"],
                  row["source_warehouse_id"], row["is_sub_assembly"],
@@ -640,7 +670,9 @@ def update_bom(conn, args):
         operations = _parse_json_arg(args.operations, "operations")
 
         # Delete old operations
-        conn.execute("DELETE FROM bom_operation WHERE bom_id = ?", (args.bom_id,))
+        bo_t2 = Table("bom_operation")
+        del_bo_q = Q.from_(bo_t2).delete().where(bo_t2.bom_id == P())
+        conn.execute(del_bo_q.get_sql(), (args.bom_id,))
 
         if operations and isinstance(operations, list):
             for i, op in enumerate(operations):
@@ -656,10 +688,9 @@ def update_bom(conn, args):
                 # Calculate operating cost if not provided
                 op_cost = to_decimal(op.get("operating_cost", "0"))
                 if op_cost <= 0 and ws_id:
-                    ws = conn.execute(
-                        "SELECT operating_cost_per_hour FROM workstation WHERE id = ?",
-                        (ws_id,),
-                    ).fetchone()
+                    ws_t3 = Table("workstation")
+                    ws_cost_q3 = Q.from_(ws_t3).select(ws_t3.operating_cost_per_hour).where(ws_t3.id == P())
+                    ws = conn.execute(ws_cost_q3.get_sql(), (ws_id,)).fetchone()
                     if ws:
                         time_mins = to_decimal(op.get("time_in_minutes", "0"))
                         op_cost = round_currency(
@@ -667,11 +698,12 @@ def update_bom(conn, args):
                             * to_decimal(ws["operating_cost_per_hour"])
                         )
 
+                bo_ins_q2 = (Q.into(bo_t2).columns(
+                    "id", "bom_id", "operation_id", "workstation_id",
+                    "time_in_minutes", "operating_cost", "sequence", "description"
+                ).insert(P(), P(), P(), P(), P(), P(), P(), P()))
                 conn.execute(
-                    """INSERT INTO bom_operation
-                       (id, bom_id, operation_id, workstation_id,
-                        time_in_minutes, operating_cost, sequence, description)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    bo_ins_q2.get_sql(),
                     (str(uuid.uuid4()), args.bom_id, op_id_ref, ws_id,
                      op.get("time_in_minutes", "0"),
                      str(round_currency(op_cost)),
@@ -682,10 +714,8 @@ def update_bom(conn, args):
             updates.append("with_operations = 1")
             # Calculate new operating cost
             new_operating_cost = Decimal("0")
-            op_rows = conn.execute(
-                "SELECT operating_cost FROM bom_operation WHERE bom_id = ?",
-                (args.bom_id,),
-            ).fetchall()
+            bo_cost_q = Q.from_(bo_t2).select(bo_t2.operating_cost).where(bo_t2.bom_id == P())
+            op_rows = conn.execute(bo_cost_q.get_sql(), (args.bom_id,)).fetchall()
             for op_row in op_rows:
                 new_operating_cost += to_decimal(op_row["operating_cost"])
             new_operating_cost = round_currency(new_operating_cost)
@@ -717,6 +747,7 @@ def update_bom(conn, args):
     if not updated_fields:
         err("No fields to update")
 
+    # raw SQL — dynamic column list built at runtime
     updates.append("updated_at = datetime('now')")
     params.append(args.bom_id)
     conn.execute(
@@ -728,9 +759,9 @@ def update_bom(conn, args):
     conn.commit()
 
     # Fetch updated BOM for response
-    updated_bom = conn.execute(
-        "SELECT * FROM bom WHERE id = ?", (args.bom_id,),
-    ).fetchone()
+    bom_t4 = Table("bom")
+    upd_bom_q = Q.from_(bom_t4).select(bom_t4.star).where(bom_t4.id == P())
+    updated_bom = conn.execute(upd_bom_q.get_sql(), (args.bom_id,)).fetchone()
     updated_dict = row_to_dict(updated_bom)
 
     ok({
@@ -755,17 +786,18 @@ def get_bom(conn, args):
     if not args.bom_id:
         err("--bom-id is required")
 
-    bom = conn.execute("SELECT * FROM bom WHERE id = ?", (args.bom_id,)).fetchone()
+    bom_t = Table("bom")
+    bom_q = Q.from_(bom_t).select(bom_t.star).where(bom_t.id == P())
+    bom = conn.execute(bom_q.get_sql(), (args.bom_id,)).fetchone()
     if not bom:
         err(f"BOM {args.bom_id} not found")
 
     data = row_to_dict(bom)
 
     # Fetch finished goods item details
-    fg_item = conn.execute(
-        "SELECT item_code, item_name, stock_uom FROM item WHERE id = ?",
-        (data["item_id"],),
-    ).fetchone()
+    item_t = Table("item")
+    fg_q = Q.from_(item_t).select(item_t.item_code, item_t.item_name, item_t.stock_uom).where(item_t.id == P())
+    fg_item = conn.execute(fg_q.get_sql(), (data["item_id"],)).fetchone()
     if fg_item:
         fg_dict = row_to_dict(fg_item)
         data["item_code"] = fg_dict.get("item_code")
@@ -773,28 +805,30 @@ def get_bom(conn, args):
         data["stock_uom"] = fg_dict.get("stock_uom")
 
     # Fetch BOM items with item details
-    items = conn.execute(
-        """SELECT bi.*, i.item_code, i.item_name, i.stock_uom AS item_uom
-           FROM bom_item bi
-           LEFT JOIN item i ON i.id = bi.item_id
-           WHERE bi.bom_id = ?
-           ORDER BY bi.rowid""",
-        (args.bom_id,),
-    ).fetchall()
+    bi = Table("bom_item").as_("bi")
+    i = Table("item").as_("i")
+    bi_q = (Q.from_(bi)
+            .left_join(i).on(i.id == bi.item_id)
+            .select(bi.star, i.item_code, i.item_name, i.field("stock_uom").as_("item_uom"))
+            .where(bi.bom_id == P())
+            .orderby(bi.rowid))
+    items = conn.execute(bi_q.get_sql(), (args.bom_id,)).fetchall()
     data["items"] = [row_to_dict(r) for r in items]
 
     # Fetch BOM operations with operation and workstation details
-    operations = conn.execute(
-        """SELECT bo.*, o.name AS operation_name,
-                  w.name AS workstation_name,
-                  w.operating_cost_per_hour AS ws_hour_rate
-           FROM bom_operation bo
-           LEFT JOIN operation o ON o.id = bo.operation_id
-           LEFT JOIN workstation w ON w.id = bo.workstation_id
-           WHERE bo.bom_id = ?
-           ORDER BY bo.sequence, bo.rowid""",
-        (args.bom_id,),
-    ).fetchall()
+    bo = Table("bom_operation").as_("bo")
+    o = Table("operation").as_("o")
+    w = Table("workstation").as_("w")
+    bo_q = (Q.from_(bo)
+            .left_join(o).on(o.id == bo.operation_id)
+            .left_join(w).on(w.id == bo.workstation_id)
+            .select(bo.star,
+                    o.name.as_("operation_name"),
+                    w.name.as_("workstation_name"),
+                    w.operating_cost_per_hour.as_("ws_hour_rate"))
+            .where(bo.bom_id == P())
+            .orderby(bo.sequence, bo.rowid))
+    operations = conn.execute(bo_q.get_sql(), (args.bom_id,)).fetchall()
     data["operations"] = [row_to_dict(r) for r in operations]
 
     ok(data)
@@ -810,53 +844,67 @@ def list_boms(conn, args):
     Optional: --item-id, --is-active, --company-id, --is-default,
               --search, --limit (20), --offset (0)
     """
-    conditions = ["1=1"]
-    params = []
+    b = Table("bom").as_("b")
+    i = Table("item").as_("i")
+
+    # Build count query
+    count_q = Q.from_(b).left_join(i).on(i.id == b.item_id).select(fn.Count("*"))
+    count_params = []
 
     if args.item_id:
-        conditions.append("b.item_id = ?")
-        params.append(args.item_id)
+        count_q = count_q.where(b.item_id == P())
+        count_params.append(args.item_id)
     if args.is_active is not None:
-        conditions.append("b.is_active = ?")
-        params.append(int(args.is_active))
+        count_q = count_q.where(b.is_active == P())
+        count_params.append(int(args.is_active))
     if args.company_id:
-        conditions.append("b.company_id = ?")
-        params.append(args.company_id)
+        count_q = count_q.where(b.company_id == P())
+        count_params.append(args.company_id)
     if args.is_default is not None:
-        conditions.append("b.is_default = ?")
-        params.append(int(args.is_default))
+        count_q = count_q.where(b.is_default == P())
+        count_params.append(int(args.is_default))
     if args.search:
-        conditions.append(
-            "(i.item_name LIKE ? OR i.item_code LIKE ? OR b.naming_series LIKE ?)"
+        count_q = count_q.where(
+            (i.item_name.like(P())) | (i.item_code.like(P())) | (b.naming_series.like(P()))
         )
-        params.extend([f"%{args.search}%", f"%{args.search}%", f"%{args.search}%"])
+        count_params.extend([f"%{args.search}%", f"%{args.search}%", f"%{args.search}%"])
 
-    where = " AND ".join(conditions)
-
-    count_row = conn.execute(
-        f"""SELECT COUNT(*) FROM bom b
-            LEFT JOIN item i ON i.id = b.item_id
-            WHERE {where}""",
-        params,
-    ).fetchone()
+    count_row = conn.execute(count_q.get_sql(), count_params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"""SELECT b.id, b.naming_series, b.item_id, b.quantity, b.is_active,
-               b.is_default, b.raw_material_cost, b.operating_cost,
-               b.total_cost, b.with_operations, b.company_id,
-               i.item_code, i.item_name
-           FROM bom b
-           LEFT JOIN item i ON i.id = b.item_id
-           WHERE {where}
-           ORDER BY b.created_at DESC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    # Build rows query
+    rows_q = (Q.from_(b).left_join(i).on(i.id == b.item_id)
+              .select(b.id, b.naming_series, b.item_id, b.quantity, b.is_active,
+                      b.is_default, b.raw_material_cost, b.operating_cost,
+                      b.total_cost, b.with_operations, b.company_id,
+                      i.item_code, i.item_name)
+              .orderby(b.created_at, order=Order.desc)
+              .limit(P()).offset(P()))
+
+    row_params = []
+    if args.item_id:
+        rows_q = rows_q.where(b.item_id == P())
+        row_params.append(args.item_id)
+    if args.is_active is not None:
+        rows_q = rows_q.where(b.is_active == P())
+        row_params.append(int(args.is_active))
+    if args.company_id:
+        rows_q = rows_q.where(b.company_id == P())
+        row_params.append(args.company_id)
+    if args.is_default is not None:
+        rows_q = rows_q.where(b.is_default == P())
+        row_params.append(int(args.is_default))
+    if args.search:
+        rows_q = rows_q.where(
+            (i.item_name.like(P())) | (i.item_code.like(P())) | (b.naming_series.like(P()))
+        )
+        row_params.extend([f"%{args.search}%", f"%{args.search}%", f"%{args.search}%"])
+    row_params.extend([limit, offset])
+
+    rows = conn.execute(rows_q.get_sql(), row_params).fetchall()
 
     ok({"boms": [row_to_dict(r) for r in rows], "total_count": total_count,
          "limit": limit, "offset": offset, "has_more": offset + limit < total_count})
@@ -912,9 +960,9 @@ def explode_bom(conn, args):
         visited.add(bom_id)
 
         # Fetch the BOM header for its quantity (yield per BOM)
-        current_bom = conn.execute(
-            "SELECT quantity FROM bom WHERE id = ?", (bom_id,),
-        ).fetchone()
+        bom_hdr_t = Table("bom")
+        bom_hdr_q = Q.from_(bom_hdr_t).select(bom_hdr_t.quantity).where(bom_hdr_t.id == P())
+        current_bom = conn.execute(bom_hdr_q.get_sql(), (bom_id,)).fetchone()
         if not current_bom:
             err(f"BOM {bom_id} not found during explosion")
 
@@ -923,13 +971,13 @@ def explode_bom(conn, args):
             err(f"BOM {bom_id} has invalid quantity: {bom_base_qty}")
 
         # Fetch BOM items
-        bom_items = conn.execute(
-            """SELECT bi.*, i.item_code, i.item_name, i.stock_uom
-               FROM bom_item bi
-               LEFT JOIN item i ON i.id = bi.item_id
-               WHERE bi.bom_id = ?""",
-            (bom_id,),
-        ).fetchall()
+        bi_t = Table("bom_item").as_("bi")
+        it_t = Table("item").as_("i")
+        bi_exp_q = (Q.from_(bi_t)
+                    .left_join(it_t).on(it_t.id == bi_t.item_id)
+                    .select(bi_t.star, it_t.item_code, it_t.item_name, it_t.stock_uom)
+                    .where(bi_t.bom_id == P()))
+        bom_items = conn.execute(bi_exp_q.get_sql(), (bom_id,)).fetchall()
 
         for bi_row in bom_items:
             bi = row_to_dict(bi_row)
@@ -1009,9 +1057,9 @@ def add_operation(conn, args):
         err("--name is required")
 
     # Check uniqueness
-    existing = conn.execute(
-        "SELECT id FROM operation WHERE name = ?", (args.name,),
-    ).fetchone()
+    op_t = Table("operation")
+    op_chk_q = Q.from_(op_t).select(op_t.id).where(op_t.name == P())
+    existing = conn.execute(op_chk_q.get_sql(), (args.name,)).fetchone()
     if existing:
         err(f"Operation '{args.name}' already exists")
 
@@ -1021,13 +1069,11 @@ def add_operation(conn, args):
         _validate_workstation_exists(conn, ws_id)
 
     op_id = str(uuid.uuid4())
+    op_ins_q = (Q.into(op_t).columns(
+        "id", "name", "description", "default_workstation_id", "is_active"
+    ).insert(P(), P(), P(), P(), 1))
     try:
-        conn.execute(
-            """INSERT INTO operation
-               (id, name, description, default_workstation_id, is_active)
-               VALUES (?, ?, ?, ?, 1)""",
-            (op_id, args.name, args.description, ws_id),
-        )
+        conn.execute(op_ins_q.get_sql(), (op_id, args.name, args.description, ws_id))
     except sqlite3.IntegrityError as e:
         sys.stderr.write(f"[erpclaw-manufacturing] {e}\n")
         err("Operation creation failed — check for duplicates or invalid data")
@@ -1053,9 +1099,9 @@ def add_workstation(conn, args):
     if not args.name:
         err("--name is required")
 
-    existing = conn.execute(
-        "SELECT id FROM workstation WHERE name = ?", (args.name,),
-    ).fetchone()
+    ws_t = Table("workstation")
+    ws_chk_q = Q.from_(ws_t).select(ws_t.id).where(ws_t.name == P())
+    existing = conn.execute(ws_chk_q.get_sql(), (args.name,)).fetchone()
     if existing:
         err(f"Workstation '{args.name}' already exists")
 
@@ -1064,21 +1110,21 @@ def add_workstation(conn, args):
 
     # Validate holiday list if provided
     if args.holiday_list_id:
-        hl = conn.execute(
-            "SELECT id FROM holiday_list WHERE id = ?",
-            (args.holiday_list_id,),
-        ).fetchone()
+        hl_t = Table("holiday_list")
+        hl_q = Q.from_(hl_t).select(hl_t.id).where(hl_t.id == P())
+        hl = conn.execute(hl_q.get_sql(), (args.holiday_list_id,)).fetchone()
         if not hl:
             err(f"Holiday list {args.holiday_list_id} not found")
 
     ws_id = str(uuid.uuid4())
+    ws_ins_q = (Q.into(ws_t).columns(
+        "id", "name", "workstation_type", "production_capacity",
+        "operating_cost_per_hour", "working_hours_per_day",
+        "holiday_list_id", "status", "description"
+    ).insert(P(), P(), P(), P(), P(), P(), P(), ValueWrapper("active"), P()))
     try:
         conn.execute(
-            """INSERT INTO workstation
-               (id, name, workstation_type, production_capacity,
-                operating_cost_per_hour, working_hours_per_day,
-                holiday_list_id, status, description)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
+            ws_ins_q.get_sql(),
             (ws_id, args.name, args.workstation_type,
              args.production_capacity, hour_rate,
              working_hours, args.holiday_list_id,
@@ -1121,9 +1167,9 @@ def add_routing(conn, args):
     if not args.operations:
         err("--operations (JSON) is required")
 
-    existing = conn.execute(
-        "SELECT id FROM routing WHERE name = ?", (args.name,),
-    ).fetchone()
+    rt_t = Table("routing")
+    rt_chk_q = Q.from_(rt_t).select(rt_t.id).where(rt_t.name == P())
+    existing = conn.execute(rt_chk_q.get_sql(), (args.name,)).fetchone()
     if existing:
         err(f"Routing '{args.name}' already exists")
 
@@ -1133,11 +1179,9 @@ def add_routing(conn, args):
 
     routing_id = str(uuid.uuid4())
 
+    rt_ins_q = Q.into(rt_t).columns("id", "name", "description").insert(P(), P(), P())
     try:
-        conn.execute(
-            "INSERT INTO routing (id, name, description) VALUES (?, ?, ?)",
-            (routing_id, args.name, args.description),
-        )
+        conn.execute(rt_ins_q.get_sql(), (routing_id, args.name, args.description))
     except sqlite3.IntegrityError as e:
         sys.stderr.write(f"[erpclaw-manufacturing] {e}\n")
         err("Routing creation failed — check for duplicates or invalid data")
@@ -1156,10 +1200,9 @@ def add_routing(conn, args):
         # Calculate operating cost if not explicitly provided
         op_cost = to_decimal(op.get("operating_cost", "0"))
         if op_cost <= 0 and ws_id:
-            ws = conn.execute(
-                "SELECT operating_cost_per_hour FROM workstation WHERE id = ?",
-                (ws_id,),
-            ).fetchone()
+            ws_t2 = Table("workstation")
+            ws_cost_q = Q.from_(ws_t2).select(ws_t2.operating_cost_per_hour).where(ws_t2.id == P())
+            ws = conn.execute(ws_cost_q.get_sql(), (ws_id,)).fetchone()
             if ws:
                 time_mins = to_decimal(op.get("time_in_minutes", "0"))
                 op_cost = round_currency(
@@ -1168,11 +1211,13 @@ def add_routing(conn, args):
                 )
 
         ro_id = str(uuid.uuid4())
+        ro_t = Table("routing_operation")
+        ro_ins_q = (Q.into(ro_t).columns(
+            "id", "routing_id", "operation_id", "workstation_id",
+            "sequence", "time_in_minutes", "operating_cost"
+        ).insert(P(), P(), P(), P(), P(), P(), P()))
         conn.execute(
-            """INSERT INTO routing_operation
-               (id, routing_id, operation_id, workstation_id,
-                sequence, time_in_minutes, operating_cost)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ro_ins_q.get_sql(),
             (ro_id, routing_id, op_id_ref, ws_id,
              op.get("sequence", i + 1),
              op.get("time_in_minutes", "0"),
@@ -1239,15 +1284,18 @@ def add_work_order(conn, args):
     naming = get_next_name(conn, "work_order", company_id=args.company_id)
 
     wo_id = str(uuid.uuid4())
+    wo_t = Table("work_order")
+    wo_ins_q = (Q.into(wo_t).columns(
+        "id", "naming_series", "item_id", "bom_id", "qty", "produced_qty",
+        "planned_start_date", "planned_end_date",
+        "source_warehouse_id", "target_warehouse_id", "wip_warehouse_id",
+        "sales_order_id", "status", "material_transferred_for_manufacturing",
+        "company_id"
+    ).insert(P(), P(), P(), P(), P(), ValueWrapper("0"), P(), P(), P(), P(), P(),
+             P(), ValueWrapper("draft"), ValueWrapper("0"), P()))
     try:
         conn.execute(
-            """INSERT INTO work_order
-               (id, naming_series, item_id, bom_id, qty, produced_qty,
-                planned_start_date, planned_end_date,
-                source_warehouse_id, target_warehouse_id, wip_warehouse_id,
-                sales_order_id, status, material_transferred_for_manufacturing,
-                company_id)
-               VALUES (?, ?, ?, ?, ?, '0', ?, ?, ?, ?, ?, ?, 'draft', '0', ?)""",
+            wo_ins_q.get_sql(),
             (wo_id, naming, fg_item_id, args.bom_id, str(round_currency(qty)),
              args.planned_start_date, args.planned_end_date,
              source_wh, target_wh, wip_wh,
@@ -1262,12 +1310,18 @@ def add_work_order(conn, args):
     if bom_qty <= 0:
         bom_qty = Decimal("1")
 
-    bom_items = conn.execute(
-        """SELECT bi.item_id, bi.quantity, bi.source_warehouse_id
-           FROM bom_item bi WHERE bi.bom_id = ?""",
-        (args.bom_id,),
-    ).fetchall()
+    bi_t2 = Table("bom_item").as_("bi")
+    bi_fetch_q = (Q.from_(bi_t2)
+                  .select(bi_t2.item_id, bi_t2.quantity, bi_t2.source_warehouse_id)
+                  .where(bi_t2.bom_id == P()))
+    bom_items = conn.execute(bi_fetch_q.get_sql(), (args.bom_id,)).fetchall()
 
+    woi_t = Table("work_order_item")
+    woi_ins_q = (Q.into(woi_t).columns(
+        "id", "work_order_id", "item_id", "required_qty", "transferred_qty",
+        "consumed_qty", "source_warehouse_id"
+    ).insert(P(), P(), P(), P(), ValueWrapper("0"), ValueWrapper("0"), P()))
+    woi_ins_sql = woi_ins_q.get_sql()
     for bi_row in bom_items:
         bi = row_to_dict(bi_row)
         bi_qty = to_decimal(bi["quantity"])
@@ -1275,10 +1329,7 @@ def add_work_order(conn, args):
         woi_source_wh = bi.get("source_warehouse_id") or source_wh
 
         conn.execute(
-            """INSERT INTO work_order_item
-               (id, work_order_id, item_id, required_qty, transferred_qty,
-                consumed_qty, source_warehouse_id)
-               VALUES (?, ?, ?, ?, '0', '0', ?)""",
+            woi_ins_sql,
             (str(uuid.uuid4()), wo_id, bi["item_id"],
              str(required_qty), woi_source_wh),
         )
@@ -1314,53 +1365,52 @@ def get_work_order(conn, args):
     if not args.work_order_id:
         err("--work-order-id is required")
 
-    wo = conn.execute(
-        "SELECT * FROM work_order WHERE id = ?", (args.work_order_id,),
-    ).fetchone()
+    wo_t = Table("work_order")
+    wo_q = Q.from_(wo_t).select(wo_t.star).where(wo_t.id == P())
+    wo = conn.execute(wo_q.get_sql(), (args.work_order_id,)).fetchone()
     if not wo:
         err(f"Work Order {args.work_order_id} not found")
 
     data = row_to_dict(wo)
 
     # Fetch item name for the finished good
-    fg_item = conn.execute(
-        "SELECT item_code, item_name FROM item WHERE id = ?",
-        (data["item_id"],),
-    ).fetchone()
+    item_t = Table("item")
+    fg_q = Q.from_(item_t).select(item_t.item_code, item_t.item_name).where(item_t.id == P())
+    fg_item = conn.execute(fg_q.get_sql(), (data["item_id"],)).fetchone()
     if fg_item:
         fg_dict = row_to_dict(fg_item)
         data["item_code"] = fg_dict.get("item_code")
         data["item_name"] = fg_dict.get("item_name")
 
     # Fetch BOM naming_series
-    bom_row = conn.execute(
-        "SELECT naming_series FROM bom WHERE id = ?", (data["bom_id"],),
-    ).fetchone()
+    bom_t = Table("bom")
+    bom_ns_q = Q.from_(bom_t).select(bom_t.naming_series).where(bom_t.id == P())
+    bom_row = conn.execute(bom_ns_q.get_sql(), (data["bom_id"],)).fetchone()
     if bom_row:
         data["bom_naming_series"] = bom_row["naming_series"]
 
     # Fetch work order items with item details
-    items = conn.execute(
-        """SELECT woi.*, i.item_code, i.item_name, i.stock_uom
-           FROM work_order_item woi
-           LEFT JOIN item i ON i.id = woi.item_id
-           WHERE woi.work_order_id = ?
-           ORDER BY woi.rowid""",
-        (args.work_order_id,),
-    ).fetchall()
+    woi = Table("work_order_item").as_("woi")
+    i = Table("item").as_("i")
+    woi_q = (Q.from_(woi)
+             .left_join(i).on(i.id == woi.item_id)
+             .select(woi.star, i.item_code, i.item_name, i.stock_uom)
+             .where(woi.work_order_id == P())
+             .orderby(woi.rowid))
+    items = conn.execute(woi_q.get_sql(), (args.work_order_id,)).fetchall()
     data["items"] = [row_to_dict(r) for r in items]
 
     # Fetch job cards
-    job_cards = conn.execute(
-        """SELECT jc.*, o.name AS operation_name,
-                  w.name AS workstation_name
-           FROM job_card jc
-           LEFT JOIN operation o ON o.id = jc.operation_id
-           LEFT JOIN workstation w ON w.id = jc.workstation_id
-           WHERE jc.work_order_id = ?
-           ORDER BY jc.created_at""",
-        (args.work_order_id,),
-    ).fetchall()
+    jc = Table("job_card").as_("jc")
+    o = Table("operation").as_("o")
+    w = Table("workstation").as_("w")
+    jc_q = (Q.from_(jc)
+            .left_join(o).on(o.id == jc.operation_id)
+            .left_join(w).on(w.id == jc.workstation_id)
+            .select(jc.star, o.name.as_("operation_name"), w.name.as_("workstation_name"))
+            .where(jc.work_order_id == P())
+            .orderby(jc.created_at))
+    job_cards = conn.execute(jc_q.get_sql(), (args.work_order_id,)).fetchall()
     data["job_cards"] = [row_to_dict(r) for r in job_cards]
 
     ok(data)
@@ -1376,54 +1426,64 @@ def list_work_orders(conn, args):
     Optional: --company-id, --status, --from-date, --to-date, --item-id,
               --limit (20), --offset (0)
     """
-    conditions = ["1=1"]
-    params = []
+    wo = Table("work_order").as_("wo")
+    i = Table("item").as_("i")
+
+    count_q = Q.from_(wo).left_join(i).on(i.id == wo.item_id).select(fn.Count("*"))
+    count_params = []
 
     if args.company_id:
-        conditions.append("wo.company_id = ?")
-        params.append(args.company_id)
+        count_q = count_q.where(wo.company_id == P())
+        count_params.append(args.company_id)
     if args.status:
         if args.status not in VALID_WO_STATUSES:
             err(f"Invalid status '{args.status}'. Valid: {VALID_WO_STATUSES}")
-        conditions.append("wo.status = ?")
-        params.append(args.status)
+        count_q = count_q.where(wo.status == P())
+        count_params.append(args.status)
     if args.from_date:
-        conditions.append("wo.created_at >= ?")
-        params.append(args.from_date)
+        count_q = count_q.where(wo.created_at >= P())
+        count_params.append(args.from_date)
     if args.to_date:
-        conditions.append("wo.created_at <= ?")
-        params.append(args.to_date + " 23:59:59")
+        count_q = count_q.where(wo.created_at <= P())
+        count_params.append(args.to_date + " 23:59:59")
     if args.item_id:
-        conditions.append("wo.item_id = ?")
-        params.append(args.item_id)
+        count_q = count_q.where(wo.item_id == P())
+        count_params.append(args.item_id)
 
-    where = " AND ".join(conditions)
-
-    count_row = conn.execute(
-        f"""SELECT COUNT(*) FROM work_order wo
-            LEFT JOIN item i ON i.id = wo.item_id
-            WHERE {where}""",
-        params,
-    ).fetchone()
+    count_row = conn.execute(count_q.get_sql(), count_params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"""SELECT wo.id, wo.naming_series, wo.item_id, wo.bom_id,
-               wo.qty, wo.produced_qty, wo.status, wo.company_id,
-               wo.planned_start_date, wo.actual_start_date,
-               wo.actual_end_date, wo.material_transferred_for_manufacturing,
-               i.item_code, i.item_name
-           FROM work_order wo
-           LEFT JOIN item i ON i.id = wo.item_id
-           WHERE {where}
-           ORDER BY wo.created_at DESC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    rows_q = (Q.from_(wo).left_join(i).on(i.id == wo.item_id)
+              .select(wo.id, wo.naming_series, wo.item_id, wo.bom_id,
+                      wo.qty, wo.produced_qty, wo.status, wo.company_id,
+                      wo.planned_start_date, wo.actual_start_date,
+                      wo.actual_end_date, wo.material_transferred_for_manufacturing,
+                      i.item_code, i.item_name)
+              .orderby(wo.created_at, order=Order.desc)
+              .limit(P()).offset(P()))
+
+    row_params = []
+    if args.company_id:
+        rows_q = rows_q.where(wo.company_id == P())
+        row_params.append(args.company_id)
+    if args.status:
+        rows_q = rows_q.where(wo.status == P())
+        row_params.append(args.status)
+    if args.from_date:
+        rows_q = rows_q.where(wo.created_at >= P())
+        row_params.append(args.from_date)
+    if args.to_date:
+        rows_q = rows_q.where(wo.created_at <= P())
+        row_params.append(args.to_date + " 23:59:59")
+    if args.item_id:
+        rows_q = rows_q.where(wo.item_id == P())
+        row_params.append(args.item_id)
+    row_params.extend([limit, offset])
+
+    rows = conn.execute(rows_q.get_sql(), row_params).fetchall()
 
     ok({"work_orders": [row_to_dict(r) for r in rows], "total_count": total_count,
          "limit": limit, "offset": offset, "has_more": offset + limit < total_count})
@@ -1441,9 +1501,9 @@ def start_work_order(conn, args):
     if not args.work_order_id:
         err("--work-order-id is required")
 
-    wo = conn.execute(
-        "SELECT * FROM work_order WHERE id = ?", (args.work_order_id,),
-    ).fetchone()
+    wo_t = Table("work_order")
+    wo_q = Q.from_(wo_t).select(wo_t.star).where(wo_t.id == P())
+    wo = conn.execute(wo_q.get_sql(), (args.work_order_id,)).fetchone()
     if not wo:
         err(f"Work Order {args.work_order_id} not found")
 
@@ -1455,12 +1515,12 @@ def start_work_order(conn, args):
         )
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    conn.execute(
-        """UPDATE work_order
-           SET status = 'not_started', actual_start_date = ?, updated_at = datetime('now')
-           WHERE id = ?""",
-        (now_str, args.work_order_id),
-    )
+    wo_start_q = (Q.update(wo_t)
+                  .set(wo_t.status, ValueWrapper("not_started"))
+                  .set(wo_t.actual_start_date, P())
+                  .set(wo_t.updated_at, LiteralValue("datetime('now')"))
+                  .where(wo_t.id == P()))
+    conn.execute(wo_start_q.get_sql(), (now_str, args.work_order_id))
 
     audit(conn, "erpclaw-manufacturing", "start-work-order", "work_order", args.work_order_id,
            old_values={"status": "draft"},
@@ -1497,9 +1557,9 @@ def transfer_materials(conn, args):
         err("--items must be a non-empty JSON array")
 
     # Validate work order
-    wo = conn.execute(
-        "SELECT * FROM work_order WHERE id = ?", (args.work_order_id,),
-    ).fetchone()
+    wo_t = Table("work_order")
+    wo_q = Q.from_(wo_t).select(wo_t.star).where(wo_t.id == P())
+    wo = conn.execute(wo_q.get_sql(), (args.work_order_id,)).fetchone()
     if not wo:
         err(f"Work Order {args.work_order_id} not found")
 
@@ -1523,10 +1583,9 @@ def transfer_materials(conn, args):
     cost_center_id = _get_cost_center(conn, company_id)
 
     # Fetch work order items for validation
-    wo_items = conn.execute(
-        "SELECT * FROM work_order_item WHERE work_order_id = ?",
-        (args.work_order_id,),
-    ).fetchall()
+    woi_t = Table("work_order_item")
+    woi_q = Q.from_(woi_t).select(woi_t.star).where(woi_t.work_order_id == P())
+    wo_items = conn.execute(woi_q.get_sql(), (args.work_order_id,)).fetchall()
     wo_item_map = {}
     for woi_row in wo_items:
         woi = row_to_dict(woi_row)
@@ -1608,12 +1667,12 @@ def transfer_materials(conn, args):
         err(f"SLE posting failed: {e}")
 
     # Fetch inserted SLE rows for GL generation
-    sle_rows = conn.execute(
-        """SELECT * FROM stock_ledger_entry
-           WHERE voucher_type = 'work_order' AND voucher_id = ?
-           AND is_cancelled = 0""",
-        (args.work_order_id,),
-    ).fetchall()
+    sle_t = Table("stock_ledger_entry")
+    sle_q = (Q.from_(sle_t).select(sle_t.star)
+             .where(sle_t.voucher_type == ValueWrapper("work_order"))
+             .where(sle_t.voucher_id == P())
+             .where(sle_t.is_cancelled == 0))
+    sle_rows = conn.execute(sle_q.get_sql(), (args.work_order_id,)).fetchall()
     sle_dicts = [row_to_dict(r) for r in sle_rows]
 
     # Create perpetual inventory GL entries
@@ -1645,6 +1704,7 @@ def transfer_materials(conn, args):
             err(f"GL posting failed: {e}")
 
     # Update work_order_item transferred_qty
+    # raw SQL — CAST expression not well supported by PyPika
     total_material_transferred = Decimal("0")
     for item_id, transfer_qty in transfer_updates:
         conn.execute(
@@ -1659,20 +1719,19 @@ def transfer_materials(conn, args):
     # Update work_order.material_transferred_for_manufacturing
     current_transferred = to_decimal(wo_dict["material_transferred_for_manufacturing"])
     new_transferred = round_currency(current_transferred + total_material_transferred)
-    conn.execute(
-        """UPDATE work_order
-           SET material_transferred_for_manufacturing = ?,
-               updated_at = datetime('now')
-           WHERE id = ?""",
-        (str(new_transferred), args.work_order_id),
-    )
+    wo_upd_q = (Q.update(wo_t)
+                .set(wo_t.material_transferred_for_manufacturing, P())
+                .set(wo_t.updated_at, LiteralValue("datetime('now')"))
+                .where(wo_t.id == P()))
+    conn.execute(wo_upd_q.get_sql(), (str(new_transferred), args.work_order_id))
 
     # Transition to in_process if currently not_started
     if wo_dict["status"] == "not_started":
-        conn.execute(
-            "UPDATE work_order SET status = 'in_process', updated_at = datetime('now') WHERE id = ?",
-            (args.work_order_id,),
-        )
+        wo_status_q = (Q.update(wo_t)
+                       .set(wo_t.status, ValueWrapper("in_process"))
+                       .set(wo_t.updated_at, LiteralValue("datetime('now')"))
+                       .where(wo_t.id == P()))
+        conn.execute(wo_status_q.get_sql(), (args.work_order_id,))
 
     audit(conn, "erpclaw-manufacturing", "transfer-materials", "work_order", args.work_order_id,
            new_values={
@@ -1706,9 +1765,9 @@ def create_job_card(conn, args):
         err("--operation-id is required")
 
     # Validate work order
-    wo = conn.execute(
-        "SELECT * FROM work_order WHERE id = ?", (args.work_order_id,),
-    ).fetchone()
+    wo_t = Table("work_order")
+    wo_q = Q.from_(wo_t).select(wo_t.star).where(wo_t.id == P())
+    wo = conn.execute(wo_q.get_sql(), (args.work_order_id,)).fetchone()
     if not wo:
         err(f"Work Order {args.work_order_id} not found")
 
@@ -1739,12 +1798,14 @@ def create_job_card(conn, args):
     naming = get_next_name(conn, "job_card", company_id=wo_dict["company_id"])
 
     jc_id = str(uuid.uuid4())
+    jc_t = Table("job_card")
+    jc_ins_q = (Q.into(jc_t).columns(
+        "id", "naming_series", "work_order_id", "operation_id", "workstation_id",
+        "for_quantity", "completed_qty", "total_time_in_minutes", "status"
+    ).insert(P(), P(), P(), P(), P(), P(), ValueWrapper("0"), ValueWrapper("0"), ValueWrapper("open")))
     try:
         conn.execute(
-            """INSERT INTO job_card
-               (id, naming_series, work_order_id, operation_id, workstation_id,
-                for_quantity, completed_qty, total_time_in_minutes, status)
-               VALUES (?, ?, ?, ?, ?, ?, '0', '0', 'open')""",
+            jc_ins_q.get_sql(),
             (jc_id, naming, args.work_order_id, args.operation_id,
              ws_id, for_qty),
         )
@@ -1787,9 +1848,9 @@ def complete_job_card(conn, args):
     if not args.actual_time_in_mins:
         err("--actual-time-in-mins is required")
 
-    jc = conn.execute(
-        "SELECT * FROM job_card WHERE id = ?", (args.job_card_id,),
-    ).fetchone()
+    jc_t = Table("job_card")
+    jc_q = Q.from_(jc_t).select(jc_t.star).where(jc_t.id == P())
+    jc = conn.execute(jc_q.get_sql(), (args.job_card_id,)).fetchone()
     if not jc:
         err(f"Job Card {args.job_card_id} not found")
 
@@ -1815,22 +1876,22 @@ def complete_job_card(conn, args):
         updates["completed_qty"] = completed_qty
 
     if completed_qty:
-        conn.execute(
-            """UPDATE job_card
-               SET status = 'completed', total_time_in_minutes = ?,
-                   time_completed = ?, completed_qty = ?,
-                   updated_at = datetime('now')
-               WHERE id = ?""",
-            (time_mins, now_str, completed_qty, args.job_card_id),
-        )
+        jc_upd_q = (Q.update(jc_t)
+                    .set(jc_t.status, ValueWrapper("completed"))
+                    .set(jc_t.total_time_in_minutes, P())
+                    .set(jc_t.time_completed, P())
+                    .set(jc_t.completed_qty, P())
+                    .set(jc_t.updated_at, LiteralValue("datetime('now')"))
+                    .where(jc_t.id == P()))
+        conn.execute(jc_upd_q.get_sql(), (time_mins, now_str, completed_qty, args.job_card_id))
     else:
-        conn.execute(
-            """UPDATE job_card
-               SET status = 'completed', total_time_in_minutes = ?,
-                   time_completed = ?, updated_at = datetime('now')
-               WHERE id = ?""",
-            (time_mins, now_str, args.job_card_id),
-        )
+        jc_upd_q = (Q.update(jc_t)
+                    .set(jc_t.status, ValueWrapper("completed"))
+                    .set(jc_t.total_time_in_minutes, P())
+                    .set(jc_t.time_completed, P())
+                    .set(jc_t.updated_at, LiteralValue("datetime('now')"))
+                    .where(jc_t.id == P()))
+        conn.execute(jc_upd_q.get_sql(), (time_mins, now_str, args.job_card_id))
 
     audit(conn, "erpclaw-manufacturing", "complete-job-card", "job_card", args.job_card_id,
            old_values={"status": jc_dict["status"]},
@@ -1862,9 +1923,9 @@ def complete_work_order(conn, args):
     if not args.work_order_id:
         err("--work-order-id is required")
 
-    wo = conn.execute(
-        "SELECT * FROM work_order WHERE id = ?", (args.work_order_id,),
-    ).fetchone()
+    wo_t = Table("work_order")
+    wo_q = Q.from_(wo_t).select(wo_t.star).where(wo_t.id == P())
+    wo = conn.execute(wo_q.get_sql(), (args.work_order_id,)).fetchone()
     if not wo:
         err(f"Work Order {args.work_order_id} not found")
 
@@ -1894,10 +1955,9 @@ def complete_work_order(conn, args):
     # --- Calculate production cost ---
 
     # 1. Raw Material cost: sum of (transferred_qty * valuation_rate) per WO item
-    wo_items = conn.execute(
-        "SELECT * FROM work_order_item WHERE work_order_id = ?",
-        (args.work_order_id,),
-    ).fetchall()
+    woi_t = Table("work_order_item")
+    woi_q = Q.from_(woi_t).select(woi_t.star).where(woi_t.work_order_id == P())
+    wo_items = conn.execute(woi_q.get_sql(), (args.work_order_id,)).fetchall()
 
     rm_cost = Decimal("0")
     for woi_row in wo_items:
@@ -1915,23 +1975,23 @@ def complete_work_order(conn, args):
     rm_cost = round_currency(rm_cost)
 
     # 2. Operating cost: sum from completed job cards
-    job_cards = conn.execute(
-        """SELECT jc.total_time_in_minutes, jc.workstation_id
-           FROM job_card jc
-           WHERE jc.work_order_id = ? AND jc.status = 'completed'""",
-        (args.work_order_id,),
-    ).fetchall()
+    jc_t = Table("job_card").as_("jc")
+    jc_cost_q = (Q.from_(jc_t)
+                 .select(jc_t.total_time_in_minutes, jc_t.workstation_id)
+                 .where(jc_t.work_order_id == P())
+                 .where(jc_t.status == ValueWrapper("completed")))
+    job_cards = conn.execute(jc_cost_q.get_sql(), (args.work_order_id,)).fetchall()
 
+    ws_t2 = Table("workstation")
+    ws_cost_q = Q.from_(ws_t2).select(ws_t2.operating_cost_per_hour).where(ws_t2.id == P())
+    ws_cost_sql = ws_cost_q.get_sql()
     operating_cost = Decimal("0")
     for jc_row in job_cards:
         jc = row_to_dict(jc_row)
         time_mins = to_decimal(jc.get("total_time_in_minutes", "0"))
         ws_id = jc.get("workstation_id")
         if ws_id and time_mins > 0:
-            ws = conn.execute(
-                "SELECT operating_cost_per_hour FROM workstation WHERE id = ?",
-                (ws_id,),
-            ).fetchone()
+            ws = conn.execute(ws_cost_sql, (ws_id,)).fetchone()
             if ws:
                 hour_rate = to_decimal(ws["operating_cost_per_hour"])
                 operating_cost += round_currency(
@@ -1984,12 +2044,12 @@ def complete_work_order(conn, args):
         err(f"SLE posting failed: {e}")
 
     # Fetch SLE rows for GL generation
-    sle_rows = conn.execute(
-        """SELECT * FROM stock_ledger_entry
-           WHERE voucher_type = 'work_order' AND voucher_id = ?
-           AND is_cancelled = 0""",
-        (completion_voucher_id,),
-    ).fetchall()
+    sle_t = Table("stock_ledger_entry")
+    sle_q = (Q.from_(sle_t).select(sle_t.star)
+             .where(sle_t.voucher_type == ValueWrapper("work_order"))
+             .where(sle_t.voucher_id == P())
+             .where(sle_t.is_cancelled == 0))
+    sle_rows = conn.execute(sle_q.get_sql(), (completion_voucher_id,)).fetchall()
     sle_dicts = [row_to_dict(r) for r in sle_rows]
 
     # Create perpetual inventory GL entries
@@ -2021,17 +2081,21 @@ def complete_work_order(conn, args):
             err(f"GL posting failed: {e}")
 
     # Update work order
+    wo_complete_q = (Q.update(wo_t)
+                     .set(wo_t.produced_qty, P())
+                     .set(wo_t.status, ValueWrapper("completed"))
+                     .set(wo_t.actual_end_date, P())
+                     .set(wo_t.updated_at, LiteralValue("datetime('now')"))
+                     .where(wo_t.id == P()))
     conn.execute(
-        """UPDATE work_order
-           SET produced_qty = ?, status = 'completed',
-               actual_end_date = ?, updated_at = datetime('now')
-           WHERE id = ?""",
+        wo_complete_q.get_sql(),
         (str(round_currency(produced_qty)),
          datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
          args.work_order_id),
     )
 
     # Mark all work order items as fully consumed
+    # raw SQL — SET col = other_col not well supported by PyPika
     conn.execute(
         """UPDATE work_order_item
            SET consumed_qty = transferred_qty
@@ -2075,9 +2139,9 @@ def cancel_work_order(conn, args):
     if not args.work_order_id:
         err("--work-order-id is required")
 
-    wo = conn.execute(
-        "SELECT * FROM work_order WHERE id = ?", (args.work_order_id,),
-    ).fetchone()
+    wo_t = Table("work_order")
+    wo_q = Q.from_(wo_t).select(wo_t.star).where(wo_t.id == P())
+    wo = conn.execute(wo_q.get_sql(), (args.work_order_id,)).fetchone()
     if not wo:
         err(f"Work Order {args.work_order_id} not found")
 
@@ -2135,20 +2199,20 @@ def cancel_work_order(conn, args):
         pass
 
     # Set WO status to cancelled
-    conn.execute(
-        """UPDATE work_order
-           SET status = 'cancelled', updated_at = datetime('now')
-           WHERE id = ?""",
-        (args.work_order_id,),
-    )
+    wo_cancel_q = (Q.update(wo_t)
+                   .set(wo_t.status, ValueWrapper("cancelled"))
+                   .set(wo_t.updated_at, LiteralValue("datetime('now')"))
+                   .where(wo_t.id == P()))
+    conn.execute(wo_cancel_q.get_sql(), (args.work_order_id,))
 
     # Cancel all open/in_process job cards for this WO
-    conn.execute(
-        """UPDATE job_card
-           SET status = 'cancelled', updated_at = datetime('now')
-           WHERE work_order_id = ? AND status IN ('open', 'in_process')""",
-        (args.work_order_id,),
-    )
+    jc_t = Table("job_card")
+    jc_cancel_q = (Q.update(jc_t)
+                   .set(jc_t.status, ValueWrapper("cancelled"))
+                   .set(jc_t.updated_at, LiteralValue("datetime('now')"))
+                   .where(jc_t.work_order_id == P())
+                   .where(jc_t.status.isin(["open", "in_process"])))
+    conn.execute(jc_cancel_q.get_sql(), (args.work_order_id,))
 
     audit(conn, "erpclaw-manufacturing", "cancel-work-order", "work_order", args.work_order_id,
            old_values={"status": wo_dict["status"]},
@@ -2193,14 +2257,13 @@ def create_production_plan(conn, args):
     naming = get_next_name(conn, "production_plan", company_id=args.company_id)
 
     plan_id = str(uuid.uuid4())
+    pp_t = Table("production_plan")
+    pp_ins_q = (Q.into(pp_t).columns(
+        "id", "naming_series", "planning_period_start", "planning_period_end",
+        "status", "company_id"
+    ).insert(P(), P(), P(), P(), ValueWrapper("draft"), P()))
     try:
-        conn.execute(
-            """INSERT INTO production_plan
-               (id, naming_series, planning_period_start, planning_period_end,
-                status, company_id)
-               VALUES (?, ?, ?, ?, 'draft', ?)""",
-            (plan_id, naming, today, end_date, args.company_id),
-        )
+        conn.execute(pp_ins_q.get_sql(), (plan_id, naming, today, end_date, args.company_id))
     except sqlite3.IntegrityError as e:
         sys.stderr.write(f"[erpclaw-manufacturing] {e}\n")
         err("Production Plan creation failed — check for duplicates or invalid data")
@@ -2230,11 +2293,13 @@ def create_production_plan(conn, args):
         if warehouse_id:
             _validate_warehouse_exists(conn, warehouse_id, f"Plan item {i}: warehouse")
 
+        ppi_t = Table("production_plan_item")
+        ppi_ins_q = (Q.into(ppi_t).columns(
+            "id", "production_plan_id", "item_id", "bom_id", "planned_qty",
+            "produced_qty", "ordered_qty", "sales_order_id", "warehouse_id"
+        ).insert(P(), P(), P(), P(), P(), ValueWrapper("0"), ValueWrapper("0"), P(), P()))
         conn.execute(
-            """INSERT INTO production_plan_item
-               (id, production_plan_id, item_id, bom_id, planned_qty,
-                produced_qty, ordered_qty, sales_order_id, warehouse_id)
-               VALUES (?, ?, ?, ?, ?, '0', '0', ?, ?)""",
+            ppi_ins_q.get_sql(),
             (str(uuid.uuid4()), plan_id, item_id, bom_id,
              str(round_currency(qty)),
              item.get("sales_order_id"), warehouse_id),
@@ -2282,9 +2347,9 @@ def _explode_bom_for_mrp(conn, bom_id, parent_qty):
 
         visited.add(current_bom_id)
 
-        current_bom = conn.execute(
-            "SELECT quantity FROM bom WHERE id = ?", (current_bom_id,),
-        ).fetchone()
+        bom_hdr = Table("bom")
+        bom_hdr_q = Q.from_(bom_hdr).select(bom_hdr.quantity).where(bom_hdr.id == P())
+        current_bom = conn.execute(bom_hdr_q.get_sql(), (current_bom_id,)).fetchone()
         if not current_bom:
             visited.discard(current_bom_id)
             return
@@ -2293,9 +2358,9 @@ def _explode_bom_for_mrp(conn, bom_id, parent_qty):
         if bom_base_qty <= 0:
             bom_base_qty = Decimal("1")
 
-        bom_items = conn.execute(
-            "SELECT * FROM bom_item WHERE bom_id = ?", (current_bom_id,),
-        ).fetchall()
+        bi_mrp = Table("bom_item")
+        bi_mrp_q = Q.from_(bi_mrp).select(bi_mrp.star).where(bi_mrp.bom_id == P())
+        bom_items = conn.execute(bi_mrp_q.get_sql(), (current_bom_id,)).fetchall()
 
         for bi_row in bom_items:
             bi = row_to_dict(bi_row)
@@ -2343,10 +2408,9 @@ def run_mrp(conn, args):
     if not args.production_plan_id:
         err("--production-plan-id is required")
 
-    plan = conn.execute(
-        "SELECT * FROM production_plan WHERE id = ?",
-        (args.production_plan_id,),
-    ).fetchone()
+    pp_t = Table("production_plan")
+    pp_q = Q.from_(pp_t).select(pp_t.star).where(pp_t.id == P())
+    plan = conn.execute(pp_q.get_sql(), (args.production_plan_id,)).fetchone()
     if not plan:
         err(f"Production Plan {args.production_plan_id} not found")
 
@@ -2360,16 +2424,14 @@ def run_mrp(conn, args):
     company_id = plan_dict["company_id"]
 
     # Delete any existing materials from a previous MRP run
-    conn.execute(
-        "DELETE FROM production_plan_material WHERE production_plan_id = ?",
-        (args.production_plan_id,),
-    )
+    ppm_t = Table("production_plan_material")
+    del_ppm_q = Q.from_(ppm_t).delete().where(ppm_t.production_plan_id == P())
+    conn.execute(del_ppm_q.get_sql(), (args.production_plan_id,))
 
     # Fetch plan items
-    plan_items = conn.execute(
-        "SELECT * FROM production_plan_item WHERE production_plan_id = ?",
-        (args.production_plan_id,),
-    ).fetchall()
+    ppi_t = Table("production_plan_item")
+    ppi_q = Q.from_(ppi_t).select(ppi_t.star).where(ppi_t.production_plan_id == P())
+    plan_items = conn.execute(ppi_q.get_sql(), (args.production_plan_id,)).fetchall()
 
     if not plan_items:
         err("Production Plan has no items")
@@ -2421,18 +2483,19 @@ def run_mrp(conn, args):
         else:
             # If no warehouse specified, sum across all warehouses for company
             try:
-                stock_rows = conn.execute(
-                    """SELECT decimal_sum(actual_qty) AS total_qty
-                       FROM stock_ledger_entry
-                       WHERE item_id = ? AND is_cancelled = 0""",
-                    (item_id,),
-                ).fetchone()
+                sle_t = Table("stock_ledger_entry")
+                sle_sum_q = (Q.from_(sle_t)
+                             .select(DecimalSum(sle_t.actual_qty).as_("total_qty"))
+                             .where(sle_t.item_id == P())
+                             .where(sle_t.is_cancelled == 0))
+                stock_rows = conn.execute(sle_sum_q.get_sql(), (item_id,)).fetchone()
                 if stock_rows and stock_rows["total_qty"]:
                     available_qty = to_decimal(str(stock_rows["total_qty"]))
             except Exception:
                 available_qty = Decimal("0")
 
         # Get on-order quantity from open purchase orders
+        # raw SQL — complex COALESCE + decimal_sum + JOIN + NOT IN + arithmetic comparison
         on_order_qty = Decimal("0")
         try:
             po_row = conn.execute(
@@ -2456,11 +2519,12 @@ def run_mrp(conn, args):
             max(Decimal("0"), required_qty - available_qty - on_order_qty)
         )
 
+        ppm_ins_q = (Q.into(ppm_t).columns(
+            "id", "production_plan_id", "item_id", "required_qty",
+            "available_qty", "on_order_qty", "shortfall_qty", "warehouse_id"
+        ).insert(P(), P(), P(), P(), P(), P(), P(), P()))
         conn.execute(
-            """INSERT INTO production_plan_material
-               (id, production_plan_id, item_id, required_qty,
-                available_qty, on_order_qty, shortfall_qty, warehouse_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            ppm_ins_q.get_sql(),
             (str(uuid.uuid4()), args.production_plan_id, item_id,
              str(round_currency(required_qty)),
              str(available_qty), str(on_order_qty),
@@ -2471,12 +2535,11 @@ def run_mrp(conn, args):
             total_shortfall_items += 1
 
     # Update plan status
-    conn.execute(
-        """UPDATE production_plan
-           SET status = 'submitted', updated_at = datetime('now')
-           WHERE id = ?""",
-        (args.production_plan_id,),
-    )
+    pp_upd_q = (Q.update(pp_t)
+                .set(pp_t.status, ValueWrapper("submitted"))
+                .set(pp_t.updated_at, LiteralValue("datetime('now')"))
+                .where(pp_t.id == P()))
+    conn.execute(pp_upd_q.get_sql(), (args.production_plan_id,))
 
     audit(conn, "erpclaw-manufacturing", "run-mrp", "production_plan", args.production_plan_id,
            new_values={
@@ -2506,37 +2569,37 @@ def get_production_plan(conn, args):
     if not args.production_plan_id:
         err("--production-plan-id is required")
 
-    plan = conn.execute(
-        "SELECT * FROM production_plan WHERE id = ?",
-        (args.production_plan_id,),
-    ).fetchone()
+    pp_t = Table("production_plan")
+    pp_q = Q.from_(pp_t).select(pp_t.star).where(pp_t.id == P())
+    plan = conn.execute(pp_q.get_sql(), (args.production_plan_id,)).fetchone()
     if not plan:
         err(f"Production Plan {args.production_plan_id} not found")
 
     data = row_to_dict(plan)
 
     # Fetch plan items with item and BOM details
-    items = conn.execute(
-        """SELECT ppi.*, i.item_code, i.item_name,
-                  b.naming_series AS bom_naming_series
-           FROM production_plan_item ppi
-           LEFT JOIN item i ON i.id = ppi.item_id
-           LEFT JOIN bom b ON b.id = ppi.bom_id
-           WHERE ppi.production_plan_id = ?
-           ORDER BY ppi.rowid""",
-        (args.production_plan_id,),
-    ).fetchall()
+    ppi = Table("production_plan_item").as_("ppi")
+    i = Table("item").as_("i")
+    b = Table("bom").as_("b")
+    ppi_q = (Q.from_(ppi)
+             .left_join(i).on(i.id == ppi.item_id)
+             .left_join(b).on(b.id == ppi.bom_id)
+             .select(ppi.star, i.item_code, i.item_name,
+                     b.naming_series.as_("bom_naming_series"))
+             .where(ppi.production_plan_id == P())
+             .orderby(ppi.rowid))
+    items = conn.execute(ppi_q.get_sql(), (args.production_plan_id,)).fetchall()
     data["items"] = [row_to_dict(r) for r in items]
 
     # Fetch materials with item details
-    materials = conn.execute(
-        """SELECT ppm.*, i.item_code, i.item_name, i.stock_uom
-           FROM production_plan_material ppm
-           LEFT JOIN item i ON i.id = ppm.item_id
-           WHERE ppm.production_plan_id = ?
-           ORDER BY ppm.rowid""",
-        (args.production_plan_id,),
-    ).fetchall()
+    ppm = Table("production_plan_material").as_("ppm")
+    i2 = Table("item").as_("i")
+    ppm_q = (Q.from_(ppm)
+             .left_join(i2).on(i2.id == ppm.item_id)
+             .select(ppm.star, i2.item_code, i2.item_name, i2.stock_uom)
+             .where(ppm.production_plan_id == P())
+             .orderby(ppm.rowid))
+    materials = conn.execute(ppm_q.get_sql(), (args.production_plan_id,)).fetchall()
     data["materials"] = [row_to_dict(r) for r in materials]
 
     # Summary
@@ -2563,10 +2626,9 @@ def generate_work_orders(conn, args):
     if not args.production_plan_id:
         err("--production-plan-id is required")
 
-    plan = conn.execute(
-        "SELECT * FROM production_plan WHERE id = ?",
-        (args.production_plan_id,),
-    ).fetchone()
+    pp_t = Table("production_plan")
+    pp_q = Q.from_(pp_t).select(pp_t.star).where(pp_t.id == P())
+    plan = conn.execute(pp_q.get_sql(), (args.production_plan_id,)).fetchone()
     if not plan:
         err(f"Production Plan {args.production_plan_id} not found")
 
@@ -2574,11 +2636,11 @@ def generate_work_orders(conn, args):
     company_id = plan_dict["company_id"]
 
     # Fetch plan items without work orders
-    plan_items = conn.execute(
-        """SELECT * FROM production_plan_item
-           WHERE production_plan_id = ? AND work_order_id IS NULL""",
-        (args.production_plan_id,),
-    ).fetchall()
+    ppi_t = Table("production_plan_item")
+    ppi_q = (Q.from_(ppi_t).select(ppi_t.star)
+             .where(ppi_t.production_plan_id == P())
+             .where(ppi_t.work_order_id.isnull()))
+    plan_items = conn.execute(ppi_q.get_sql(), (args.production_plan_id,)).fetchall()
 
     if not plan_items:
         ok({
@@ -2598,9 +2660,9 @@ def generate_work_orders(conn, args):
         warehouse_id = pi.get("warehouse_id")
 
         # Get BOM details
-        bom = conn.execute(
-            "SELECT * FROM bom WHERE id = ?", (bom_id,),
-        ).fetchone()
+        bom_t = Table("bom")
+        bom_q = Q.from_(bom_t).select(bom_t.star).where(bom_t.id == P())
+        bom = conn.execute(bom_q.get_sql(), (bom_id,)).fetchone()
         if not bom:
             continue
         bom_dict = row_to_dict(bom)
@@ -2613,14 +2675,17 @@ def generate_work_orders(conn, args):
         naming = get_next_name(conn, "work_order", company_id=company_id)
 
         wo_id = str(uuid.uuid4())
+        wo_t = Table("work_order")
+        wo_ins_q = (Q.into(wo_t).columns(
+            "id", "naming_series", "item_id", "bom_id", "qty", "produced_qty",
+            "production_plan_id", "sales_order_id",
+            "target_warehouse_id",
+            "status", "material_transferred_for_manufacturing", "company_id"
+        ).insert(P(), P(), P(), P(), P(), ValueWrapper("0"), P(), P(), P(),
+                 ValueWrapper("draft"), ValueWrapper("0"), P()))
         try:
             conn.execute(
-                """INSERT INTO work_order
-                   (id, naming_series, item_id, bom_id, qty, produced_qty,
-                    production_plan_id, sales_order_id,
-                    target_warehouse_id,
-                    status, material_transferred_for_manufacturing, company_id)
-                   VALUES (?, ?, ?, ?, ?, '0', ?, ?, ?, 'draft', '0', ?)""",
+                wo_ins_q.get_sql(),
                 (wo_id, naming, fg_item_id, bom_id,
                  str(round_currency(planned_qty)),
                  args.production_plan_id, pi.get("sales_order_id"),
@@ -2630,30 +2695,34 @@ def generate_work_orders(conn, args):
             continue
 
         # Copy BOM items to work_order_item
-        bom_items = conn.execute(
-            "SELECT item_id, quantity, source_warehouse_id FROM bom_item WHERE bom_id = ?",
-            (bom_id,),
-        ).fetchall()
+        bi_t = Table("bom_item")
+        bi_fetch_q = (Q.from_(bi_t)
+                      .select(bi_t.item_id, bi_t.quantity, bi_t.source_warehouse_id)
+                      .where(bi_t.bom_id == P()))
+        bom_items = conn.execute(bi_fetch_q.get_sql(), (bom_id,)).fetchall()
 
+        woi_t = Table("work_order_item")
+        woi_ins_q = (Q.into(woi_t).columns(
+            "id", "work_order_id", "item_id", "required_qty",
+            "transferred_qty", "consumed_qty", "source_warehouse_id"
+        ).insert(P(), P(), P(), P(), ValueWrapper("0"), ValueWrapper("0"), P()))
+        woi_ins_sql = woi_ins_q.get_sql()
         for bi_row in bom_items:
             bi = row_to_dict(bi_row)
             bi_qty = to_decimal(bi["quantity"])
             required_qty = round_currency((bi_qty / bom_base_qty) * planned_qty)
 
             conn.execute(
-                """INSERT INTO work_order_item
-                   (id, work_order_id, item_id, required_qty,
-                    transferred_qty, consumed_qty, source_warehouse_id)
-                   VALUES (?, ?, ?, ?, '0', '0', ?)""",
+                woi_ins_sql,
                 (str(uuid.uuid4()), wo_id, bi["item_id"],
                  str(required_qty), bi.get("source_warehouse_id")),
             )
 
         # Link work order back to plan item
-        conn.execute(
-            "UPDATE production_plan_item SET work_order_id = ? WHERE id = ?",
-            (wo_id, pi["id"]),
-        )
+        ppi_upd_q = (Q.update(ppi_t)
+                     .set(ppi_t.work_order_id, P())
+                     .where(ppi_t.id == P()))
+        conn.execute(ppi_upd_q.get_sql(), (wo_id, pi["id"]))
 
         audit(conn, "erpclaw-manufacturing", "generate-work-orders", "work_order", wo_id,
                new_values={
@@ -2690,14 +2759,14 @@ def generate_purchase_requests(conn, args):
     if not args.production_plan_id:
         err("--production-plan-id is required")
 
-    plan = conn.execute(
-        "SELECT * FROM production_plan WHERE id = ?",
-        (args.production_plan_id,),
-    ).fetchone()
+    pp_t = Table("production_plan")
+    pp_q = Q.from_(pp_t).select(pp_t.star).where(pp_t.id == P())
+    plan = conn.execute(pp_q.get_sql(), (args.production_plan_id,)).fetchone()
     if not plan:
         err(f"Production Plan {args.production_plan_id} not found")
 
     # Fetch all materials with shortfall > 0
+    # raw SQL — arithmetic comparison (shortfall_qty + 0 > 0)
     materials = conn.execute(
         """SELECT ppm.*, i.item_code, i.item_name, i.stock_uom
            FROM production_plan_material ppm
@@ -2759,10 +2828,9 @@ def add_subcontracting_order(conn, args):
         err("--quantity must be greater than 0")
 
     # Validate supplier
-    supplier = conn.execute(
-        "SELECT id FROM supplier WHERE id = ? OR name = ?",
-        (args.supplier_id, args.supplier_id),
-    ).fetchone()
+    sup_t = Table("supplier")
+    sup_q = Q.from_(sup_t).select(sup_t.id).where((sup_t.id == P()) | (sup_t.name == P()))
+    supplier = conn.execute(sup_q.get_sql(), (args.supplier_id, args.supplier_id)).fetchone()
     if not supplier:
         err(f"Supplier {args.supplier_id} not found")
     args.supplier_id = supplier["id"]
@@ -2788,14 +2856,17 @@ def add_subcontracting_order(conn, args):
     naming = get_next_name(conn, "subcontracting_order", company_id=args.company_id)
 
     sco_id = str(uuid.uuid4())
+    sco_t = Table("subcontracting_order")
+    sco_ins_q = (Q.into(sco_t).columns(
+        "id", "naming_series", "supplier_id", "service_item_id",
+        "finished_item_id", "bom_id", "qty",
+        "supplier_warehouse_id", "status",
+        "materials_transferred", "received_qty", "company_id"
+    ).insert(P(), P(), P(), P(), P(), P(), P(), P(), ValueWrapper("draft"),
+             ValueWrapper("0"), ValueWrapper("0"), P()))
     try:
         conn.execute(
-            """INSERT INTO subcontracting_order
-               (id, naming_series, supplier_id, service_item_id,
-                finished_item_id, bom_id, qty,
-                supplier_warehouse_id, status,
-                materials_transferred, received_qty, company_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', '0', '0', ?)""",
+            sco_ins_q.get_sql(),
             (sco_id, naming, args.supplier_id, service_item_id,
              finished_item_id, args.bom_id, str(round_currency(qty)),
              supplier_wh, args.company_id),
@@ -2834,66 +2905,76 @@ def status_action(conn, args):
 
     Optional: --company-id (filter by company)
     """
-    company_filter = ""
-    params = []
-    if args.company_id:
-        company_filter = "AND company_id = ?"
-        params = [args.company_id]
-
     # BOMs
-    total_boms = conn.execute(
-        f"SELECT COUNT(*) FROM bom WHERE 1=1 {company_filter}", params,
-    ).fetchone()[0]
-    active_boms = conn.execute(
-        f"SELECT COUNT(*) FROM bom WHERE is_active = 1 {company_filter}", params,
-    ).fetchone()[0]
+    bom_t = Table("bom")
+    bom_cnt_q = Q.from_(bom_t).select(fn.Count("*"))
+    if args.company_id:
+        bom_cnt_q = bom_cnt_q.where(bom_t.company_id == P())
+    total_boms = conn.execute(bom_cnt_q.get_sql(), [args.company_id] if args.company_id else []).fetchone()[0]
+
+    bom_active_q = Q.from_(bom_t).select(fn.Count("*")).where(bom_t.is_active == 1)
+    if args.company_id:
+        bom_active_q = bom_active_q.where(bom_t.company_id == P())
+    active_boms = conn.execute(bom_active_q.get_sql(), [args.company_id] if args.company_id else []).fetchone()[0]
 
     # Work Orders by status
+    wo_t = Table("work_order")
     wo_statuses = {}
     for status in VALID_WO_STATUSES:
-        cnt = conn.execute(
-            f"SELECT COUNT(*) FROM work_order WHERE status = ? {company_filter}",
-            [status] + params,
-        ).fetchone()[0]
+        wo_status_q = Q.from_(wo_t).select(fn.Count("*")).where(wo_t.status == P())
+        params = [status]
+        if args.company_id:
+            wo_status_q = wo_status_q.where(wo_t.company_id == P())
+            params.append(args.company_id)
+        cnt = conn.execute(wo_status_q.get_sql(), params).fetchone()[0]
         if cnt > 0:
             wo_statuses[status] = cnt
 
-    total_wos = conn.execute(
-        f"SELECT COUNT(*) FROM work_order WHERE 1=1 {company_filter}", params,
-    ).fetchone()[0]
+    wo_total_q = Q.from_(wo_t).select(fn.Count("*"))
+    if args.company_id:
+        wo_total_q = wo_total_q.where(wo_t.company_id == P())
+    total_wos = conn.execute(wo_total_q.get_sql(), [args.company_id] if args.company_id else []).fetchone()[0]
 
     # Job Cards
-    open_job_cards = conn.execute(
-        """SELECT COUNT(*) FROM job_card jc
-           JOIN work_order wo ON wo.id = jc.work_order_id
-           WHERE jc.status IN ('open', 'in_process')"""
-        + (f" AND wo.company_id = ?" if args.company_id else ""),
-        params,
-    ).fetchone()[0]
+    jc_t = Table("job_card").as_("jc")
+    wo_jc = Table("work_order").as_("wo")
+    jc_cnt_q = (Q.from_(jc_t)
+                .join(wo_jc).on(wo_jc.id == jc_t.work_order_id)
+                .select(fn.Count("*"))
+                .where(jc_t.status.isin(["open", "in_process"])))
+    jc_params = []
+    if args.company_id:
+        jc_cnt_q = jc_cnt_q.where(wo_jc.company_id == P())
+        jc_params.append(args.company_id)
+    open_job_cards = conn.execute(jc_cnt_q.get_sql(), jc_params).fetchone()[0]
 
     # Production Plans
-    active_plans = conn.execute(
-        f"""SELECT COUNT(*) FROM production_plan
-            WHERE status NOT IN ('cancelled')
-            {company_filter}""",
-        params,
-    ).fetchone()[0]
+    pp_t = Table("production_plan")
+    pp_cnt_q = Q.from_(pp_t).select(fn.Count("*")).where(pp_t.status != ValueWrapper("cancelled"))
+    pp_params = []
+    if args.company_id:
+        pp_cnt_q = pp_cnt_q.where(pp_t.company_id == P())
+        pp_params.append(args.company_id)
+    active_plans = conn.execute(pp_cnt_q.get_sql(), pp_params).fetchone()[0]
 
     # Subcontracting Orders
-    active_scos = conn.execute(
-        f"""SELECT COUNT(*) FROM subcontracting_order
-            WHERE status NOT IN ('cancelled', 'completed')
-            {company_filter}""",
-        params,
-    ).fetchone()[0]
+    sco_t = Table("subcontracting_order")
+    sco_cnt_q = (Q.from_(sco_t).select(fn.Count("*"))
+                 .where(sco_t.status.notin(["cancelled", "completed"])))
+    sco_params = []
+    if args.company_id:
+        sco_cnt_q = sco_cnt_q.where(sco_t.company_id == P())
+        sco_params.append(args.company_id)
+    active_scos = conn.execute(sco_cnt_q.get_sql(), sco_params).fetchone()[0]
 
     # Operations and Workstations
-    total_operations = conn.execute(
-        "SELECT COUNT(*) FROM operation WHERE is_active = 1",
-    ).fetchone()[0]
-    total_workstations = conn.execute(
-        "SELECT COUNT(*) FROM workstation WHERE status = 'active'",
-    ).fetchone()[0]
+    op_t = Table("operation")
+    op_cnt_q = Q.from_(op_t).select(fn.Count("*")).where(op_t.is_active == 1)
+    total_operations = conn.execute(op_cnt_q.get_sql()).fetchone()[0]
+
+    ws_t = Table("workstation")
+    ws_cnt_q = Q.from_(ws_t).select(fn.Count("*")).where(ws_t.status == ValueWrapper("active"))
+    total_workstations = conn.execute(ws_cnt_q.get_sql()).fetchone()[0]
 
     ok({
         "total_boms": total_boms,

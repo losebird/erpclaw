@@ -4,7 +4,7 @@ version: 1.0.0
 description: AI-powered business analysis for ERPClaw — anomaly detection, cash flow forecasting, business rules, relationship scoring, conversation memory
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-ai-engine
 tier: 3
 category: analytics
 requires: [erpclaw-setup, erpclaw-gl]

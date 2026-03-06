@@ -18,7 +18,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 # Add shared lib for init_db
-_LOCAL_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../"))
+_LOCAL_ROOT = os.path.expanduser("~/Downloads/projects/erpclaw")
 _SERVER_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "erpclaw-setup", "scripts")
 if os.path.exists(os.path.join(_LOCAL_ROOT, "init_db.py")):
     PROJECT_ROOT = _LOCAL_ROOT
@@ -39,7 +39,7 @@ def _init_db(db_path):
         # Server layout: try multiple known locations
         for candidate in [
             os.path.expanduser("~/clawd/init_db.py"),
-            os.path.join(os.path.dirname(__file__), "..", "..", "init_db.py"),
+            os.path.expanduser("~/clawd/repos/erpclaw-plan/init_db.py"),
             os.path.join(os.path.dirname(__file__), "..", "init_db.py"),
         ]:
             if os.path.exists(candidate):

@@ -4,7 +4,7 @@ version: 1.0.0
 description: Procure-to-pay cycle -- suppliers, material requests, RFQs, supplier quotations, purchase orders, purchase receipts, purchase invoices, debit notes, landed costs
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-buying
 tier: 4
 category: buying
 requires: [erpclaw-setup, erpclaw-gl, erpclaw-inventory, erpclaw-tax]

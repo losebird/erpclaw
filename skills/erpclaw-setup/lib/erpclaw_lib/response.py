@@ -7,9 +7,16 @@ import json
 import sys
 
 
-def ok(data: dict) -> None:
-    """Send success response and exit."""
-    data["status"] = "ok"
+def ok(data: dict = None) -> None:
+    """Send success response and exit.
+
+    Sets status to "ok" only if not already present, preserving
+    domain-specific status fields (e.g., visit_status, plan_status).
+    """
+    if data is None:
+        data = {}
+    if "status" not in data:
+        data["status"] = "ok"
     print(json.dumps(data, indent=2, default=str))
     sys.exit(0)
 

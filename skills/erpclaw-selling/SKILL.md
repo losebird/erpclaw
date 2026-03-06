@@ -4,7 +4,7 @@ version: 1.0.0
 description: Order-to-cash cycle -- customers, quotations, sales orders, delivery notes, sales invoices, credit notes, recurring invoices for ERPClaw ERP
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-selling
 tier: 4
 category: selling
 requires: [erpclaw-setup, erpclaw-gl, erpclaw-inventory, erpclaw-tax]
@@ -292,9 +292,10 @@ After `add-customer`: offer quotation. After `submit-quotation`: offer SO conver
 **Shared library:** `~/.openclaw/erpclaw/lib/gl_posting.py` -- `post_gl_entries()`, `reverse_gl_entries()`.
 
 ### Sub-Skills
+
 | Sub-Skill | Shortcut | What It Does |
 |-----------|----------|-------------|
 | `erp-selling` | `/erp-selling` | Quick sales summary |
 | `erp-customers` | `/erp-customers` | List customers |
-| `erp-invoices` | `/erp-invoices` | Recent invoices with status and outstanding |
-| `erp-orders` | `/erp-orders` | Active sales orders with fulfillment status |
+| `erp-invoices` | `/erp-invoices` | Lists recent sales invoices with status and outstanding amounts |
+| `erp-orders` | `/erp-orders` | Lists active sales orders with fulfillment status |

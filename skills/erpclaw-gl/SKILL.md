@@ -4,7 +4,7 @@ version: 1.0.0
 description: General Ledger and chart of accounts management for ERPClaw ERP
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-gl
 tier: 1
 category: accounting
 tags: [erpclaw, general-ledger, accounting, chart-of-accounts]

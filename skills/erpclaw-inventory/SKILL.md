@@ -4,7 +4,7 @@ version: 1.0.0
 description: Inventory management -- items, warehouses, stock entries, batches, serial numbers, pricing, stock reconciliation, and stock reporting for ERPClaw ERP
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-inventory
 tier: 3
 category: inventory
 requires: [erpclaw-setup, erpclaw-gl]

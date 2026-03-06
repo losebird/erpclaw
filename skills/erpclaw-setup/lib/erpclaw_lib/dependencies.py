@@ -154,6 +154,20 @@ TABLE_TO_SKILL = {
 }
 
 
+def register_tables(skill_name: str, table_names: list[str]):
+    """Register table ownership for a vertical skill.
+
+    Verticals call this during init_db to register their tables
+    without modifying shared lib source.
+
+    Args:
+        skill_name: e.g. 'propclaw', 'buildclaw'
+        table_names: List of table names owned by this skill.
+    """
+    for t in table_names:
+        TABLE_TO_SKILL[t] = skill_name
+
+
 def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     """Check if a table exists in the database."""
     row = conn.execute(

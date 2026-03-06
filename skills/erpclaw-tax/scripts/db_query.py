@@ -28,6 +28,8 @@ try:
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
     from erpclaw_lib.query_helpers import resolve_company_id
+    from erpclaw_lib.query import Q, P, Table, Field, fn, DecimalSum, Order
+    from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
@@ -42,6 +44,20 @@ VALID_CHARGE_TYPES = (
 )
 VALID_ADD_DEDUCT = ("add", "deduct")
 VALID_FORM_TYPES = ("1099-NEC", "1099-MISC")
+
+# PyPika table aliases
+tt_t = Table("tax_template")
+tl_t = Table("tax_template_line")
+tc_t = Table("tax_category")
+tr_t = Table("tax_rule")
+itt_t = Table("item_tax_template")
+twc_t = Table("tax_withholding_category")
+twg_t = Table("tax_withholding_group")
+twe_t = Table("tax_withholding_entry")
+co_t = Table("company")
+acct_t = Table("account")
+cust_t = Table("customer")
+supp_t = Table("supplier")
 
 
 # ---------------------------------------------------------------------------
@@ -83,12 +99,16 @@ def _validate_lines(lines):
 
 def _insert_lines(conn, template_id, lines):
     """Insert tax_template_line rows for a template."""
+    q = (
+        Q.into(tl_t)
+        .columns("id", "tax_template_id", "tax_account_id", "rate",
+                 "charge_type", "row_order", "add_deduct",
+                 "included_in_print_rate", "description")
+        .insert(P(), P(), P(), P(), P(), P(), P(), P(), P())
+    )
+    sql = q.get_sql()
     for i, line in enumerate(lines):
-        conn.execute(
-            """INSERT INTO tax_template_line
-               (id, tax_template_id, tax_account_id, rate, charge_type,
-                row_order, add_deduct, included_in_print_rate, description)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        conn.execute(sql,
             (str(uuid.uuid4()), template_id, line["tax_account_id"],
              str(round_currency(to_decimal(str(line["rate"])))),
              line.get("charge_type", "on_net_total"),
@@ -101,14 +121,16 @@ def _insert_lines(conn, template_id, lines):
 
 def _get_template_lines(conn, template_id):
     """Fetch template lines with account names, ordered by row_order."""
-    rows = conn.execute(
-        """SELECT tl.*, a.name AS account_name
-           FROM tax_template_line tl
-           LEFT JOIN account a ON a.id = tl.tax_account_id
-           WHERE tl.tax_template_id = ?
-           ORDER BY tl.row_order""",
-        (template_id,),
-    ).fetchall()
+    tl = Table("tax_template_line")
+    a = Table("account")
+    q = (
+        Q.from_(tl)
+        .select(tl.star, a.name.as_("account_name"))
+        .left_join(a).on(a.id == tl.tax_account_id)
+        .where(tl.tax_template_id == P())
+        .orderby(tl.row_order)
+    )
+    rows = conn.execute(q.get_sql(), (template_id,)).fetchall()
     return [row_to_dict(r) for r in rows]
 
 
@@ -125,7 +147,8 @@ def add_tax_template(conn, args):
         err("--company-id is required")
 
     # Verify company exists
-    co = conn.execute("SELECT id FROM company WHERE id = ?", (args.company_id,)).fetchone()
+    q = Q.from_(co_t).select(co_t.id).where(co_t.id == P())
+    co = conn.execute(q.get_sql(), (args.company_id,)).fetchone()
     if not co:
         err(f"Company not found: {args.company_id}")
 
@@ -135,26 +158,30 @@ def add_tax_template(conn, args):
     _validate_lines(lines)
 
     # Verify all tax accounts exist
+    q_acct = Q.from_(acct_t).select(acct_t.id).where(acct_t.id == P())
+    acct_sql = q_acct.get_sql()
     for i, line in enumerate(lines):
-        acct = conn.execute("SELECT id FROM account WHERE id = ?",
-                            (line["tax_account_id"],)).fetchone()
+        acct = conn.execute(acct_sql, (line["tax_account_id"],)).fetchone()
         if not acct:
             err(f"Line {i}: account not found: {line['tax_account_id']}")
 
     tid = str(uuid.uuid4())
     # If setting as default, clear other defaults of same type+company
     if args.is_default:
-        conn.execute(
-            """UPDATE tax_template SET is_default = 0
-               WHERE company_id = ? AND (tax_type = ? OR tax_type = 'both')""",
-            (args.company_id, args.tax_type),
+        q_clear = (
+            Q.update(tt_t).set(tt_t.is_default, 0)
+            .where(tt_t.company_id == P())
+            .where((tt_t.tax_type == P()) | (tt_t.tax_type == "both"))
         )
+        conn.execute(q_clear.get_sql(), (args.company_id, args.tax_type))
 
-    conn.execute(
-        """INSERT INTO tax_template (id, name, tax_type, is_default, company_id)
-           VALUES (?, ?, ?, ?, ?)""",
-        (tid, args.name, args.tax_type, 1 if args.is_default else 0, args.company_id),
+    q_ins = (
+        Q.into(tt_t)
+        .columns("id", "name", "tax_type", "is_default", "company_id")
+        .insert(P(), P(), P(), P(), P())
     )
+    conn.execute(q_ins.get_sql(),
+        (tid, args.name, args.tax_type, 1 if args.is_default else 0, args.company_id))
     _insert_lines(conn, tid, lines)
 
     audit(conn, "erpclaw-tax", "add-tax-template", "tax_template", tid,
@@ -168,8 +195,8 @@ def update_tax_template(conn, args):
     if not args.tax_template_id:
         err("--tax-template-id is required")
 
-    t = conn.execute("SELECT * FROM tax_template WHERE id = ?",
-                     (args.tax_template_id,)).fetchone()
+    q_get = Q.from_(tt_t).select(tt_t.star).where(tt_t.id == P())
+    t = conn.execute(q_get.get_sql(), (args.tax_template_id,)).fetchone()
     if not t:
         err(f"Tax template not found: {args.tax_template_id}")
 
@@ -183,12 +210,14 @@ def update_tax_template(conn, args):
     if args.is_default is not None:
         is_def = 1 if args.is_default else 0
         if is_def:
-            conn.execute(
-                """UPDATE tax_template SET is_default = 0
-                   WHERE company_id = ? AND (tax_type = ? OR tax_type = 'both')
-                   AND id != ?""",
-                (t["company_id"], t["tax_type"], args.tax_template_id),
+            q_clear = (
+                Q.update(tt_t).set(tt_t.is_default, 0)
+                .where(tt_t.company_id == P())
+                .where((tt_t.tax_type == P()) | (tt_t.tax_type == "both"))
+                .where(tt_t.id != P())
             )
+            conn.execute(q_clear.get_sql(),
+                (t["company_id"], t["tax_type"], args.tax_template_id))
         updates.append("is_default = ?")
         params.append(is_def)
         updated_fields.append("is_default")
@@ -197,16 +226,18 @@ def update_tax_template(conn, args):
     lines = _parse_json_arg(args.lines, "lines") if args.lines else None
     if lines is not None:
         _validate_lines(lines)
+        q_acct = Q.from_(acct_t).select(acct_t.id).where(acct_t.id == P())
+        acct_sql = q_acct.get_sql()
         for i, line in enumerate(lines):
-            acct = conn.execute("SELECT id FROM account WHERE id = ?",
-                                (line["tax_account_id"],)).fetchone()
+            acct = conn.execute(acct_sql, (line["tax_account_id"],)).fetchone()
             if not acct:
                 err(f"Line {i}: account not found: {line['tax_account_id']}")
-        conn.execute("DELETE FROM tax_template_line WHERE tax_template_id = ?",
-                     (args.tax_template_id,))
+        q_del = Q.from_(tl_t).delete().where(tl_t.tax_template_id == P())
+        conn.execute(q_del.get_sql(), (args.tax_template_id,))
         _insert_lines(conn, args.tax_template_id, lines)
         updated_fields.append("lines")
 
+    # Dynamic UPDATE — keep as raw SQL (variable SET columns)
     if updates:
         updates.append("updated_at = datetime('now')")
         params.append(args.tax_template_id)
@@ -227,8 +258,8 @@ def get_tax_template(conn, args):
     if not args.tax_template_id:
         err("--tax-template-id is required")
 
-    t = conn.execute("SELECT * FROM tax_template WHERE id = ?",
-                     (args.tax_template_id,)).fetchone()
+    q = Q.from_(tt_t).select(tt_t.star).where(tt_t.id == P())
+    t = conn.execute(q.get_sql(), (args.tax_template_id,)).fetchone()
     if not t:
         err(f"Tax template not found: {args.tax_template_id}")
 
@@ -243,19 +274,17 @@ def list_tax_templates(conn, args):
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
 
-    sql = "SELECT * FROM tax_template WHERE company_id = ?"
+    base = Q.from_(tt_t).where(tt_t.company_id == P())
     params = [company_id]
     if args.tax_type:
-        sql += " AND (tax_type = ? OR tax_type = 'both')"
+        base = base.where((tt_t.tax_type == P()) | (tt_t.tax_type == "both"))
         params.append(args.tax_type)
 
-    count_sql = sql.replace("SELECT * FROM tax_template", "SELECT COUNT(*) as cnt FROM tax_template")
-    total_count = conn.execute(count_sql, params).fetchone()["cnt"]
+    q_count = base.select(fn.Count("*").as_("cnt"))
+    total_count = conn.execute(q_count.get_sql(), params).fetchone()["cnt"]
 
-    sql += " ORDER BY name LIMIT ? OFFSET ?"
-    params.extend([limit, offset])
-
-    rows = conn.execute(sql, params).fetchall()
+    q_rows = base.select(tt_t.star).orderby(tt_t.name).limit(P()).offset(P())
+    rows = conn.execute(q_rows.get_sql(), params + [limit, offset]).fetchall()
     ok({"templates": [row_to_dict(r) for r in rows],
          "total_count": total_count, "limit": limit, "offset": offset,
          "has_more": offset + limit < total_count})
@@ -265,26 +294,27 @@ def delete_tax_template(conn, args):
     if not args.tax_template_id:
         err("--tax-template-id is required")
 
-    t = conn.execute("SELECT * FROM tax_template WHERE id = ?",
-                     (args.tax_template_id,)).fetchone()
+    q_get = Q.from_(tt_t).select(tt_t.star).where(tt_t.id == P())
+    t = conn.execute(q_get.get_sql(), (args.tax_template_id,)).fetchone()
     if not t:
         err(f"Tax template not found: {args.tax_template_id}")
 
     # Check if referenced by tax rules
-    ref = conn.execute("SELECT COUNT(*) as cnt FROM tax_rule WHERE tax_template_id = ?",
-                       (args.tax_template_id,)).fetchone()
+    q_ref = Q.from_(tr_t).select(fn.Count("*").as_("cnt")).where(tr_t.tax_template_id == P())
+    ref = conn.execute(q_ref.get_sql(), (args.tax_template_id,)).fetchone()
     if ref["cnt"] > 0:
         err(f"Cannot delete: template is referenced by {ref['cnt']} tax rule(s)")
 
     # Check if referenced by item_tax_template
-    ref2 = conn.execute("SELECT COUNT(*) as cnt FROM item_tax_template WHERE tax_template_id = ?",
-                        (args.tax_template_id,)).fetchone()
+    q_ref2 = Q.from_(itt_t).select(fn.Count("*").as_("cnt")).where(itt_t.tax_template_id == P())
+    ref2 = conn.execute(q_ref2.get_sql(), (args.tax_template_id,)).fetchone()
     if ref2["cnt"] > 0:
         err(f"Cannot delete: template is referenced by {ref2['cnt']} item tax template(s)")
 
-    conn.execute("DELETE FROM tax_template_line WHERE tax_template_id = ?",
-                 (args.tax_template_id,))
-    conn.execute("DELETE FROM tax_template WHERE id = ?", (args.tax_template_id,))
+    q_del_lines = Q.from_(tl_t).delete().where(tl_t.tax_template_id == P())
+    conn.execute(q_del_lines.get_sql(), (args.tax_template_id,))
+    q_del_tmpl = Q.from_(tt_t).delete().where(tt_t.id == P())
+    conn.execute(q_del_tmpl.get_sql(), (args.tax_template_id,))
 
     audit(conn, "erpclaw-tax", "delete-tax-template", "tax_template", args.tax_template_id,
            old_values={"name": t["name"]})
@@ -301,10 +331,8 @@ def add_tax_category(conn, args):
         err("--name is required")
 
     cid = str(uuid.uuid4())
-    conn.execute(
-        "INSERT INTO tax_category (id, name, description) VALUES (?, ?, ?)",
-        (cid, args.name, args.description or ""),
-    )
+    q = Q.into(tc_t).columns("id", "name", "description").insert(P(), P(), P())
+    conn.execute(q.get_sql(), (cid, args.name, args.description or ""))
     audit(conn, "erpclaw-tax", "add-tax-category", "tax_category", cid,
            new_values={"name": args.name})
     conn.commit()
@@ -314,9 +342,10 @@ def add_tax_category(conn, args):
 def list_tax_categories(conn, args):
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
-    total_count = conn.execute("SELECT COUNT(*) as cnt FROM tax_category").fetchone()["cnt"]
-    rows = conn.execute("SELECT * FROM tax_category ORDER BY name LIMIT ? OFFSET ?",
-                        (limit, offset)).fetchall()
+    q_count = Q.from_(tc_t).select(fn.Count("*").as_("cnt"))
+    total_count = conn.execute(q_count.get_sql()).fetchone()["cnt"]
+    q = Q.from_(tc_t).select(tc_t.star).orderby(tc_t.name).limit(P()).offset(P())
+    rows = conn.execute(q.get_sql(), (limit, offset)).fetchall()
     ok({"categories": [row_to_dict(r) for r in rows],
          "total_count": total_count, "limit": limit, "offset": offset,
          "has_more": offset + limit < total_count})
@@ -335,8 +364,8 @@ def add_tax_rule(conn, args):
         err("--priority is required")
 
     # Verify template exists
-    t = conn.execute("SELECT id, company_id FROM tax_template WHERE id = ?",
-                     (args.tax_template_id,)).fetchone()
+    q_tmpl = Q.from_(tt_t).select(tt_t.id, tt_t.company_id).where(tt_t.id == P())
+    t = conn.execute(q_tmpl.get_sql(), (args.tax_template_id,)).fetchone()
     if not t:
         err(f"Tax template not found: {args.tax_template_id}")
 
@@ -349,18 +378,19 @@ def add_tax_rule(conn, args):
         err("At least one filter condition required (customer, supplier, state, or category)")
 
     rid = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO tax_rule
-           (id, tax_template_id, tax_type, customer_id, customer_group,
-            supplier_id, supplier_group, shipping_state, tax_category_id,
-            priority, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+    q_ins = (
+        Q.into(tr_t)
+        .columns("id", "tax_template_id", "tax_type", "customer_id",
+                 "customer_group", "supplier_id", "supplier_group",
+                 "shipping_state", "tax_category_id", "priority", "company_id")
+        .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P())
+    )
+    conn.execute(q_ins.get_sql(),
         (rid, args.tax_template_id, args.tax_type,
          args.customer_id, args.customer_group,
          args.supplier_id, None,
          args.shipping_state, args.tax_category_id,
-         args.priority, t["company_id"]),
-    )
+         args.priority, t["company_id"]))
     audit(conn, "erpclaw-tax", "add-tax-rule", "tax_rule", rid,
            new_values={"tax_template_id": args.tax_template_id, "tax_type": args.tax_type})
     conn.commit()
@@ -373,19 +403,21 @@ def list_tax_rules(conn, args):
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
 
-    total_count = conn.execute(
-        "SELECT COUNT(*) as cnt FROM tax_rule WHERE company_id = ?",
-        (company_id,)).fetchone()["cnt"]
+    q_count = Q.from_(tr_t).select(fn.Count("*").as_("cnt")).where(tr_t.company_id == P())
+    total_count = conn.execute(q_count.get_sql(), (company_id,)).fetchone()["cnt"]
 
-    rows = conn.execute(
-        """SELECT r.*, t.name AS template_name
-           FROM tax_rule r
-           LEFT JOIN tax_template t ON t.id = r.tax_template_id
-           WHERE r.company_id = ?
-           ORDER BY r.priority, r.created_at
-           LIMIT ? OFFSET ?""",
-        (company_id, limit, offset),
-    ).fetchall()
+    r = Table("tax_rule")
+    t = Table("tax_template")
+    q = (
+        Q.from_(r)
+        .select(r.star, t.name.as_("template_name"))
+        .left_join(t).on(t.id == r.tax_template_id)
+        .where(r.company_id == P())
+        .orderby(r.priority)
+        .orderby(r.created_at)
+        .limit(P()).offset(P())
+    )
+    rows = conn.execute(q.get_sql(), (company_id, limit, offset)).fetchall()
     ok({"rules": [row_to_dict(r) for r in rows],
          "total_count": total_count, "limit": limit, "offset": offset,
          "has_more": offset + limit < total_count})
@@ -408,31 +440,36 @@ def resolve_tax_template(conn, args):
     # Check party exemption (customer or supplier table)
     is_exempt = False
     if args.party_type == "customer":
-        party = conn.execute(
-            "SELECT id, exempt_from_sales_tax FROM customer WHERE id = ?",
-            (args.party_id,)).fetchone()
+        q_cust = Q.from_(cust_t).select(cust_t.id, cust_t.exempt_from_sales_tax).where(cust_t.id == P())
+        party = conn.execute(q_cust.get_sql(), (args.party_id,)).fetchone()
         if party and party["exempt_from_sales_tax"]:
             is_exempt = True
     elif args.party_type == "supplier":
-        party = conn.execute(
-            "SELECT id FROM supplier WHERE id = ?",
-            (args.party_id,)).fetchone()
+        q_supp = Q.from_(supp_t).select(supp_t.id).where(supp_t.id == P())
+        party = conn.execute(q_supp.get_sql(), (args.party_id,)).fetchone()
 
     # Parse shipping address if provided
     shipping = _parse_json_arg(args.shipping_address, "shipping-address") if args.shipping_address else None
     ship_state = shipping.get("state") if shipping else None
 
     # Query matching rules, ordered by priority
-    sql = """SELECT r.*, t.name AS template_name
-             FROM tax_rule r
-             JOIN tax_template t ON t.id = r.tax_template_id
-             WHERE r.company_id = ?
-               AND (r.tax_type = ? OR t.tax_type = 'both')
-             ORDER BY r.priority ASC"""
-    rules = conn.execute(sql, (company_id, tx_type)).fetchall()
+    r = Table("tax_rule")
+    t = Table("tax_template")
+    q_rules = (
+        Q.from_(r)
+        .select(r.star, t.name.as_("template_name"))
+        .join(t).on(t.id == r.tax_template_id)
+        .where(r.company_id == P())
+        .where((r.tax_type == P()) | (t.tax_type == "both"))
+        .orderby(r.priority, order=Order.asc)
+    )
+    rules = conn.execute(q_rules.get_sql(), (company_id, tx_type)).fetchall()
 
     best_template_id = None
     best_template_name = None
+
+    q_cust_grp = Q.from_(cust_t).select(cust_t.customer_group).where(cust_t.id == P())
+    cust_grp_sql = q_cust_grp.get_sql()
 
     for rule in rules:
         match = True
@@ -441,9 +478,7 @@ def resolve_tax_template(conn, args):
             match = False
         # Customer group rule
         if rule["customer_group"]:
-            cust = conn.execute(
-                "SELECT customer_group FROM customer WHERE id = ?",
-                (args.party_id,)).fetchone()
+            cust = conn.execute(cust_grp_sql, (args.party_id,)).fetchone()
             if not cust or cust["customer_group"] != rule["customer_group"]:
                 match = False
         # Supplier-specific rule
@@ -463,13 +498,15 @@ def resolve_tax_template(conn, args):
 
     # Fallback to company default
     if not best_template_id:
-        default = conn.execute(
-            """SELECT id, name FROM tax_template
-               WHERE company_id = ? AND is_default = 1
-               AND (tax_type = ? OR tax_type = 'both')
-               LIMIT 1""",
-            (company_id, tx_type),
-        ).fetchone()
+        q_def = (
+            Q.from_(tt_t)
+            .select(tt_t.id, tt_t.name)
+            .where(tt_t.company_id == P())
+            .where(tt_t.is_default == 1)
+            .where((tt_t.tax_type == P()) | (tt_t.tax_type == "both"))
+            .limit(1)
+        )
+        default = conn.execute(q_def.get_sql(), (company_id, tx_type)).fetchone()
         if default:
             best_template_id = default["id"]
             best_template_name = default["name"]
@@ -477,8 +514,8 @@ def resolve_tax_template(conn, args):
     # Check item-level overrides
     item_overrides = []
     if best_template_id:
-        overrides = conn.execute(
-            "SELECT item_id, tax_template_id FROM item_tax_template").fetchall()
+        q_ovr = Q.from_(itt_t).select(itt_t.item_id, itt_t.tax_template_id)
+        overrides = conn.execute(q_ovr.get_sql()).fetchall()
         item_overrides = [row_to_dict(o) for o in overrides
                           if o["tax_template_id"] != best_template_id]
 
@@ -603,17 +640,14 @@ def add_item_tax_template(conn, args):
         err("--tax-template-id is required")
 
     # Verify template exists
-    t = conn.execute("SELECT id FROM tax_template WHERE id = ?",
-                     (args.tax_template_id,)).fetchone()
+    q_chk = Q.from_(tt_t).select(tt_t.id).where(tt_t.id == P())
+    t = conn.execute(q_chk.get_sql(), (args.tax_template_id,)).fetchone()
     if not t:
         err(f"Tax template not found: {args.tax_template_id}")
 
     iid = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO item_tax_template (id, item_id, tax_template_id, tax_rate)
-           VALUES (?, ?, ?, ?)""",
-        (iid, args.item_id, args.tax_template_id, args.tax_rate),
-    )
+    q = Q.into(itt_t).columns("id", "item_id", "tax_template_id", "tax_rate").insert(P(), P(), P(), P())
+    conn.execute(q.get_sql(), (iid, args.item_id, args.tax_template_id, args.tax_rate))
     audit(conn, "erpclaw-tax", "add-item-tax-template", "item_tax_template", iid,
            new_values={"item_id": args.item_id, "tax_template_id": args.tax_template_id})
     conn.commit()
@@ -643,30 +677,34 @@ def add_tax_withholding_category(conn, args):
         err("Invalid decimal for --rate or --threshold-amount")
 
     cid = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO tax_withholding_category
-           (id, name, category_code, cumulative_threshold, company_id)
-           VALUES (?, ?, ?, ?, ?)""",
-        (cid, args.name, args.form_type, args.threshold_amount, args.company_id),
+    q_cat = (
+        Q.into(twc_t)
+        .columns("id", "name", "category_code", "cumulative_threshold", "company_id")
+        .insert(P(), P(), P(), P(), P())
     )
+    conn.execute(q_cat.get_sql(),
+        (cid, args.name, args.form_type, args.threshold_amount, args.company_id))
 
     # Create a default withholding group with the provided rate
     gid = str(uuid.uuid4())
     # Find a withholding account — use first liability account
-    wh_acct = conn.execute(
-        """SELECT id FROM account
-           WHERE account_type IN ('tax','payable')
-           AND company_id = ? LIMIT 1""",
-        (args.company_id,)).fetchone()
+    q_acct = (
+        Q.from_(acct_t).select(acct_t.id)
+        .where(acct_t.account_type.isin(["tax", "payable"]))
+        .where(acct_t.company_id == P())
+        .limit(1)
+    )
+    wh_acct = conn.execute(q_acct.get_sql(), (args.company_id,)).fetchone()
     wh_account_id = wh_acct["id"] if wh_acct else None
 
     if wh_account_id:
-        conn.execute(
-            """INSERT INTO tax_withholding_group
-               (id, category_id, group_name, rate, effective_from, account_id)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (gid, cid, "Default", args.wh_rate, "2020-01-01", wh_account_id),
+        q_grp = (
+            Q.into(twg_t)
+            .columns("id", "category_id", "group_name", "rate", "effective_from", "account_id")
+            .insert(P(), P(), P(), P(), P(), P())
         )
+        conn.execute(q_grp.get_sql(),
+            (gid, cid, "Default", args.wh_rate, "2020-01-01", wh_account_id))
 
     audit(conn, "erpclaw-tax", "add-tax-withholding-category", "tax_withholding_category", cid,
            new_values={"name": args.name, "form_type": args.form_type})
@@ -683,8 +721,8 @@ def get_withholding_details(conn, args):
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
     # Check supplier
-    _sup = conn.execute("SELECT * FROM supplier WHERE id = ?",
-                        (args.supplier_id,)).fetchone()
+    q_sup = Q.from_(supp_t).select(supp_t.star).where(supp_t.id == P())
+    _sup = conn.execute(q_sup.get_sql(), (args.supplier_id,)).fetchone()
     if not _sup:
         err(f"Supplier not found: {args.supplier_id}")
     supplier = row_to_dict(_sup)
@@ -699,27 +737,32 @@ def get_withholding_details(conn, args):
     cat_name = ""
 
     if supplier.get("tax_withholding_category_id"):
-        wh_cat = conn.execute(
-            "SELECT * FROM tax_withholding_category WHERE id = ?",
+        q_cat = Q.from_(twc_t).select(twc_t.star).where(twc_t.id == P())
+        wh_cat = conn.execute(q_cat.get_sql(),
             (supplier["tax_withholding_category_id"],)).fetchone()
         if wh_cat:
             cat_name = wh_cat["name"]
             threshold = to_decimal(wh_cat["cumulative_threshold"] or "0")
             # Get current rate from group
-            grp = conn.execute(
-                """SELECT rate FROM tax_withholding_group
-                   WHERE category_id = ? ORDER BY effective_from DESC LIMIT 1""",
-                (wh_cat["id"],)).fetchone()
+            q_grp = (
+                Q.from_(twg_t).select(twg_t.rate)
+                .where(twg_t.category_id == P())
+                .orderby(twg_t.effective_from, order=Order.desc)
+                .limit(1)
+            )
+            grp = conn.execute(q_grp.get_sql(), (wh_cat["id"],)).fetchone()
             if grp:
                 wh_rate = to_decimal(grp["rate"])
 
     # Get YTD payments
-    ytd = conn.execute(
-        """SELECT COALESCE(decimal_sum(taxable_amount), '0') as total
-           FROM tax_withholding_entry
-           WHERE party_type = 'supplier' AND party_id = ? AND fiscal_year = ?""",
-        (args.supplier_id, args.tax_year),
-    ).fetchone()
+    q_ytd = (
+        Q.from_(twe_t)
+        .select(fn.Coalesce(DecimalSum(twe_t.taxable_amount), ValueWrapper("0")).as_("total"))
+        .where(twe_t.party_type == "supplier")
+        .where(twe_t.party_id == P())
+        .where(twe_t.fiscal_year == P())
+    )
+    ytd = conn.execute(q_ytd.get_sql(), (args.supplier_id, args.tax_year)).fetchone()
     ytd_payments = round_currency(to_decimal(str(ytd["total"])))
 
     threshold_exceeded = ytd_payments >= threshold if threshold > 0 else False
@@ -755,8 +798,8 @@ def record_withholding_entry(conn, args):
         err("--tax-year is required")
 
     # Find withholding category for supplier
-    _sup = conn.execute("SELECT * FROM supplier WHERE id = ?",
-                        (args.supplier_id,)).fetchone()
+    q_sup = Q.from_(supp_t).select(supp_t.star).where(supp_t.id == P())
+    _sup = conn.execute(q_sup.get_sql(), (args.supplier_id,)).fetchone()
     if not _sup:
         err(f"Supplier not found: {args.supplier_id}")
     supplier = row_to_dict(_sup)
@@ -766,15 +809,16 @@ def record_withholding_entry(conn, args):
         err("Supplier has no withholding category assigned")
 
     eid = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO tax_withholding_entry
-           (id, party_type, party_id, category_id, fiscal_year,
-            taxable_amount, withheld_amount,
-            withholding_voucher_type, withholding_voucher_id)
-           VALUES (?, 'supplier', ?, ?, ?, '0', ?, ?, ?)""",
-        (eid, args.supplier_id, cat_id, args.tax_year,
-         args.withholding_amount, args.voucher_type, args.voucher_id),
+    q = (
+        Q.into(twe_t)
+        .columns("id", "party_type", "party_id", "category_id", "fiscal_year",
+                 "taxable_amount", "withheld_amount",
+                 "withholding_voucher_type", "withholding_voucher_id")
+        .insert(P(), "supplier", P(), P(), P(), "0", P(), P(), P())
     )
+    conn.execute(q.get_sql(),
+        (eid, args.supplier_id, cat_id, args.tax_year,
+         args.withholding_amount, args.voucher_type, args.voucher_id))
     audit(conn, "erpclaw-tax", "record-withholding-entry", "tax_withholding_entry", eid,
            new_values={"supplier_id": args.supplier_id, "amount": args.withholding_amount})
     conn.commit()
@@ -793,8 +837,8 @@ def record_1099_payment(conn, args):
     if not args.voucher_id:
         err("--voucher-id is required")
 
-    _sup = conn.execute("SELECT * FROM supplier WHERE id = ?",
-                        (args.supplier_id,)).fetchone()
+    q_sup = Q.from_(supp_t).select(supp_t.star).where(supp_t.id == P())
+    _sup = conn.execute(q_sup.get_sql(), (args.supplier_id,)).fetchone()
     if not _sup:
         err(f"Supplier not found: {args.supplier_id}")
     supplier = row_to_dict(_sup)
@@ -804,23 +848,26 @@ def record_1099_payment(conn, args):
         err("Supplier has no withholding category assigned")
 
     eid = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO tax_withholding_entry
-           (id, party_type, party_id, category_id, fiscal_year,
-            taxable_amount, withheld_amount,
-            taxable_voucher_type, taxable_voucher_id)
-           VALUES (?, 'supplier', ?, ?, ?, ?, '0', ?, ?)""",
-        (eid, args.supplier_id, cat_id, args.tax_year,
-         args.ple_amount, args.voucher_type, args.voucher_id),
+    q = (
+        Q.into(twe_t)
+        .columns("id", "party_type", "party_id", "category_id", "fiscal_year",
+                 "taxable_amount", "withheld_amount",
+                 "taxable_voucher_type", "taxable_voucher_id")
+        .insert(P(), "supplier", P(), P(), P(), P(), "0", P(), P())
     )
+    conn.execute(q.get_sql(),
+        (eid, args.supplier_id, cat_id, args.tax_year,
+         args.ple_amount, args.voucher_type, args.voucher_id))
 
     # Get YTD total
-    ytd = conn.execute(
-        """SELECT COALESCE(decimal_sum(taxable_amount), '0') as total
-           FROM tax_withholding_entry
-           WHERE party_type = 'supplier' AND party_id = ? AND fiscal_year = ?""",
-        (args.supplier_id, args.tax_year),
-    ).fetchone()
+    q_ytd = (
+        Q.from_(twe_t)
+        .select(fn.Coalesce(DecimalSum(twe_t.taxable_amount), ValueWrapper("0")).as_("total"))
+        .where(twe_t.party_type == "supplier")
+        .where(twe_t.party_id == P())
+        .where(twe_t.fiscal_year == P())
+    )
+    ytd = conn.execute(q_ytd.get_sql(), (args.supplier_id, args.tax_year)).fetchone()
 
     audit(conn, "erpclaw-tax", "record-1099-payment", "tax_withholding_entry", eid,
            new_values={"supplier_id": args.supplier_id, "amount": args.ple_amount})
@@ -834,12 +881,11 @@ def generate_1099_data(conn, args):
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
     # Get all withholding categories for this company
-    cats = conn.execute(
-        "SELECT * FROM tax_withholding_category WHERE company_id = ?",
-        (company_id,)).fetchall()
+    q_cats = Q.from_(twc_t).select(twc_t.star).where(twc_t.company_id == P())
+    cats = conn.execute(q_cats.get_sql(), (company_id,)).fetchall()
     cat_map = {c["id"]: row_to_dict(c) for c in cats}
 
-    # Get all suppliers with 1099 entries for the year
+    # Get all suppliers with 1099 entries for the year (IN subquery — keep raw SQL)
     entries = conn.execute(
         """SELECT party_id, category_id,
                   decimal_sum(taxable_amount) as total_paid
@@ -851,6 +897,8 @@ def generate_1099_data(conn, args):
     ).fetchall()
 
     vendors = []
+    q_sup_info = Q.from_(supp_t).select(supp_t.id, supp_t.name, supp_t.tax_id).where(supp_t.id == P())
+    sup_info_sql = q_sup_info.get_sql()
     for entry in entries:
         cat = cat_map.get(entry["category_id"])
         if not cat:
@@ -860,9 +908,7 @@ def generate_1099_data(conn, args):
         if total < threshold:
             continue
 
-        _sup = conn.execute(
-            "SELECT id, name, tax_id FROM supplier WHERE id = ?",
-            (entry["party_id"],)).fetchone()
+        _sup = conn.execute(sup_info_sql, (entry["party_id"],)).fetchone()
         if not _sup:
             continue
         supplier = row_to_dict(_sup)
@@ -887,17 +933,14 @@ def generate_1099_data(conn, args):
 def status_action(conn, args):
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
-    templates = conn.execute(
-        "SELECT COUNT(*) as cnt FROM tax_template WHERE company_id = ?",
-        (company_id,)).fetchone()["cnt"]
-    rules = conn.execute(
-        "SELECT COUNT(*) as cnt FROM tax_rule WHERE company_id = ?",
-        (company_id,)).fetchone()["cnt"]
-    wh_cats = conn.execute(
-        "SELECT COUNT(*) as cnt FROM tax_withholding_category WHERE company_id = ?",
-        (company_id,)).fetchone()["cnt"]
+    q_tt = Q.from_(tt_t).select(fn.Count("*").as_("cnt")).where(tt_t.company_id == P())
+    templates = conn.execute(q_tt.get_sql(), (company_id,)).fetchone()["cnt"]
+    q_tr = Q.from_(tr_t).select(fn.Count("*").as_("cnt")).where(tr_t.company_id == P())
+    rules = conn.execute(q_tr.get_sql(), (company_id,)).fetchone()["cnt"]
+    q_wc = Q.from_(twc_t).select(fn.Count("*").as_("cnt")).where(twc_t.company_id == P())
+    wh_cats = conn.execute(q_wc.get_sql(), (company_id,)).fetchone()["cnt"]
 
-    # Count distinct 1099 vendors for current year
+    # Count distinct 1099 vendors for current year (IN subquery — keep raw SQL)
     year = str(datetime.now(timezone.utc).year)
     vendors = conn.execute(
         """SELECT COUNT(DISTINCT party_id) as cnt

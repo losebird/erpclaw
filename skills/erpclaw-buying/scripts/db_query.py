@@ -35,6 +35,8 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
+    from erpclaw_lib.query import Q, P, Table, Field, fn, Case, Order, Criterion, Not, NULL, DecimalSum, DecimalAbs
+    from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
@@ -59,18 +61,24 @@ def _parse_json_arg(value, name):
 
 
 def _get_fiscal_year(conn, posting_date: str) -> str | None:
-    fy = conn.execute(
-        "SELECT name FROM fiscal_year WHERE start_date <= ? AND end_date >= ? AND is_closed = 0",
-        (posting_date, posting_date),
-    ).fetchone()
+    fy_t = Table("fiscal_year")
+    q = (Q.from_(fy_t)
+         .select(fy_t.name)
+         .where(fy_t.start_date <= P())
+         .where(fy_t.end_date >= P())
+         .where(fy_t.is_closed == 0))
+    fy = conn.execute(q.get_sql(), (posting_date, posting_date)).fetchone()
     return fy["name"] if fy else None
 
 
 def _get_cost_center(conn, company_id: str) -> str | None:
-    cc = conn.execute(
-        "SELECT id FROM cost_center WHERE company_id = ? AND is_group = 0 LIMIT 1",
-        (company_id,),
-    ).fetchone()
+    cc_t = Table("cost_center")
+    q = (Q.from_(cc_t)
+         .select(cc_t.id)
+         .where(cc_t.company_id == P())
+         .where(cc_t.is_group == 0)
+         .limit(1))
+    cc = conn.execute(q.get_sql(), (company_id,)).fetchone()
     return cc["id"] if cc else None
 
 
@@ -82,14 +90,14 @@ def _calculate_tax(conn, tax_template_id, subtotal):
     """Calculate tax from template. Returns (tax_amount, tax_details list)."""
     if not tax_template_id:
         return Decimal("0"), []
-    lines = conn.execute(
-        """SELECT ttl.*, a.name as account_name
-           FROM tax_template_line ttl
-           LEFT JOIN account a ON a.id = ttl.tax_account_id
-           WHERE ttl.tax_template_id = ?
-           ORDER BY ttl.row_order""",
-        (tax_template_id,),
-    ).fetchall()
+    ttl = Table("tax_template_line").as_("ttl")
+    a = Table("account").as_("a")
+    q = (Q.from_(ttl)
+         .left_join(a).on(a.id == ttl.tax_account_id)
+         .select(ttl.star, a.name.as_("account_name"))
+         .where(ttl.tax_template_id == P())
+         .orderby(ttl.row_order))
+    lines = conn.execute(q.get_sql(), (tax_template_id,)).fetchall()
     if not lines:
         return Decimal("0"), []
     total_tax = Decimal("0")
@@ -131,8 +139,9 @@ def add_supplier(conn, args):
     if not args.company_id:
         err("--company-id is required")
 
-    if not conn.execute("SELECT id FROM company WHERE id = ?",
-                        (args.company_id,)).fetchone():
+    company_t = Table("company")
+    q = Q.from_(company_t).select(company_t.id).where(company_t.id == P())
+    if not conn.execute(q.get_sql(), (args.company_id,)).fetchone():
         err(f"Company {args.company_id} not found")
 
     supplier_type = args.supplier_type or "company"
@@ -140,8 +149,9 @@ def add_supplier(conn, args):
         err("--supplier-type must be 'company' or 'individual'")
 
     if args.payment_terms_id:
-        if not conn.execute("SELECT id FROM payment_terms WHERE id = ?",
-                            (args.payment_terms_id,)).fetchone():
+        pt_t = Table("payment_terms")
+        q = Q.from_(pt_t).select(pt_t.id).where(pt_t.id == P())
+        if not conn.execute(q.get_sql(), (args.payment_terms_id,)).fetchone():
             err(f"Payment terms {args.payment_terms_id} not found")
 
     primary_address = args.primary_address
@@ -152,15 +162,17 @@ def add_supplier(conn, args):
 
     supplier_id = str(uuid.uuid4())
     try:
-        conn.execute(
-            """INSERT INTO supplier
-               (id, name, supplier_group, supplier_type, payment_terms_id,
-                tax_id, is_1099_vendor, primary_address, status, company_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
+        s_t = Table("supplier")
+        q = (Q.into(s_t)
+             .columns("id", "name", "supplier_group", "supplier_type",
+                      "payment_terms_id", "tax_id", "is_1099_vendor",
+                      "primary_address", "status", "company_id")
+             .insert(P(), P(), P(), P(), P(), P(), P(), P(),
+                     ValueWrapper("active"), P()))
+        conn.execute(q.get_sql(),
             (supplier_id, args.name, args.supplier_group, supplier_type,
              args.payment_terms_id, args.tax_id, is_1099,
-             primary_address, args.company_id),
-        )
+             primary_address, args.company_id))
     except sqlite3.IntegrityError as e:
         sys.stderr.write(f"[erpclaw-buying] {e}\n")
         err("Supplier creation failed — check for duplicates or invalid data")
@@ -180,7 +192,10 @@ def update_supplier(conn, args):
     if not args.supplier_id:
         err("--supplier-id is required")
 
-    supplier = conn.execute("SELECT * FROM supplier WHERE id = ? OR name = ?",
+    s_t = Table("supplier")
+    q = (Q.from_(s_t).select(s_t.star)
+         .where((s_t.id == P()) | (s_t.name == P())))
+    supplier = conn.execute(q.get_sql(),
                             (args.supplier_id, args.supplier_id)).fetchone()
     if not supplier:
         err(f"Supplier {args.supplier_id} not found",
@@ -211,6 +226,7 @@ def update_supplier(conn, args):
     if not updated_fields:
         err("No fields to update")
 
+    # raw SQL — dynamic column list built at runtime
     updates.append("updated_at = datetime('now')")
     params.append(args.supplier_id)
     conn.execute(f"UPDATE supplier SET {', '.join(updates)} WHERE id = ?", params)
@@ -230,7 +246,10 @@ def get_supplier(conn, args):
     if not args.supplier_id:
         err("--supplier-id is required")
 
-    supplier = conn.execute("SELECT * FROM supplier WHERE id = ? OR name = ?",
+    s_t = Table("supplier")
+    q = (Q.from_(s_t).select(s_t.star)
+         .where((s_t.id == P()) | (s_t.name == P())))
+    supplier = conn.execute(q.get_sql(),
                             (args.supplier_id, args.supplier_id)).fetchone()
     if not supplier:
         err(f"Supplier {args.supplier_id} not found")
@@ -238,13 +257,14 @@ def get_supplier(conn, args):
     data = row_to_dict(supplier)
 
     # Outstanding from purchase invoices
-    outstanding = conn.execute(
-        """SELECT COALESCE(decimal_sum(outstanding_amount), '0') as total_outstanding,
-                  COUNT(*) as invoice_count
-           FROM purchase_invoice
-           WHERE supplier_id = ? AND status IN ('submitted', 'overdue', 'partially_paid')""",
-        (args.supplier_id,),
-    ).fetchone()
+    pi_t = Table("purchase_invoice")
+    q = (Q.from_(pi_t)
+         .select(fn.Coalesce(DecimalSum(pi_t.outstanding_amount), ValueWrapper("0")).as_("total_outstanding"),
+                 fn.Count("*").as_("invoice_count"))
+         .where(pi_t.supplier_id == P())
+         .where(pi_t.status.isin([P(), P(), P()])))
+    outstanding = conn.execute(q.get_sql(),
+        (args.supplier_id, "submitted", "overdue", "partially_paid")).fetchone()
     data["total_outstanding"] = str(round_currency(to_decimal(str(outstanding["total_outstanding"]))))
     data["outstanding_invoice_count"] = outstanding["invoice_count"]
 
@@ -257,38 +277,37 @@ def get_supplier(conn, args):
 
 def list_suppliers(conn, args):
     """List suppliers with filtering."""
-    conditions = ["1=1"]
+    s = Table("supplier").as_("s")
     params = []
 
+    count_q = Q.from_(s).select(fn.Count("*"))
+    data_q = (Q.from_(s)
+              .select(s.id, s.name, s.supplier_group, s.supplier_type,
+                      s.tax_id, s.is_1099_vendor, s.status, s.company_id))
+
     if args.company_id:
-        conditions.append("s.company_id = ?")
+        count_q = count_q.where(s.company_id == P())
+        data_q = data_q.where(s.company_id == P())
         params.append(args.company_id)
     if args.supplier_group:
-        conditions.append("s.supplier_group = ?")
+        count_q = count_q.where(s.supplier_group == P())
+        data_q = data_q.where(s.supplier_group == P())
         params.append(args.supplier_group)
     if args.search:
-        conditions.append("(s.name LIKE ? OR s.tax_id LIKE ?)")
+        crit = (s.name.like(P())) | (s.tax_id.like(P()))
+        count_q = count_q.where(crit)
+        data_q = data_q.where(crit)
         params.extend([f"%{args.search}%", f"%{args.search}%"])
 
-    where = " AND ".join(conditions)
-
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM supplier s WHERE {where}", params
-    ).fetchone()
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
+    data_params = params + [limit, offset]
 
-    rows = conn.execute(
-        f"""SELECT s.id, s.name, s.supplier_group, s.supplier_type,
-               s.tax_id, s.is_1099_vendor, s.status, s.company_id
-           FROM supplier s WHERE {where}
-           ORDER BY s.name
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    data_q = data_q.orderby(s.name).limit(P()).offset(P())
+    rows = conn.execute(data_q.get_sql(), data_params).fetchall()
 
     ok({"suppliers": [row_to_dict(r) for r in rows], "total_count": total_count,
          "limit": limit, "offset": offset, "has_more": offset + limit < total_count})
@@ -314,8 +333,9 @@ def add_material_request(conn, args):
     if not args.company_id:
         err("--company-id is required")
 
-    if not conn.execute("SELECT id FROM company WHERE id = ?",
-                        (args.company_id,)).fetchone():
+    company_t = Table("company")
+    q = Q.from_(company_t).select(company_t.id).where(company_t.id == P())
+    if not conn.execute(q.get_sql(), (args.company_id,)).fetchone():
         err(f"Company {args.company_id} not found")
 
     items = _parse_json_arg(args.items, "items")
@@ -325,12 +345,17 @@ def add_material_request(conn, args):
     mr_id = str(uuid.uuid4())
 
     # Insert parent first (FK target)
-    conn.execute(
-        """INSERT INTO material_request
-           (id, request_type, status, company_id)
-           VALUES (?, ?, 'draft', ?)""",
-        (mr_id, rtype, args.company_id),
-    )
+    mr_t = Table("material_request")
+    q = (Q.into(mr_t)
+         .columns("id", "request_type", "status", "company_id")
+         .insert(P(), P(), ValueWrapper("draft"), P()))
+    conn.execute(q.get_sql(), (mr_id, rtype, args.company_id))
+
+    mri_t = Table("material_request_item")
+    mri_q = (Q.into(mri_t)
+             .columns("id", "material_request_id", "item_id", "quantity", "warehouse_id")
+             .insert(P(), P(), P(), P(), P()))
+    mri_sql = mri_q.get_sql()
 
     for i, item in enumerate(items):
         item_id = item.get("item_id")
@@ -340,13 +365,9 @@ def add_material_request(conn, args):
         if qty <= 0:
             err(f"Item {i}: qty must be > 0")
 
-        conn.execute(
-            """INSERT INTO material_request_item
-               (id, material_request_id, item_id, quantity, warehouse_id)
-               VALUES (?, ?, ?, ?, ?)""",
+        conn.execute(mri_sql,
             (str(uuid.uuid4()), mr_id, item_id, str(round_currency(qty)),
-             item.get("warehouse_id")),
-        )
+             item.get("warehouse_id")))
 
     audit(conn, "erpclaw-buying", "add-material-request", "material_request", mr_id,
            new_values={"request_type": rtype, "item_count": len(items)})
@@ -364,8 +385,9 @@ def submit_material_request(conn, args):
     if not args.material_request_id:
         err("--material-request-id is required")
 
-    mr = conn.execute("SELECT * FROM material_request WHERE id = ?",
-                      (args.material_request_id,)).fetchone()
+    mr_t = Table("material_request")
+    q = Q.from_(mr_t).select(mr_t.star).where(mr_t.id == P())
+    mr = conn.execute(q.get_sql(), (args.material_request_id,)).fetchone()
     if not mr:
         err(f"Material request {args.material_request_id} not found")
     if mr["status"] != "draft":
@@ -373,11 +395,12 @@ def submit_material_request(conn, args):
 
     naming = get_next_name(conn, "material_request", company_id=mr["company_id"])
 
-    conn.execute(
-        """UPDATE material_request SET status = 'submitted', naming_series = ?,
-           updated_at = datetime('now') WHERE id = ?""",
-        (naming, args.material_request_id),
-    )
+    q = (Q.update(mr_t)
+         .set(mr_t.status, ValueWrapper("submitted"))
+         .set(mr_t.naming_series, P())
+         .set(mr_t.updated_at, LiteralValue("datetime('now')"))
+         .where(mr_t.id == P()))
+    conn.execute(q.get_sql(), (naming, args.material_request_id))
 
     audit(conn, "erpclaw-buying", "submit-material-request", "material_request",
            args.material_request_id,
@@ -393,39 +416,37 @@ def submit_material_request(conn, args):
 
 def list_material_requests(conn, args):
     """List material requests."""
-    conditions = ["1=1"]
+    mr = Table("material_request").as_("mr")
     params = []
 
+    count_q = Q.from_(mr).select(fn.Count("*"))
+    data_q = Q.from_(mr).select(mr.star)
+
     if args.company_id:
-        conditions.append("mr.company_id = ?")
+        count_q = count_q.where(mr.company_id == P())
+        data_q = data_q.where(mr.company_id == P())
         params.append(args.company_id)
     if args.request_type:
         rtype = args.request_type
         if rtype == "transfer":
             rtype = "material_transfer"
-        conditions.append("mr.request_type = ?")
+        count_q = count_q.where(mr.request_type == P())
+        data_q = data_q.where(mr.request_type == P())
         params.append(rtype)
     if args.mr_status:
-        conditions.append("mr.status = ?")
+        count_q = count_q.where(mr.status == P())
+        data_q = data_q.where(mr.status == P())
         params.append(args.mr_status)
 
-    where = " AND ".join(conditions)
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM material_request mr WHERE {where}", params
-    ).fetchone()
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
+    data_params = params + [limit, offset]
 
-    rows = conn.execute(
-        f"""SELECT mr.* FROM material_request mr
-           WHERE {where}
-           ORDER BY mr.created_at DESC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    data_q = data_q.orderby(mr.created_at, order=Order.desc).limit(P()).offset(P())
+    rows = conn.execute(data_q.get_sql(), data_params).fetchall()
 
     ok({"material_requests": [row_to_dict(r) for r in rows],
          "total_count": total_count, "limit": limit, "offset": offset,
@@ -445,8 +466,9 @@ def add_rfq(conn, args):
     if not args.company_id:
         err("--company-id is required")
 
-    if not conn.execute("SELECT id FROM company WHERE id = ?",
-                        (args.company_id,)).fetchone():
+    company_t = Table("company")
+    q = Q.from_(company_t).select(company_t.id).where(company_t.id == P())
+    if not conn.execute(q.get_sql(), (args.company_id,)).fetchone():
         err(f"Company {args.company_id} not found")
 
     items = _parse_json_arg(args.items, "items")
@@ -458,23 +480,29 @@ def add_rfq(conn, args):
         err("--suppliers must be a non-empty JSON array")
 
     # Validate suppliers exist
+    sup_t = Table("supplier")
+    sup_q = Q.from_(sup_t).select(sup_t.id).where(sup_t.id == P())
+    sup_sql = sup_q.get_sql()
     for sid in suppliers:
-        if not conn.execute("SELECT id FROM supplier WHERE id = ?",
-                            (sid,)).fetchone():
+        if not conn.execute(sup_sql, (sid,)).fetchone():
             err(f"Supplier {sid} not found")
 
     rfq_id = str(uuid.uuid4())
     today = _today()
 
     # Insert parent first
-    conn.execute(
-        """INSERT INTO request_for_quotation
-           (id, rfq_date, status, company_id)
-           VALUES (?, ?, 'draft', ?)""",
-        (rfq_id, today, args.company_id),
-    )
+    rfq_t = Table("request_for_quotation")
+    q = (Q.into(rfq_t)
+         .columns("id", "rfq_date", "status", "company_id")
+         .insert(P(), P(), ValueWrapper("draft"), P()))
+    conn.execute(q.get_sql(), (rfq_id, today, args.company_id))
 
     # Insert RFQ items
+    ri_t = Table("rfq_item")
+    ri_q = (Q.into(ri_t)
+            .columns("id", "rfq_id", "item_id", "quantity", "uom", "required_date")
+            .insert(P(), P(), P(), P(), P(), P()))
+    ri_sql = ri_q.get_sql()
     for i, item in enumerate(items):
         item_id = item.get("item_id")
         if not item_id:
@@ -482,21 +510,18 @@ def add_rfq(conn, args):
         qty = to_decimal(item.get("qty", "0"))
         if qty <= 0:
             err(f"Item {i}: qty must be > 0")
-        conn.execute(
-            """INSERT INTO rfq_item
-               (id, rfq_id, item_id, quantity, uom, required_date)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+        conn.execute(ri_sql,
             (str(uuid.uuid4()), rfq_id, item_id, str(round_currency(qty)),
-             item.get("uom"), item.get("required_date")),
-        )
+             item.get("uom"), item.get("required_date")))
 
     # Insert RFQ suppliers
+    rs_t = Table("rfq_supplier")
+    rs_q = (Q.into(rs_t)
+            .columns("id", "rfq_id", "supplier_id")
+            .insert(P(), P(), P()))
+    rs_sql = rs_q.get_sql()
     for sid in suppliers:
-        conn.execute(
-            """INSERT INTO rfq_supplier (id, rfq_id, supplier_id)
-               VALUES (?, ?, ?)""",
-            (str(uuid.uuid4()), rfq_id, sid),
-        )
+        conn.execute(rs_sql, (str(uuid.uuid4()), rfq_id, sid))
 
     audit(conn, "erpclaw-buying", "add-rfq", "request_for_quotation", rfq_id,
            new_values={"item_count": len(items), "supplier_count": len(suppliers)})
@@ -514,8 +539,9 @@ def submit_rfq(conn, args):
     if not args.rfq_id:
         err("--rfq-id is required")
 
-    rfq = conn.execute("SELECT * FROM request_for_quotation WHERE id = ?",
-                       (args.rfq_id,)).fetchone()
+    rfq_t = Table("request_for_quotation")
+    q = Q.from_(rfq_t).select(rfq_t.star).where(rfq_t.id == P())
+    rfq = conn.execute(q.get_sql(), (args.rfq_id,)).fetchone()
     if not rfq:
         err(f"RFQ {args.rfq_id} not found")
     if rfq["status"] != "draft":
@@ -524,18 +550,19 @@ def submit_rfq(conn, args):
     naming = get_next_name(conn, "request_for_quotation",
                            company_id=rfq["company_id"])
 
-    conn.execute(
-        """UPDATE request_for_quotation SET status = 'submitted',
-           naming_series = ?, updated_at = datetime('now') WHERE id = ?""",
-        (naming, args.rfq_id),
-    )
+    q = (Q.update(rfq_t)
+         .set(rfq_t.status, ValueWrapper("submitted"))
+         .set(rfq_t.naming_series, P())
+         .set(rfq_t.updated_at, LiteralValue("datetime('now')"))
+         .where(rfq_t.id == P()))
+    conn.execute(q.get_sql(), (naming, args.rfq_id))
 
     # Mark sent_date on rfq_supplier rows
-    conn.execute(
-        """UPDATE rfq_supplier SET sent_date = datetime('now')
-           WHERE rfq_id = ?""",
-        (args.rfq_id,),
-    )
+    rs_t = Table("rfq_supplier")
+    q = (Q.update(rs_t)
+         .set(rs_t.sent_date, LiteralValue("datetime('now')"))
+         .where(rs_t.rfq_id == P()))
+    conn.execute(q.get_sql(), (args.rfq_id,))
 
     audit(conn, "erpclaw-buying", "submit-rfq", "request_for_quotation", args.rfq_id,
            new_values={"naming_series": naming})
@@ -550,35 +577,32 @@ def submit_rfq(conn, args):
 
 def list_rfqs(conn, args):
     """List RFQs."""
-    conditions = ["1=1"]
+    r = Table("request_for_quotation").as_("r")
     params = []
 
+    count_q = Q.from_(r).select(fn.Count("*"))
+    data_q = Q.from_(r).select(r.star)
+
     if args.company_id:
-        conditions.append("r.company_id = ?")
+        count_q = count_q.where(r.company_id == P())
+        data_q = data_q.where(r.company_id == P())
         params.append(args.company_id)
     if args.rfq_status:
-        conditions.append("r.status = ?")
+        count_q = count_q.where(r.status == P())
+        data_q = data_q.where(r.status == P())
         params.append(args.rfq_status)
 
-    where = " AND ".join(conditions)
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM request_for_quotation r WHERE {where}", params
-    ).fetchone()
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
+    data_params = params + [limit, offset]
 
-    rows = conn.execute(
-        f"""SELECT r.* FROM request_for_quotation r
-           WHERE {where}
-           ORDER BY r.created_at DESC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    data_q = data_q.orderby(r.created_at, order=Order.desc).limit(P()).offset(P())
+    rows = conn.execute(data_q.get_sql(), data_params).fetchall()
 
-    ok({"rfqs": [row_to_dict(r) for r in rows], "total_count": total_count,
+    ok({"rfqs": [row_to_dict(r_row) for r_row in rows], "total_count": total_count,
          "limit": limit, "offset": offset, "has_more": offset + limit < total_count})
 
 
@@ -595,12 +619,16 @@ def add_supplier_quotation(conn, args):
     if not args.items:
         err("--items is required (JSON array with prices)")
 
-    rfq = conn.execute("SELECT * FROM request_for_quotation WHERE id = ?",
-                       (args.rfq_id,)).fetchone()
+    rfq_t = Table("request_for_quotation")
+    q = Q.from_(rfq_t).select(rfq_t.star).where(rfq_t.id == P())
+    rfq = conn.execute(q.get_sql(), (args.rfq_id,)).fetchone()
     if not rfq:
         err(f"RFQ {args.rfq_id} not found")
 
-    supplier = conn.execute("SELECT * FROM supplier WHERE id = ? OR name = ?",
+    sup_t = Table("supplier")
+    q = (Q.from_(sup_t).select(sup_t.star)
+         .where((sup_t.id == P()) | (sup_t.name == P())))
+    supplier = conn.execute(q.get_sql(),
                             (args.supplier_id, args.supplier_id)).fetchone()
     if not supplier:
         err(f"Supplier {args.supplier_id} not found")
@@ -615,13 +643,25 @@ def add_supplier_quotation(conn, args):
     total_amount = Decimal("0")
 
     # Insert parent first
-    conn.execute(
-        """INSERT INTO supplier_quotation
-           (id, supplier_id, quotation_date, rfq_id, total_amount,
-            grand_total, status, company_id)
-           VALUES (?, ?, ?, ?, '0', '0', 'draft', ?)""",
-        (sq_id, args.supplier_id, today, args.rfq_id, rfq["company_id"]),
-    )
+    sq_t = Table("supplier_quotation")
+    q = (Q.into(sq_t)
+         .columns("id", "supplier_id", "quotation_date", "rfq_id",
+                  "total_amount", "grand_total", "status", "company_id")
+         .insert(P(), P(), P(), P(), ValueWrapper("0"), ValueWrapper("0"),
+                 ValueWrapper("draft"), P()))
+    conn.execute(q.get_sql(),
+        (sq_id, args.supplier_id, today, args.rfq_id, rfq["company_id"]))
+
+    ri_t = Table("rfq_item")
+    ri_q = Q.from_(ri_t).select(ri_t.star).where(ri_t.id == P())
+    ri_sql = ri_q.get_sql()
+
+    sqi_t = Table("supplier_quotation_item")
+    sqi_q = (Q.into(sqi_t)
+             .columns("id", "supplier_quotation_id", "item_id", "quantity",
+                      "rate", "amount", "lead_time_days")
+             .insert(P(), P(), P(), P(), P(), P(), P()))
+    sqi_sql = sqi_q.get_sql()
 
     for i, item in enumerate(items):
         rfq_item_id = item.get("rfq_item_id")
@@ -632,8 +672,7 @@ def add_supplier_quotation(conn, args):
             err(f"Item {i}: rate must be > 0")
 
         # Get qty from the rfq_item
-        rfq_item = conn.execute("SELECT * FROM rfq_item WHERE id = ?",
-                                (rfq_item_id,)).fetchone()
+        rfq_item = conn.execute(ri_sql, (rfq_item_id,)).fetchone()
         if not rfq_item:
             err(f"Item {i}: rfq_item {rfq_item_id} not found")
 
@@ -641,45 +680,40 @@ def add_supplier_quotation(conn, args):
         amount = round_currency(qty * rate)
         total_amount += amount
 
-        conn.execute(
-            """INSERT INTO supplier_quotation_item
-               (id, supplier_quotation_id, item_id, quantity, rate, amount,
-                lead_time_days)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        conn.execute(sqi_sql,
             (str(uuid.uuid4()), sq_id, rfq_item["item_id"],
              str(round_currency(qty)), str(round_currency(rate)),
-             str(amount), item.get("lead_time_days")),
-        )
+             str(amount), item.get("lead_time_days")))
 
     # Update totals
-    conn.execute(
-        """UPDATE supplier_quotation SET total_amount = ?, grand_total = ?
-           WHERE id = ?""",
-        (str(round_currency(total_amount)), str(round_currency(total_amount)),
-         sq_id),
-    )
+    q = (Q.update(sq_t)
+         .set(sq_t.total_amount, P())
+         .set(sq_t.grand_total, P())
+         .where(sq_t.id == P()))
+    conn.execute(q.get_sql(),
+        (str(round_currency(total_amount)), str(round_currency(total_amount)), sq_id))
 
     # Mark rfq_supplier as having a response
-    conn.execute(
-        """UPDATE rfq_supplier SET response_date = datetime('now'),
-           supplier_quotation_id = ?
-           WHERE rfq_id = ? AND supplier_id = ?""",
-        (sq_id, args.rfq_id, args.supplier_id),
-    )
+    rs_t = Table("rfq_supplier")
+    q = (Q.update(rs_t)
+         .set(rs_t.response_date, LiteralValue("datetime('now')"))
+         .set(rs_t.supplier_quotation_id, P())
+         .where(rs_t.rfq_id == P())
+         .where(rs_t.supplier_id == P()))
+    conn.execute(q.get_sql(), (sq_id, args.rfq_id, args.supplier_id))
 
     # Update RFQ status if all suppliers responded
-    all_responded = conn.execute(
-        """SELECT COUNT(*) as total,
-                  SUM(CASE WHEN supplier_quotation_id IS NOT NULL THEN 1 ELSE 0 END) as responded
-           FROM rfq_supplier WHERE rfq_id = ?""",
-        (args.rfq_id,),
-    ).fetchone()
+    q = (Q.from_(rs_t)
+         .select(fn.Count("*").as_("total"),
+                 fn.Sum(Case().when(rs_t.supplier_quotation_id.isnotnull(), 1).else_(0)).as_("responded"))
+         .where(rs_t.rfq_id == P()))
+    all_responded = conn.execute(q.get_sql(), (args.rfq_id,)).fetchone()
     if all_responded["total"] == all_responded["responded"]:
-        conn.execute(
-            """UPDATE request_for_quotation SET status = 'quotation_received',
-               updated_at = datetime('now') WHERE id = ?""",
-            (args.rfq_id,),
-        )
+        q = (Q.update(rfq_t)
+             .set(rfq_t.status, ValueWrapper("quotation_received"))
+             .set(rfq_t.updated_at, LiteralValue("datetime('now')"))
+             .where(rfq_t.id == P()))
+        conn.execute(q.get_sql(), (args.rfq_id,))
 
     audit(conn, "erpclaw-buying", "add-supplier-quotation", "supplier_quotation", sq_id,
            new_values={"supplier_id": args.supplier_id, "rfq_id": args.rfq_id,
@@ -695,36 +729,33 @@ def add_supplier_quotation(conn, args):
 
 def list_supplier_quotations(conn, args):
     """List supplier quotations."""
-    conditions = ["1=1"]
+    sq = Table("supplier_quotation").as_("sq")
+    s = Table("supplier").as_("s")
     params = []
 
+    count_q = Q.from_(sq).select(fn.Count("*"))
+    data_q = (Q.from_(sq)
+              .left_join(s).on(s.id == sq.supplier_id)
+              .select(sq.star, s.name.as_("supplier_name")))
+
     if args.rfq_id:
-        conditions.append("sq.rfq_id = ?")
+        count_q = count_q.where(sq.rfq_id == P())
+        data_q = data_q.where(sq.rfq_id == P())
         params.append(args.rfq_id)
     if args.supplier_id:
-        conditions.append("sq.supplier_id = ?")
+        count_q = count_q.where(sq.supplier_id == P())
+        data_q = data_q.where(sq.supplier_id == P())
         params.append(args.supplier_id)
 
-    where = " AND ".join(conditions)
-
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM supplier_quotation sq WHERE {where}", params
-    ).fetchone()
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
+    data_params = params + [limit, offset]
 
-    rows = conn.execute(
-        f"""SELECT sq.*, s.name as supplier_name
-           FROM supplier_quotation sq
-           LEFT JOIN supplier s ON s.id = sq.supplier_id
-           WHERE {where}
-           ORDER BY sq.created_at DESC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    data_q = data_q.orderby(sq.created_at, order=Order.desc).limit(P()).offset(P())
+    rows = conn.execute(data_q.get_sql(), data_params).fetchall()
 
     ok({"supplier_quotations": [row_to_dict(r) for r in rows],
          "total_count": total_count, "limit": limit, "offset": offset,
@@ -740,37 +771,44 @@ def compare_supplier_quotations(conn, args):
     if not args.rfq_id:
         err("--rfq-id is required")
 
-    rfq = conn.execute("SELECT * FROM request_for_quotation WHERE id = ?",
-                       (args.rfq_id,)).fetchone()
+    rfq_t = Table("request_for_quotation")
+    q = Q.from_(rfq_t).select(rfq_t.star).where(rfq_t.id == P())
+    rfq = conn.execute(q.get_sql(), (args.rfq_id,)).fetchone()
     if not rfq:
         err(f"RFQ {args.rfq_id} not found")
 
     # Get all RFQ items
-    rfq_items = conn.execute(
-        """SELECT ri.*, i.item_code, i.item_name
-           FROM rfq_item ri
-           LEFT JOIN item i ON i.id = ri.item_id
-           WHERE ri.rfq_id = ?""",
-        (args.rfq_id,),
-    ).fetchall()
+    ri = Table("rfq_item").as_("ri")
+    i_t = Table("item").as_("i")
+    q = (Q.from_(ri)
+         .left_join(i_t).on(i_t.id == ri.item_id)
+         .select(ri.star, i_t.item_code, i_t.item_name)
+         .where(ri.rfq_id == P()))
+    rfq_items = conn.execute(q.get_sql(), (args.rfq_id,)).fetchall()
 
     # Get all supplier quotations for this RFQ
-    sqs = conn.execute(
-        """SELECT sq.*, s.name as supplier_name
-           FROM supplier_quotation sq
-           LEFT JOIN supplier s ON s.id = sq.supplier_id
-           WHERE sq.rfq_id = ?""",
-        (args.rfq_id,),
-    ).fetchall()
+    sq_t = Table("supplier_quotation").as_("sq")
+    s_t = Table("supplier").as_("s")
+    q = (Q.from_(sq_t)
+         .left_join(s_t).on(s_t.id == sq_t.supplier_id)
+         .select(sq_t.star, s_t.name.as_("supplier_name"))
+         .where(sq_t.rfq_id == P()))
+    sqs = conn.execute(q.get_sql(), (args.rfq_id,)).fetchall()
+
+    sqi_t = Table("supplier_quotation_item")
+    sqi_q = (Q.from_(sqi_t).select(sqi_t.star)
+             .where(sqi_t.supplier_quotation_id == P())
+             .where(sqi_t.item_id == P()))
+    sqi_sql = sqi_q.get_sql()
 
     comparison = []
     for ri_row in rfq_items:
-        ri = row_to_dict(ri_row)
+        ri_d = row_to_dict(ri_row)
         item_comparison = {
-            "item_id": ri["item_id"],
-            "item_code": ri.get("item_code"),
-            "item_name": ri.get("item_name"),
-            "required_qty": ri["quantity"],
+            "item_id": ri_d["item_id"],
+            "item_code": ri_d.get("item_code"),
+            "item_name": ri_d.get("item_name"),
+            "required_qty": ri_d["quantity"],
             "quotes": [],
             "lowest_rate": None,
             "lowest_supplier": None,
@@ -779,11 +817,8 @@ def compare_supplier_quotations(conn, args):
         for sq_row in sqs:
             sq = row_to_dict(sq_row)
             # Find the quote item for this RFQ item
-            sqi = conn.execute(
-                """SELECT * FROM supplier_quotation_item
-                   WHERE supplier_quotation_id = ? AND item_id = ?""",
-                (sq["id"], ri["item_id"]),
-            ).fetchone()
+            sqi = conn.execute(sqi_sql,
+                (sq["id"], ri_d["item_id"])).fetchone()
             if sqi:
                 sqi_d = row_to_dict(sqi)
                 rate = to_decimal(sqi_d["rate"])
@@ -825,7 +860,10 @@ def add_purchase_order(conn, args):
     if not args.company_id:
         err("--company-id is required")
 
-    supplier = conn.execute("SELECT * FROM supplier WHERE id = ? OR name = ?",
+    sup_t = Table("supplier")
+    q = (Q.from_(sup_t).select(sup_t.star)
+         .where((sup_t.id == P()) | (sup_t.name == P())))
+    supplier = conn.execute(q.get_sql(),
                             (args.supplier_id, args.supplier_id)).fetchone()
     if not supplier:
         err(f"Supplier {args.supplier_id} not found")
@@ -833,8 +871,9 @@ def add_purchase_order(conn, args):
     if supplier["status"] != "active":
         err(f"Supplier {supplier['name']} is {supplier['status']}")
 
-    if not conn.execute("SELECT id FROM company WHERE id = ?",
-                        (args.company_id,)).fetchone():
+    company_t = Table("company")
+    q = Q.from_(company_t).select(company_t.id).where(company_t.id == P())
+    if not conn.execute(q.get_sql(), (args.company_id,)).fetchone():
         err(f"Company {args.company_id} not found")
 
     items = _parse_json_arg(args.items, "items")
@@ -875,25 +914,27 @@ def add_purchase_order(conn, args):
     grand_total = round_currency(total_amount + tax_amount)
 
     # Insert parent first
-    conn.execute(
-        """INSERT INTO purchase_order
-           (id, supplier_id, order_date, total_amount, tax_amount, grand_total,
-            tax_template_id, status, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?)""",
+    po_t = Table("purchase_order")
+    q = (Q.into(po_t)
+         .columns("id", "supplier_id", "order_date", "total_amount",
+                  "tax_amount", "grand_total", "tax_template_id", "status",
+                  "company_id")
+         .insert(P(), P(), P(), P(), P(), P(), P(), ValueWrapper("draft"), P()))
+    conn.execute(q.get_sql(),
         (po_id, args.supplier_id, posting_date,
          str(round_currency(total_amount)), str(round_currency(tax_amount)),
-         str(grand_total), args.tax_template_id, args.company_id),
-    )
+         str(grand_total), args.tax_template_id, args.company_id))
 
     # Insert items
+    poi_t = Table("purchase_order_item")
+    poi_q = (Q.into(poi_t)
+             .columns("id", "purchase_order_id", "item_id", "quantity", "uom",
+                      "rate", "amount", "discount_percentage", "net_amount",
+                      "warehouse_id", "required_date")
+             .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+    poi_sql = poi_q.get_sql()
     for row_params in item_rows:
-        conn.execute(
-            """INSERT INTO purchase_order_item
-               (id, purchase_order_id, item_id, quantity, uom, rate, amount,
-                discount_percentage, net_amount, warehouse_id, required_date)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            row_params,
-        )
+        conn.execute(poi_sql, row_params)
 
     audit(conn, "erpclaw-buying", "add-purchase-order", "purchase_order", po_id,
            new_values={"supplier_id": args.supplier_id,
@@ -914,8 +955,9 @@ def update_purchase_order(conn, args):
     if not args.purchase_order_id:
         err("--purchase-order-id is required")
 
-    po = conn.execute("SELECT * FROM purchase_order WHERE id = ?",
-                      (args.purchase_order_id,)).fetchone()
+    po_t = Table("purchase_order")
+    q = Q.from_(po_t).select(po_t.star).where(po_t.id == P())
+    po = conn.execute(q.get_sql(), (args.purchase_order_id,)).fetchone()
     if not po:
         err(f"Purchase order {args.purchase_order_id} not found")
     if po["status"] != "draft":
@@ -930,8 +972,9 @@ def update_purchase_order(conn, args):
         err("--items must be a non-empty JSON array")
 
     # Delete old items and re-insert
-    conn.execute("DELETE FROM purchase_order_item WHERE purchase_order_id = ?",
-                 (args.purchase_order_id,))
+    poi_t = Table("purchase_order_item")
+    q = Q.from_(poi_t).delete().where(poi_t.purchase_order_id == P())
+    conn.execute(q.get_sql(), (args.purchase_order_id,))
 
     total_amount = Decimal("0")
     for i, item in enumerate(items):
@@ -950,6 +993,7 @@ def update_purchase_order(conn, args):
         net_amount = round_currency(amount * (Decimal("1") - discount_pct / Decimal("100")))
         total_amount += net_amount
 
+        # raw SQL — reuse same INSERT pattern for PO items
         conn.execute(
             """INSERT INTO purchase_order_item
                (id, purchase_order_id, item_id, quantity, uom, rate, amount,
@@ -965,12 +1009,15 @@ def update_purchase_order(conn, args):
     tax_amount, _ = _calculate_tax(conn, po["tax_template_id"], total_amount)
     grand_total = round_currency(total_amount + tax_amount)
 
-    conn.execute(
-        """UPDATE purchase_order SET total_amount = ?, tax_amount = ?,
-           grand_total = ?, updated_at = datetime('now') WHERE id = ?""",
+    q = (Q.update(po_t)
+         .set(po_t.total_amount, P())
+         .set(po_t.tax_amount, P())
+         .set(po_t.grand_total, P())
+         .set(po_t.updated_at, LiteralValue("datetime('now')"))
+         .where(po_t.id == P()))
+    conn.execute(q.get_sql(),
         (str(round_currency(total_amount)), str(round_currency(tax_amount)),
-         str(grand_total), args.purchase_order_id),
-    )
+         str(grand_total), args.purchase_order_id))
 
     audit(conn, "erpclaw-buying", "update-purchase-order", "purchase_order",
            args.purchase_order_id,
@@ -990,39 +1037,40 @@ def get_purchase_order(conn, args):
     if not args.purchase_order_id:
         err("--purchase-order-id is required")
 
-    po = conn.execute("SELECT * FROM purchase_order WHERE id = ?",
-                      (args.purchase_order_id,)).fetchone()
+    po_t = Table("purchase_order")
+    q = Q.from_(po_t).select(po_t.star).where(po_t.id == P())
+    po = conn.execute(q.get_sql(), (args.purchase_order_id,)).fetchone()
     if not po:
         err(f"Purchase order {args.purchase_order_id} not found")
 
     data = row_to_dict(po)
 
     # Items with received/invoiced status
-    items = conn.execute(
-        """SELECT poi.*, i.item_code, i.item_name
-           FROM purchase_order_item poi
-           LEFT JOIN item i ON i.id = poi.item_id
-           WHERE poi.purchase_order_id = ?
-           ORDER BY poi.rowid""",
-        (args.purchase_order_id,),
-    ).fetchall()
+    poi = Table("purchase_order_item").as_("poi")
+    i_t = Table("item").as_("i")
+    q = (Q.from_(poi)
+         .left_join(i_t).on(i_t.id == poi.item_id)
+         .select(poi.star, i_t.item_code, i_t.item_name)
+         .where(poi.purchase_order_id == P())
+         .orderby(poi.rowid))
+    items = conn.execute(q.get_sql(), (args.purchase_order_id,)).fetchall()
     data["items"] = [row_to_dict(r) for r in items]
 
     # Linked receipts
-    receipts = conn.execute(
-        """SELECT id, naming_series, status, posting_date
-           FROM purchase_receipt WHERE purchase_order_id = ?""",
-        (args.purchase_order_id,),
-    ).fetchall()
+    pr_t = Table("purchase_receipt")
+    q = (Q.from_(pr_t)
+         .select(pr_t.id, pr_t.naming_series, pr_t.status, pr_t.posting_date)
+         .where(pr_t.purchase_order_id == P()))
+    receipts = conn.execute(q.get_sql(), (args.purchase_order_id,)).fetchall()
     data["purchase_receipts"] = [row_to_dict(r) for r in receipts]
 
     # Linked invoices
-    invoices = conn.execute(
-        """SELECT id, naming_series, status, posting_date, grand_total,
-                  outstanding_amount
-           FROM purchase_invoice WHERE purchase_order_id = ?""",
-        (args.purchase_order_id,),
-    ).fetchall()
+    pi_t = Table("purchase_invoice")
+    q = (Q.from_(pi_t)
+         .select(pi_t.id, pi_t.naming_series, pi_t.status, pi_t.posting_date,
+                 pi_t.grand_total, pi_t.outstanding_amount)
+         .where(pi_t.purchase_order_id == P()))
+    invoices = conn.execute(q.get_sql(), (args.purchase_order_id,)).fetchall()
     data["purchase_invoices"] = [row_to_dict(r) for r in invoices]
 
     ok(data)
@@ -1034,44 +1082,48 @@ def get_purchase_order(conn, args):
 
 def list_purchase_orders(conn, args):
     """List purchase orders."""
-    conditions = ["1=1"]
+    po = Table("purchase_order").as_("po")
+    s = Table("supplier").as_("s")
     params = []
 
+    count_q = Q.from_(po).select(fn.Count("*"))
+    data_q = (Q.from_(po)
+              .left_join(s).on(s.id == po.supplier_id)
+              .select(po.star, s.name.as_("supplier_name")))
+
     if args.company_id:
-        conditions.append("po.company_id = ?")
+        count_q = count_q.where(po.company_id == P())
+        data_q = data_q.where(po.company_id == P())
         params.append(args.company_id)
     if args.supplier_id:
-        conditions.append("po.supplier_id = ?")
+        count_q = count_q.where(po.supplier_id == P())
+        data_q = data_q.where(po.supplier_id == P())
         params.append(args.supplier_id)
     if args.po_status:
-        conditions.append("po.status = ?")
+        count_q = count_q.where(po.status == P())
+        data_q = data_q.where(po.status == P())
         params.append(args.po_status)
     if args.from_date:
-        conditions.append("po.order_date >= ?")
+        count_q = count_q.where(po.order_date >= P())
+        data_q = data_q.where(po.order_date >= P())
         params.append(args.from_date)
     if args.to_date:
-        conditions.append("po.order_date <= ?")
+        count_q = count_q.where(po.order_date <= P())
+        data_q = data_q.where(po.order_date <= P())
         params.append(args.to_date)
 
-    where = " AND ".join(conditions)
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM purchase_order po WHERE {where}", params
-    ).fetchone()
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
+    data_params = params + [limit, offset]
 
-    rows = conn.execute(
-        f"""SELECT po.*, s.name as supplier_name
-           FROM purchase_order po
-           LEFT JOIN supplier s ON s.id = po.supplier_id
-           WHERE {where}
-           ORDER BY po.order_date DESC, po.created_at DESC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    data_q = (data_q
+              .orderby(po.order_date, order=Order.desc)
+              .orderby(po.created_at, order=Order.desc)
+              .limit(P()).offset(P()))
+    rows = conn.execute(data_q.get_sql(), data_params).fetchall()
 
     ok({"purchase_orders": [row_to_dict(r) for r in rows],
          "total_count": total_count, "limit": limit, "offset": offset,
@@ -1087,8 +1139,9 @@ def submit_purchase_order(conn, args):
     if not args.purchase_order_id:
         err("--purchase-order-id is required")
 
-    po = conn.execute("SELECT * FROM purchase_order WHERE id = ?",
-                      (args.purchase_order_id,)).fetchone()
+    po_t = Table("purchase_order")
+    q = Q.from_(po_t).select(po_t.star).where(po_t.id == P())
+    po = conn.execute(q.get_sql(), (args.purchase_order_id,)).fetchone()
     if not po:
         err(f"Purchase order {args.purchase_order_id} not found")
     if po["status"] != "draft":
@@ -1096,11 +1149,12 @@ def submit_purchase_order(conn, args):
 
     naming = get_next_name(conn, "purchase_order", company_id=po["company_id"])
 
-    conn.execute(
-        """UPDATE purchase_order SET status = 'confirmed', naming_series = ?,
-           updated_at = datetime('now') WHERE id = ?""",
-        (naming, args.purchase_order_id),
-    )
+    q = (Q.update(po_t)
+         .set(po_t.status, ValueWrapper("confirmed"))
+         .set(po_t.naming_series, P())
+         .set(po_t.updated_at, LiteralValue("datetime('now')"))
+         .where(po_t.id == P()))
+    conn.execute(q.get_sql(), (naming, args.purchase_order_id))
 
     audit(conn, "erpclaw-buying", "submit-purchase-order", "purchase_order",
            args.purchase_order_id,
@@ -1119,36 +1173,41 @@ def cancel_purchase_order(conn, args):
     if not args.purchase_order_id:
         err("--purchase-order-id is required")
 
-    po = conn.execute("SELECT * FROM purchase_order WHERE id = ?",
-                      (args.purchase_order_id,)).fetchone()
+    po_t = Table("purchase_order")
+    q = Q.from_(po_t).select(po_t.star).where(po_t.id == P())
+    po = conn.execute(q.get_sql(), (args.purchase_order_id,)).fetchone()
     if not po:
         err(f"Purchase order {args.purchase_order_id} not found")
     if po["status"] == "cancelled":
         err("Purchase order is already cancelled")
 
     # Check for linked receipts
-    receipts = conn.execute(
-        """SELECT COUNT(*) as cnt FROM purchase_receipt
-           WHERE purchase_order_id = ? AND status != 'cancelled'""",
-        (args.purchase_order_id,),
-    ).fetchone()
+    pr_t = Table("purchase_receipt")
+    q = (Q.from_(pr_t)
+         .select(fn.Count("*").as_("cnt"))
+         .where(pr_t.purchase_order_id == P())
+         .where(pr_t.status != P()))
+    receipts = conn.execute(q.get_sql(),
+        (args.purchase_order_id, "cancelled")).fetchone()
     if receipts["cnt"] > 0:
         err("Cannot cancel: PO has linked purchase receipts")
 
     # Check for linked invoices
-    invoices = conn.execute(
-        """SELECT COUNT(*) as cnt FROM purchase_invoice
-           WHERE purchase_order_id = ? AND status != 'cancelled'""",
-        (args.purchase_order_id,),
-    ).fetchone()
+    pi_t = Table("purchase_invoice")
+    q = (Q.from_(pi_t)
+         .select(fn.Count("*").as_("cnt"))
+         .where(pi_t.purchase_order_id == P())
+         .where(pi_t.status != P()))
+    invoices = conn.execute(q.get_sql(),
+        (args.purchase_order_id, "cancelled")).fetchone()
     if invoices["cnt"] > 0:
         err("Cannot cancel: PO has linked purchase invoices")
 
-    conn.execute(
-        """UPDATE purchase_order SET status = 'cancelled',
-           updated_at = datetime('now') WHERE id = ?""",
-        (args.purchase_order_id,),
-    )
+    q = (Q.update(po_t)
+         .set(po_t.status, ValueWrapper("cancelled"))
+         .set(po_t.updated_at, LiteralValue("datetime('now')"))
+         .where(po_t.id == P()))
+    conn.execute(q.get_sql(), (args.purchase_order_id,))
 
     audit(conn, "erpclaw-buying", "cancel-purchase-order", "purchase_order",
            args.purchase_order_id)
@@ -1165,8 +1224,9 @@ def create_purchase_receipt(conn, args):
     if not args.purchase_order_id:
         err("--purchase-order-id is required")
 
-    po = conn.execute("SELECT * FROM purchase_order WHERE id = ?",
-                      (args.purchase_order_id,)).fetchone()
+    po_t = Table("purchase_order")
+    q = Q.from_(po_t).select(po_t.star).where(po_t.id == P())
+    po = conn.execute(q.get_sql(), (args.purchase_order_id,)).fetchone()
     if not po:
         err(f"Purchase order {args.purchase_order_id} not found")
     if po["status"] not in ("confirmed", "partially_received"):
@@ -1179,11 +1239,11 @@ def create_purchase_receipt(conn, args):
     # Determine items: partial (from --items) or full (all PO items)
     items_arg = _parse_json_arg(args.items, "items") if args.items else None
 
-    po_items = conn.execute(
-        """SELECT * FROM purchase_order_item WHERE purchase_order_id = ?
-           ORDER BY rowid""",
-        (args.purchase_order_id,),
-    ).fetchall()
+    poi_t = Table("purchase_order_item")
+    q = (Q.from_(poi_t).select(poi_t.star)
+         .where(poi_t.purchase_order_id == P())
+         .orderby(poi_t.rowid))
+    po_items = conn.execute(q.get_sql(), (args.purchase_order_id,)).fetchall()
 
     total_qty = Decimal("0")
     receipt_items = []
@@ -1194,8 +1254,8 @@ def create_purchase_receipt(conn, args):
             po_item_id = item.get("purchase_order_item_id")
             if not po_item_id:
                 err(f"Item {i}: purchase_order_item_id is required for partial receipt")
-            poi = conn.execute("SELECT * FROM purchase_order_item WHERE id = ?",
-                               (po_item_id,)).fetchone()
+            poi_lookup_q = Q.from_(poi_t).select(poi_t.star).where(poi_t.id == P())
+            poi = conn.execute(poi_lookup_q.get_sql(), (po_item_id,)).fetchone()
             if not poi:
                 err(f"Item {i}: PO item {po_item_id} not found")
 
@@ -1246,25 +1306,25 @@ def create_purchase_receipt(conn, args):
         err("No items to receive (all PO items already fully received)")
 
     # Insert parent first
-    conn.execute(
-        """INSERT INTO purchase_receipt
-           (id, supplier_id, posting_date, purchase_order_id, status,
-            total_qty, company_id)
-           VALUES (?, ?, ?, ?, 'draft', ?, ?)""",
+    pr_t = Table("purchase_receipt")
+    q = (Q.into(pr_t)
+         .columns("id", "supplier_id", "posting_date", "purchase_order_id",
+                  "status", "total_qty", "company_id")
+         .insert(P(), P(), P(), P(), ValueWrapper("draft"), P(), P()))
+    conn.execute(q.get_sql(),
         (pr_id, po["supplier_id"], posting_date, args.purchase_order_id,
-         str(round_currency(total_qty)), po["company_id"]),
-    )
+         str(round_currency(total_qty)), po["company_id"]))
 
     # Insert items
+    pri_t = Table("purchase_receipt_item")
+    pri_q = (Q.into(pri_t)
+             .columns("id", "purchase_receipt_id", "item_id", "quantity",
+                      "uom", "purchase_order_item_id", "warehouse_id",
+                      "batch_id", "serial_numbers", "rate", "amount")
+             .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+    pri_sql = pri_q.get_sql()
     for row_params in receipt_items:
-        conn.execute(
-            """INSERT INTO purchase_receipt_item
-               (id, purchase_receipt_id, item_id, quantity, uom,
-                purchase_order_item_id, warehouse_id, batch_id,
-                serial_numbers, rate, amount)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            row_params,
-        )
+        conn.execute(pri_sql, row_params)
 
     audit(conn, "erpclaw-buying", "create-purchase-receipt", "purchase_receipt", pr_id,
            new_values={"purchase_order_id": args.purchase_order_id,
@@ -1283,21 +1343,22 @@ def get_purchase_receipt(conn, args):
     if not args.purchase_receipt_id:
         err("--purchase-receipt-id is required")
 
-    pr = conn.execute("SELECT * FROM purchase_receipt WHERE id = ?",
-                      (args.purchase_receipt_id,)).fetchone()
+    pr_t = Table("purchase_receipt")
+    q = Q.from_(pr_t).select(pr_t.star).where(pr_t.id == P())
+    pr = conn.execute(q.get_sql(), (args.purchase_receipt_id,)).fetchone()
     if not pr:
         err(f"Purchase receipt {args.purchase_receipt_id} not found")
 
     data = row_to_dict(pr)
 
-    items = conn.execute(
-        """SELECT pri.*, i.item_code, i.item_name
-           FROM purchase_receipt_item pri
-           LEFT JOIN item i ON i.id = pri.item_id
-           WHERE pri.purchase_receipt_id = ?
-           ORDER BY pri.rowid""",
-        (args.purchase_receipt_id,),
-    ).fetchall()
+    pri = Table("purchase_receipt_item").as_("pri")
+    i_t = Table("item").as_("i")
+    q = (Q.from_(pri)
+         .left_join(i_t).on(i_t.id == pri.item_id)
+         .select(pri.star, i_t.item_code, i_t.item_name)
+         .where(pri.purchase_receipt_id == P())
+         .orderby(pri.rowid))
+    items = conn.execute(q.get_sql(), (args.purchase_receipt_id,)).fetchall()
     data["items"] = [row_to_dict(r) for r in items]
 
     ok(data)
@@ -1309,38 +1370,40 @@ def get_purchase_receipt(conn, args):
 
 def list_purchase_receipts(conn, args):
     """List purchase receipts."""
-    conditions = ["1=1"]
+    pr = Table("purchase_receipt").as_("pr")
+    s = Table("supplier").as_("s")
     params = []
 
+    count_q = Q.from_(pr).select(fn.Count("*"))
+    data_q = (Q.from_(pr)
+              .left_join(s).on(s.id == pr.supplier_id)
+              .select(pr.star, s.name.as_("supplier_name")))
+
     if args.company_id:
-        conditions.append("pr.company_id = ?")
+        count_q = count_q.where(pr.company_id == P())
+        data_q = data_q.where(pr.company_id == P())
         params.append(args.company_id)
     if args.supplier_id:
-        conditions.append("pr.supplier_id = ?")
+        count_q = count_q.where(pr.supplier_id == P())
+        data_q = data_q.where(pr.supplier_id == P())
         params.append(args.supplier_id)
     if args.pr_status:
-        conditions.append("pr.status = ?")
+        count_q = count_q.where(pr.status == P())
+        data_q = data_q.where(pr.status == P())
         params.append(args.pr_status)
 
-    where = " AND ".join(conditions)
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM purchase_receipt pr WHERE {where}", params
-    ).fetchone()
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
+    data_params = params + [limit, offset]
 
-    rows = conn.execute(
-        f"""SELECT pr.*, s.name as supplier_name
-           FROM purchase_receipt pr
-           LEFT JOIN supplier s ON s.id = pr.supplier_id
-           WHERE {where}
-           ORDER BY pr.posting_date DESC, pr.created_at DESC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    data_q = (data_q
+              .orderby(pr.posting_date, order=Order.desc)
+              .orderby(pr.created_at, order=Order.desc)
+              .limit(P()).offset(P()))
+    rows = conn.execute(data_q.get_sql(), data_params).fetchall()
 
     ok({"purchase_receipts": [row_to_dict(r) for r in rows],
          "total_count": total_count, "limit": limit, "offset": offset,
@@ -1356,8 +1419,9 @@ def submit_purchase_receipt(conn, args):
     if not args.purchase_receipt_id:
         err("--purchase-receipt-id is required")
 
-    pr = conn.execute("SELECT * FROM purchase_receipt WHERE id = ?",
-                      (args.purchase_receipt_id,)).fetchone()
+    pr_t = Table("purchase_receipt")
+    q = Q.from_(pr_t).select(pr_t.star).where(pr_t.id == P())
+    pr = conn.execute(q.get_sql(), (args.purchase_receipt_id,)).fetchone()
     if not pr:
         err(f"Purchase receipt {args.purchase_receipt_id} not found")
     if pr["status"] != "draft":
@@ -1369,17 +1433,19 @@ def submit_purchase_receipt(conn, args):
 
     # Verify linked PO is confirmed (if exists)
     if pr_dict.get("purchase_order_id"):
-        po = conn.execute("SELECT status FROM purchase_order WHERE id = ?",
+        po_t = Table("purchase_order")
+        q = Q.from_(po_t).select(po_t.status).where(po_t.id == P())
+        po = conn.execute(q.get_sql(),
                           (pr_dict["purchase_order_id"],)).fetchone()
         if po and po["status"] not in ("confirmed", "partially_received",
                                         "partially_invoiced"):
             err(f"Linked PO status is '{po['status']}' -- must be confirmed")
 
-    items = conn.execute(
-        """SELECT * FROM purchase_receipt_item WHERE purchase_receipt_id = ?
-           ORDER BY rowid""",
-        (args.purchase_receipt_id,),
-    ).fetchall()
+    pri_t = Table("purchase_receipt_item")
+    q = (Q.from_(pri_t).select(pri_t.star)
+         .where(pri_t.purchase_receipt_id == P())
+         .orderby(pri_t.rowid))
+    items = conn.execute(q.get_sql(), (args.purchase_receipt_id,)).fetchall()
     if not items:
         err("Purchase receipt has no items")
 
@@ -1396,8 +1462,9 @@ def submit_purchase_receipt(conn, args):
         warehouse_id = item.get("warehouse_id")
         if not warehouse_id:
             # Fallback to company default warehouse
-            co = conn.execute("SELECT default_warehouse_id FROM company WHERE id = ?",
-                              (company_id,)).fetchone()
+            company_t = Table("company")
+            co_q = Q.from_(company_t).select(company_t.default_warehouse_id).where(company_t.id == P())
+            co = conn.execute(co_q.get_sql(), (company_id,)).fetchone()
             warehouse_id = co["default_warehouse_id"] if co else None
         if not warehouse_id:
             err(f"No warehouse specified for item {item['item_id']} and no company default")
@@ -1426,12 +1493,12 @@ def submit_purchase_receipt(conn, args):
         err(f"SLE posting failed: {e}")
 
     # Build perpetual inventory GL: DR Stock In Hand / CR Stock Received Not Billed
-    sle_rows = conn.execute(
-        """SELECT * FROM stock_ledger_entry
-           WHERE voucher_type = 'purchase_receipt' AND voucher_id = ?
-             AND is_cancelled = 0""",
-        (args.purchase_receipt_id,),
-    ).fetchall()
+    sle_t = Table("stock_ledger_entry")
+    q = (Q.from_(sle_t).select(sle_t.star)
+         .where(sle_t.voucher_type == ValueWrapper("purchase_receipt"))
+         .where(sle_t.voucher_id == P())
+         .where(sle_t.is_cancelled == 0))
+    sle_rows = conn.execute(q.get_sql(), (args.purchase_receipt_id,)).fetchall()
     sle_dicts = [row_to_dict(r) for r in sle_rows]
 
     gl_entries = create_perpetual_inventory_gl(
@@ -1464,6 +1531,7 @@ def submit_purchase_receipt(conn, args):
     for item_row in items:
         item = row_to_dict(item_row)
         if item.get("purchase_order_item_id"):
+            # raw SQL — CAST arithmetic expression not expressible in PyPika
             conn.execute(
                 """UPDATE purchase_order_item
                    SET received_qty = CAST(
@@ -1477,11 +1545,12 @@ def submit_purchase_receipt(conn, args):
         _update_po_receipt_status(conn, pr_dict["purchase_order_id"])
 
     # Update receipt status
-    conn.execute(
-        """UPDATE purchase_receipt SET status = 'submitted', naming_series = ?,
-           updated_at = datetime('now') WHERE id = ?""",
-        (naming, args.purchase_receipt_id),
-    )
+    q = (Q.update(pr_t)
+         .set(pr_t.status, ValueWrapper("submitted"))
+         .set(pr_t.naming_series, P())
+         .set(pr_t.updated_at, LiteralValue("datetime('now')"))
+         .where(pr_t.id == P()))
+    conn.execute(q.get_sql(), (naming, args.purchase_receipt_id))
 
     audit(conn, "erpclaw-buying", "submit-purchase-receipt", "purchase_receipt",
            args.purchase_receipt_id,
@@ -1496,10 +1565,11 @@ def submit_purchase_receipt(conn, args):
 
 def _update_po_receipt_status(conn, purchase_order_id):
     """Update PO per_received and status based on received quantities."""
-    po_items = conn.execute(
-        "SELECT quantity, received_qty FROM purchase_order_item WHERE purchase_order_id = ?",
-        (purchase_order_id,),
-    ).fetchall()
+    poi_t = Table("purchase_order_item")
+    q = (Q.from_(poi_t)
+         .select(poi_t.quantity, poi_t.received_qty)
+         .where(poi_t.purchase_order_id == P()))
+    po_items = conn.execute(q.get_sql(), (purchase_order_id,)).fetchall()
 
     total_ordered = Decimal("0")
     total_received = Decimal("0")
@@ -1519,11 +1589,13 @@ def _update_po_receipt_status(conn, purchase_order_id):
     else:
         return  # No change
 
-    conn.execute(
-        """UPDATE purchase_order SET per_received = ?, status = ?,
-           updated_at = datetime('now') WHERE id = ?""",
-        (str(per_received), new_status, purchase_order_id),
-    )
+    po_t = Table("purchase_order")
+    q = (Q.update(po_t)
+         .set(po_t.per_received, P())
+         .set(po_t.status, P())
+         .set(po_t.updated_at, LiteralValue("datetime('now')"))
+         .where(po_t.id == P()))
+    conn.execute(q.get_sql(), (str(per_received), new_status, purchase_order_id))
 
 
 # ---------------------------------------------------------------------------
@@ -1535,8 +1607,9 @@ def cancel_purchase_receipt(conn, args):
     if not args.purchase_receipt_id:
         err("--purchase-receipt-id is required")
 
-    pr = conn.execute("SELECT * FROM purchase_receipt WHERE id = ?",
-                      (args.purchase_receipt_id,)).fetchone()
+    pr_t = Table("purchase_receipt")
+    q = Q.from_(pr_t).select(pr_t.star).where(pr_t.id == P())
+    pr = conn.execute(q.get_sql(), (args.purchase_receipt_id,)).fetchone()
     if not pr:
         err(f"Purchase receipt {args.purchase_receipt_id} not found")
     if pr["status"] != "submitted":
@@ -1569,13 +1642,13 @@ def cancel_purchase_receipt(conn, args):
         reversal_gl_ids = []
 
     # Reverse PO received_qty
-    items = conn.execute(
-        "SELECT * FROM purchase_receipt_item WHERE purchase_receipt_id = ?",
-        (args.purchase_receipt_id,),
-    ).fetchall()
+    pri_t = Table("purchase_receipt_item")
+    q = Q.from_(pri_t).select(pri_t.star).where(pri_t.purchase_receipt_id == P())
+    items = conn.execute(q.get_sql(), (args.purchase_receipt_id,)).fetchall()
     for item_row in items:
         item = row_to_dict(item_row)
         if item.get("purchase_order_item_id"):
+            # raw SQL — CAST+MAX arithmetic expression not expressible in PyPika
             conn.execute(
                 """UPDATE purchase_order_item
                    SET received_qty = CAST(
@@ -1588,23 +1661,26 @@ def cancel_purchase_receipt(conn, args):
     if pr_dict.get("purchase_order_id"):
         _update_po_receipt_status(conn, pr_dict["purchase_order_id"])
         # If all received is now 0, set back to confirmed
-        po_items = conn.execute(
-            "SELECT received_qty FROM purchase_order_item WHERE purchase_order_id = ?",
-            (pr_dict["purchase_order_id"],),
-        ).fetchall()
+        poi_t = Table("purchase_order_item")
+        q = (Q.from_(poi_t).select(poi_t.received_qty)
+             .where(poi_t.purchase_order_id == P()))
+        po_items = conn.execute(q.get_sql(),
+            (pr_dict["purchase_order_id"],)).fetchall()
         all_zero = all(to_decimal(p["received_qty"]) <= 0 for p in po_items)
         if all_zero:
-            conn.execute(
-                """UPDATE purchase_order SET status = 'confirmed',
-                   per_received = '0', updated_at = datetime('now') WHERE id = ?""",
-                (pr_dict["purchase_order_id"],),
-            )
+            po_t = Table("purchase_order")
+            q = (Q.update(po_t)
+                 .set(po_t.status, ValueWrapper("confirmed"))
+                 .set(po_t.per_received, ValueWrapper("0"))
+                 .set(po_t.updated_at, LiteralValue("datetime('now')"))
+                 .where(po_t.id == P()))
+            conn.execute(q.get_sql(), (pr_dict["purchase_order_id"],))
 
-    conn.execute(
-        """UPDATE purchase_receipt SET status = 'cancelled',
-           updated_at = datetime('now') WHERE id = ?""",
-        (args.purchase_receipt_id,),
-    )
+    q = (Q.update(pr_t)
+         .set(pr_t.status, ValueWrapper("cancelled"))
+         .set(pr_t.updated_at, LiteralValue("datetime('now')"))
+         .where(pr_t.id == P()))
+    conn.execute(q.get_sql(), (args.purchase_receipt_id,))
 
     audit(conn, "erpclaw-buying", "cancel-purchase-receipt", "purchase_receipt",
            args.purchase_receipt_id,
@@ -1636,10 +1712,14 @@ def create_purchase_invoice(conn, args):
     pi_items = []
     total_amount = Decimal("0")
 
+    po_t = Table("purchase_order")
+    poi_t = Table("purchase_order_item")
+    pr_t_lookup = Table("purchase_receipt")
+
     if po_id:
         # Create from Purchase Order
-        po = conn.execute("SELECT * FROM purchase_order WHERE id = ?",
-                          (po_id,)).fetchone()
+        q = Q.from_(po_t).select(po_t.star).where(po_t.id == P())
+        po = conn.execute(q.get_sql(), (po_id,)).fetchone()
         if not po:
             err(f"Purchase order {po_id} not found")
         supplier_id = po["supplier_id"]
@@ -1647,20 +1727,19 @@ def create_purchase_invoice(conn, args):
         tax_template_id = tax_template_id or po["tax_template_id"]
 
         # If PO has receipts, set update_stock=0 (stock already moved)
-        # and link the receipt so the invoice clears SRNB instead of hitting expense
-        receipt_row = conn.execute(
-            "SELECT id FROM purchase_receipt WHERE purchase_order_id = ? AND status = 'submitted' LIMIT 1",
-            (po_id,),
-        ).fetchone()
+        q = (Q.from_(pr_t_lookup)
+             .select(pr_t_lookup.id)
+             .where(pr_t_lookup.purchase_order_id == P())
+             .where(pr_t_lookup.status == ValueWrapper("submitted"))
+             .limit(1))
+        receipt_row = conn.execute(q.get_sql(), (po_id,)).fetchone()
         if receipt_row:
             update_stock = 0
             if not pr_id_arg:
                 pr_id_arg = receipt_row["id"]
 
-        po_items = conn.execute(
-            "SELECT * FROM purchase_order_item WHERE purchase_order_id = ?",
-            (po_id,),
-        ).fetchall()
+        q = Q.from_(poi_t).select(poi_t.star).where(poi_t.purchase_order_id == P())
+        po_items = conn.execute(q.get_sql(), (po_id,)).fetchall()
         for poi_row in po_items:
             poi = row_to_dict(poi_row)
             qty = to_decimal(poi["quantity"])
@@ -1680,18 +1759,17 @@ def create_purchase_invoice(conn, args):
 
     elif pr_id_arg:
         # Create from Purchase Receipt
-        pr = conn.execute("SELECT * FROM purchase_receipt WHERE id = ?",
-                          (pr_id_arg,)).fetchone()
+        q = Q.from_(pr_t_lookup).select(pr_t_lookup.star).where(pr_t_lookup.id == P())
+        pr = conn.execute(q.get_sql(), (pr_id_arg,)).fetchone()
         if not pr:
             err(f"Purchase receipt {pr_id_arg} not found")
         supplier_id = pr["supplier_id"]
         company_id = pr["company_id"]
         update_stock = 0  # Stock already moved via GRN
 
-        pr_items = conn.execute(
-            "SELECT * FROM purchase_receipt_item WHERE purchase_receipt_id = ?",
-            (pr_id_arg,),
-        ).fetchall()
+        pri_t_lookup = Table("purchase_receipt_item")
+        q = Q.from_(pri_t_lookup).select(pri_t_lookup.star).where(pri_t_lookup.purchase_receipt_id == P())
+        pr_items = conn.execute(q.get_sql(), (pr_id_arg,)).fetchall()
         for pri_row in pr_items:
             pri = row_to_dict(pri_row)
             qty = to_decimal(pri["quantity"])
@@ -1739,8 +1817,9 @@ def create_purchase_invoice(conn, args):
         err("No items for invoice")
 
     # Validate supplier
-    supplier = conn.execute("SELECT * FROM supplier WHERE id = ?",
-                            (supplier_id,)).fetchone()
+    sup_t = Table("supplier")
+    q = Q.from_(sup_t).select(sup_t.star).where(sup_t.id == P())
+    supplier = conn.execute(q.get_sql(), (supplier_id,)).fetchone()
     if not supplier:
         err(f"Supplier {supplier_id} not found")
 
@@ -1749,28 +1828,32 @@ def create_purchase_invoice(conn, args):
     grand_total = round_currency(total_amount + tax_amount)
 
     # Insert parent first
-    conn.execute(
-        """INSERT INTO purchase_invoice
-           (id, supplier_id, posting_date, due_date, total_amount, tax_amount,
-            grand_total, outstanding_amount, tax_template_id, status,
-            purchase_order_id, purchase_receipt_id, update_stock, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)""",
+    pi_t = Table("purchase_invoice")
+    q = (Q.into(pi_t)
+         .columns("id", "supplier_id", "posting_date", "due_date",
+                  "total_amount", "tax_amount", "grand_total",
+                  "outstanding_amount", "tax_template_id", "status",
+                  "purchase_order_id", "purchase_receipt_id",
+                  "update_stock", "company_id")
+         .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(),
+                 ValueWrapper("draft"), P(), P(), P(), P()))
+    conn.execute(q.get_sql(),
         (pi_id, supplier_id, posting_date, due_date,
          str(round_currency(total_amount)), str(round_currency(tax_amount)),
          str(grand_total), str(grand_total),
-         tax_template_id, po_id, pr_id_arg, update_stock, company_id),
-    )
+         tax_template_id, po_id, pr_id_arg, update_stock, company_id))
 
     # Insert items
+    pii_t = Table("purchase_invoice_item")
+    pii_q = (Q.into(pii_t)
+             .columns("id", "purchase_invoice_id", "item_id", "quantity",
+                      "uom", "rate", "amount", "expense_account_id",
+                      "cost_center_id", "project_id",
+                      "purchase_order_item_id", "purchase_receipt_item_id")
+             .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+    pii_sql = pii_q.get_sql()
     for row_params in pi_items:
-        conn.execute(
-            """INSERT INTO purchase_invoice_item
-               (id, purchase_invoice_id, item_id, quantity, uom, rate, amount,
-                expense_account_id, cost_center_id, project_id,
-                purchase_order_item_id, purchase_receipt_item_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            row_params,
-        )
+        conn.execute(pii_sql, row_params)
 
     audit(conn, "erpclaw-buying", "create-purchase-invoice", "purchase_invoice", pi_id,
            new_values={"supplier_id": supplier_id,
@@ -1793,8 +1876,9 @@ def update_purchase_invoice(conn, args):
     if not args.purchase_invoice_id:
         err("--purchase-invoice-id is required")
 
-    pi = conn.execute("SELECT * FROM purchase_invoice WHERE id = ?",
-                      (args.purchase_invoice_id,)).fetchone()
+    pi_t = Table("purchase_invoice")
+    q = Q.from_(pi_t).select(pi_t.star).where(pi_t.id == P())
+    pi = conn.execute(q.get_sql(), (args.purchase_invoice_id,)).fetchone()
     if not pi:
         err(f"Purchase invoice {args.purchase_invoice_id} not found")
     if pi["status"] != "draft":
@@ -1804,10 +1888,10 @@ def update_purchase_invoice(conn, args):
     updated_fields = []
 
     if args.due_date is not None:
-        conn.execute(
-            "UPDATE purchase_invoice SET due_date = ? WHERE id = ?",
-            (args.due_date, args.purchase_invoice_id),
-        )
+        q = (Q.update(pi_t)
+             .set(pi_t.due_date, P())
+             .where(pi_t.id == P()))
+        conn.execute(q.get_sql(), (args.due_date, args.purchase_invoice_id))
         updated_fields.append("due_date")
 
     if args.items:
@@ -1815,10 +1899,9 @@ def update_purchase_invoice(conn, args):
         if not items or not isinstance(items, list):
             err("--items must be a non-empty JSON array")
 
-        conn.execute(
-            "DELETE FROM purchase_invoice_item WHERE purchase_invoice_id = ?",
-            (args.purchase_invoice_id,),
-        )
+        pii_t = Table("purchase_invoice_item")
+        q = Q.from_(pii_t).delete().where(pii_t.purchase_invoice_id == P())
+        conn.execute(q.get_sql(), (args.purchase_invoice_id,))
 
         total_amount = Decimal("0")
         for i, item in enumerate(items):
@@ -1848,22 +1931,25 @@ def update_purchase_invoice(conn, args):
         tax_amount, _ = _calculate_tax(conn, pi["tax_template_id"], total_amount)
         grand_total = round_currency(total_amount + tax_amount)
 
-        conn.execute(
-            """UPDATE purchase_invoice SET total_amount = ?, tax_amount = ?,
-               grand_total = ?, outstanding_amount = ?,
-               updated_at = datetime('now') WHERE id = ?""",
+        q = (Q.update(pi_t)
+             .set(pi_t.total_amount, P())
+             .set(pi_t.tax_amount, P())
+             .set(pi_t.grand_total, P())
+             .set(pi_t.outstanding_amount, P())
+             .set(pi_t.updated_at, LiteralValue("datetime('now')"))
+             .where(pi_t.id == P()))
+        conn.execute(q.get_sql(),
             (str(round_currency(total_amount)), str(round_currency(tax_amount)),
-             str(grand_total), str(grand_total), args.purchase_invoice_id),
-        )
+             str(grand_total), str(grand_total), args.purchase_invoice_id))
         updated_fields.append("items")
 
     if not updated_fields:
         err("No fields to update")
 
-    conn.execute(
-        "UPDATE purchase_invoice SET updated_at = datetime('now') WHERE id = ?",
-        (args.purchase_invoice_id,),
-    )
+    q = (Q.update(pi_t)
+         .set(pi_t.updated_at, LiteralValue("datetime('now')"))
+         .where(pi_t.id == P()))
+    conn.execute(q.get_sql(), (args.purchase_invoice_id,))
 
     audit(conn, "erpclaw-buying", "update-purchase-invoice", "purchase_invoice",
            args.purchase_invoice_id,
@@ -1882,30 +1968,30 @@ def get_purchase_invoice(conn, args):
     if not args.purchase_invoice_id:
         err("--purchase-invoice-id is required")
 
-    pi = conn.execute("SELECT * FROM purchase_invoice WHERE id = ?",
-                      (args.purchase_invoice_id,)).fetchone()
+    pi_t = Table("purchase_invoice")
+    q = Q.from_(pi_t).select(pi_t.star).where(pi_t.id == P())
+    pi = conn.execute(q.get_sql(), (args.purchase_invoice_id,)).fetchone()
     if not pi:
         err(f"Purchase invoice {args.purchase_invoice_id} not found")
 
     data = row_to_dict(pi)
 
-    items = conn.execute(
-        """SELECT pii.*, i.item_code, i.item_name
-           FROM purchase_invoice_item pii
-           LEFT JOIN item i ON i.id = pii.item_id
-           WHERE pii.purchase_invoice_id = ?
-           ORDER BY pii.rowid""",
-        (args.purchase_invoice_id,),
-    ).fetchall()
+    pii = Table("purchase_invoice_item").as_("pii")
+    i_t = Table("item").as_("i")
+    q = (Q.from_(pii)
+         .left_join(i_t).on(i_t.id == pii.item_id)
+         .select(pii.star, i_t.item_code, i_t.item_name)
+         .where(pii.purchase_invoice_id == P())
+         .orderby(pii.rowid))
+    items = conn.execute(q.get_sql(), (args.purchase_invoice_id,)).fetchall()
     data["items"] = [row_to_dict(r) for r in items]
 
     # Payment ledger entries
-    ple_rows = conn.execute(
-        """SELECT * FROM payment_ledger_entry
-           WHERE against_voucher_type = 'purchase_invoice'
-             AND against_voucher_id = ?""",
-        (args.purchase_invoice_id,),
-    ).fetchall()
+    ple_t = Table("payment_ledger_entry")
+    q = (Q.from_(ple_t).select(ple_t.star)
+         .where(ple_t.against_voucher_type == ValueWrapper("purchase_invoice"))
+         .where(ple_t.against_voucher_id == P()))
+    ple_rows = conn.execute(q.get_sql(), (args.purchase_invoice_id,)).fetchall()
     data["payments"] = [row_to_dict(r) for r in ple_rows]
 
     ok(data)
@@ -1917,44 +2003,48 @@ def get_purchase_invoice(conn, args):
 
 def list_purchase_invoices(conn, args):
     """List purchase invoices."""
-    conditions = ["1=1"]
+    pi = Table("purchase_invoice").as_("pi")
+    s = Table("supplier").as_("s")
     params = []
 
+    count_q = Q.from_(pi).select(fn.Count("*"))
+    data_q = (Q.from_(pi)
+              .left_join(s).on(s.id == pi.supplier_id)
+              .select(pi.star, s.name.as_("supplier_name")))
+
     if args.company_id:
-        conditions.append("pi.company_id = ?")
+        count_q = count_q.where(pi.company_id == P())
+        data_q = data_q.where(pi.company_id == P())
         params.append(args.company_id)
     if args.supplier_id:
-        conditions.append("pi.supplier_id = ?")
+        count_q = count_q.where(pi.supplier_id == P())
+        data_q = data_q.where(pi.supplier_id == P())
         params.append(args.supplier_id)
     if args.pi_status:
-        conditions.append("pi.status = ?")
+        count_q = count_q.where(pi.status == P())
+        data_q = data_q.where(pi.status == P())
         params.append(args.pi_status)
     if args.from_date:
-        conditions.append("pi.posting_date >= ?")
+        count_q = count_q.where(pi.posting_date >= P())
+        data_q = data_q.where(pi.posting_date >= P())
         params.append(args.from_date)
     if args.to_date:
-        conditions.append("pi.posting_date <= ?")
+        count_q = count_q.where(pi.posting_date <= P())
+        data_q = data_q.where(pi.posting_date <= P())
         params.append(args.to_date)
 
-    where = " AND ".join(conditions)
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM purchase_invoice pi WHERE {where}", params
-    ).fetchone()
+    count_row = conn.execute(count_q.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
+    data_params = params + [limit, offset]
 
-    rows = conn.execute(
-        f"""SELECT pi.*, s.name as supplier_name
-           FROM purchase_invoice pi
-           LEFT JOIN supplier s ON s.id = pi.supplier_id
-           WHERE {where}
-           ORDER BY pi.posting_date DESC, pi.created_at DESC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    data_q = (data_q
+              .orderby(pi.posting_date, order=Order.desc)
+              .orderby(pi.created_at, order=Order.desc)
+              .limit(P()).offset(P()))
+    rows = conn.execute(data_q.get_sql(), data_params).fetchall()
 
     ok({"purchase_invoices": [row_to_dict(r) for r in rows],
          "total_count": total_count, "limit": limit, "offset": offset,
@@ -1971,8 +2061,9 @@ def submit_purchase_invoice(conn, args):
     if not args.purchase_invoice_id:
         err("--purchase-invoice-id is required")
 
-    pi = conn.execute("SELECT * FROM purchase_invoice WHERE id = ?",
-                      (args.purchase_invoice_id,)).fetchone()
+    pi_t = Table("purchase_invoice")
+    q = Q.from_(pi_t).select(pi_t.star).where(pi_t.id == P())
+    pi = conn.execute(q.get_sql(), (args.purchase_invoice_id,)).fetchone()
     if not pi:
         err(f"Purchase invoice {args.purchase_invoice_id} not found")
     if pi["status"] != "draft":
@@ -1987,15 +2078,15 @@ def submit_purchase_invoice(conn, args):
     voucher_type = "debit_note" if is_return else "purchase_invoice"
 
     # Verify supplier
-    supplier = conn.execute("SELECT * FROM supplier WHERE id = ?",
-                            (supplier_id,)).fetchone()
+    sup_t = Table("supplier")
+    q = Q.from_(sup_t).select(sup_t.star).where(sup_t.id == P())
+    supplier = conn.execute(q.get_sql(), (supplier_id,)).fetchone()
     if not supplier:
         err(f"Supplier {supplier_id} not found")
 
-    items = conn.execute(
-        "SELECT * FROM purchase_invoice_item WHERE purchase_invoice_id = ?",
-        (args.purchase_invoice_id,),
-    ).fetchall()
+    pii_t = Table("purchase_invoice_item")
+    q = Q.from_(pii_t).select(pii_t.star).where(pii_t.purchase_invoice_id == P())
+    items = conn.execute(q.get_sql(), (args.purchase_invoice_id,)).fetchall()
     if not items:
         err("Purchase invoice has no items")
 
@@ -2010,8 +2101,9 @@ def submit_purchase_invoice(conn, args):
     # --- Build GL entries ---
     gl_entries = []
 
-    company_row = conn.execute("SELECT * FROM company WHERE id = ?",
-                               (company_id,)).fetchone()
+    company_t = Table("company")
+    q = Q.from_(company_t).select(company_t.star).where(company_t.id == P())
+    company_row = conn.execute(q.get_sql(), (company_id,)).fetchone()
     default_expense_acct = company_row["default_expense_account_id"] if company_row else None
 
     # Check if this invoice has a linked purchase receipt.
@@ -2020,12 +2112,14 @@ def submit_purchase_invoice(conn, args):
     # rather than DR Expense / CR Payable (which double-counts COGS).
     has_receipt = bool(pi_dict.get("purchase_receipt_id"))
     srnb_acct = None
+    acct_t = Table("account")
     if has_receipt:
-        srnb_row = conn.execute(
-            "SELECT id FROM account WHERE account_type = 'stock_received_not_billed' "
-            "AND company_id = ? AND is_group = 0 LIMIT 1",
-            (company_id,),
-        ).fetchone()
+        q = (Q.from_(acct_t).select(acct_t.id)
+             .where(acct_t.account_type == ValueWrapper("stock_received_not_billed"))
+             .where(acct_t.company_id == P())
+             .where(acct_t.is_group == 0)
+             .limit(1))
+        srnb_row = conn.execute(q.get_sql(), (company_id,)).fetchone()
         srnb_acct = srnb_row["id"] if srnb_row else None
 
     # 1. DR: SRNB (if receipt-linked) or Expense accounts (per item or default)
@@ -2040,11 +2134,12 @@ def submit_purchase_invoice(conn, args):
         elif has_receipt and not srnb_acct:
             # Perpetual inventory fallback: use Inventory (stock) account
             # when SRNB account doesn't exist but receipt is linked
-            inv_row = conn.execute(
-                "SELECT id FROM account WHERE account_type = 'stock' "
-                "AND company_id = ? AND is_group = 0 LIMIT 1",
-                (company_id,),
-            ).fetchone()
+            inv_q = (Q.from_(acct_t).select(acct_t.id)
+                     .where(acct_t.account_type == ValueWrapper("stock"))
+                     .where(acct_t.company_id == P())
+                     .where(acct_t.is_group == 0)
+                     .limit(1))
+            inv_row = conn.execute(inv_q.get_sql(), (company_id,)).fetchone()
             if inv_row:
                 debit_acct = inv_row["id"]
             else:
@@ -2076,13 +2171,13 @@ def submit_purchase_invoice(conn, args):
     abs_tax_amount = abs(tax_amount)
     abs_total_amount = abs(total_amount)
     if abs_tax_amount > 0 and pi_dict.get("tax_template_id"):
-        tax_lines = conn.execute(
-            """SELECT ttl.tax_account_id, ttl.rate
-               FROM tax_template_line ttl
-               WHERE ttl.tax_template_id = ?
-               ORDER BY ttl.row_order""",
-            (pi_dict["tax_template_id"],),
-        ).fetchall()
+        ttl_t = Table("tax_template_line").as_("ttl")
+        q = (Q.from_(ttl_t)
+             .select(ttl_t.tax_account_id, ttl_t.rate)
+             .where(ttl_t.tax_template_id == P())
+             .orderby(ttl_t.row_order))
+        tax_lines = conn.execute(q.get_sql(),
+            (pi_dict["tax_template_id"],)).fetchall()
         remaining_tax = abs_tax_amount
         for tl in tax_lines:
             tl_rate = to_decimal(tl["rate"])
@@ -2116,11 +2211,12 @@ def submit_purchase_invoice(conn, args):
     if company_row:
         payable_acct = company_row["default_payable_account_id"]
     if not payable_acct:
-        payable_row = conn.execute(
-            "SELECT id FROM account WHERE account_type = 'payable' "
-            "AND company_id = ? AND is_group = 0 LIMIT 1",
-            (company_id,),
-        ).fetchone()
+        q = (Q.from_(acct_t).select(acct_t.id)
+             .where(acct_t.account_type == ValueWrapper("payable"))
+             .where(acct_t.company_id == P())
+             .where(acct_t.is_group == 0)
+             .limit(1))
+        payable_row = conn.execute(q.get_sql(), (company_id,)).fetchone()
         payable_acct = payable_row["id"] if payable_row else None
     if not payable_acct:
         err("No payable account found for company")
@@ -2169,10 +2265,9 @@ def submit_purchase_invoice(conn, args):
         for item_row in items:
             item = row_to_dict(item_row)
             # Determine item type
-            item_master = conn.execute(
-                "SELECT is_stock_item FROM item WHERE id = ?",
-                (item["item_id"],),
-            ).fetchone()
+            item_t = Table("item")
+            q = Q.from_(item_t).select(item_t.is_stock_item).where(item_t.id == P())
+            item_master = conn.execute(q.get_sql(), (item["item_id"],)).fetchone()
             if not item_master or not item_master["is_stock_item"]:
                 continue  # Skip non-stock items
 
@@ -2181,16 +2276,16 @@ def submit_purchase_invoice(conn, args):
             # Determine warehouse
             warehouse_id = None
             if item.get("purchase_receipt_item_id"):
-                pri = conn.execute(
-                    "SELECT warehouse_id FROM purchase_receipt_item WHERE id = ?",
-                    (item["purchase_receipt_item_id"],),
-                ).fetchone()
+                pri_t2 = Table("purchase_receipt_item")
+                q = Q.from_(pri_t2).select(pri_t2.warehouse_id).where(pri_t2.id == P())
+                pri = conn.execute(q.get_sql(),
+                    (item["purchase_receipt_item_id"],)).fetchone()
                 warehouse_id = pri["warehouse_id"] if pri else None
             if not warehouse_id and item.get("purchase_order_item_id"):
-                poi = conn.execute(
-                    "SELECT warehouse_id FROM purchase_order_item WHERE id = ?",
-                    (item["purchase_order_item_id"],),
-                ).fetchone()
+                poi_t2 = Table("purchase_order_item")
+                q = Q.from_(poi_t2).select(poi_t2.warehouse_id).where(poi_t2.id == P())
+                poi = conn.execute(q.get_sql(),
+                    (item["purchase_order_item_id"],)).fetchone()
                 warehouse_id = poi["warehouse_id"] if poi else None
             if not warehouse_id and company_row:
                 warehouse_id = company_row["default_warehouse_id"]
@@ -2219,12 +2314,13 @@ def submit_purchase_invoice(conn, args):
                 err(f"SLE posting failed: {e}")
 
             # Inventory GL for SLE (DR Stock In Hand / CR Stock Received Not Billed)
-            sle_rows = conn.execute(
-                """SELECT * FROM stock_ledger_entry
-                   WHERE voucher_type = ? AND voucher_id = ?
-                     AND is_cancelled = 0""",
-                (voucher_type, args.purchase_invoice_id),
-            ).fetchall()
+            sle_t = Table("stock_ledger_entry")
+            q = (Q.from_(sle_t).select(sle_t.star)
+                 .where(sle_t.voucher_type == P())
+                 .where(sle_t.voucher_id == P())
+                 .where(sle_t.is_cancelled == 0))
+            sle_rows = conn.execute(q.get_sql(),
+                (voucher_type, args.purchase_invoice_id)).fetchall()
             sle_dicts = [row_to_dict(r) for r in sle_rows]
             inv_gl = create_perpetual_inventory_gl(
                 conn, sle_dicts,
@@ -2268,25 +2364,26 @@ def submit_purchase_invoice(conn, args):
         ple_against_id = args.purchase_invoice_id
         ple_amount = str(round_currency(grand_total))
     ple_remark = f"{'Debit Note' if is_return else 'Purchase Invoice'} {naming}"
-    conn.execute(
-        """INSERT INTO payment_ledger_entry
-           (id, posting_date, account_id, party_type, party_id,
-            voucher_type, voucher_id, against_voucher_type, against_voucher_id,
-            amount, amount_in_account_currency, remarks)
-           VALUES (?, ?, ?, 'supplier', ?, ?, ?, ?, ?,
-                   ?, ?, ?)""",
+    ple_t = Table("payment_ledger_entry")
+    q = (Q.into(ple_t)
+         .columns("id", "posting_date", "account_id", "party_type", "party_id",
+                  "voucher_type", "voucher_id", "against_voucher_type",
+                  "against_voucher_id", "amount", "amount_in_account_currency",
+                  "remarks")
+         .insert(P(), P(), P(), ValueWrapper("supplier"), P(), P(), P(), P(), P(),
+                 P(), P(), P()))
+    conn.execute(q.get_sql(),
         (ple_id, posting_date, payable_acct, supplier_id,
          voucher_type, args.purchase_invoice_id,
          ple_against_type, ple_against_id,
-         ple_amount, ple_amount,
-         ple_remark),
-    )
+         ple_amount, ple_amount, ple_remark))
 
     # Update PO invoiced_qty if linked
     if pi_dict.get("purchase_order_id"):
         for item_row in items:
             item = row_to_dict(item_row)
             if item.get("purchase_order_item_id"):
+                # raw SQL — CAST arithmetic expression not expressible in PyPika
                 conn.execute(
                     """UPDATE purchase_order_item
                        SET invoiced_qty = CAST(
@@ -2297,11 +2394,12 @@ def submit_purchase_invoice(conn, args):
         _update_po_invoice_status(conn, pi_dict["purchase_order_id"])
 
     # Update invoice status
-    conn.execute(
-        """UPDATE purchase_invoice SET status = 'submitted', naming_series = ?,
-           updated_at = datetime('now') WHERE id = ?""",
-        (naming, args.purchase_invoice_id),
-    )
+    q = (Q.update(pi_t)
+         .set(pi_t.status, ValueWrapper("submitted"))
+         .set(pi_t.naming_series, P())
+         .set(pi_t.updated_at, LiteralValue("datetime('now')"))
+         .where(pi_t.id == P()))
+    conn.execute(q.get_sql(), (naming, args.purchase_invoice_id))
 
     audit_action = "submit-debit-note" if is_return else "submit-purchase-invoice"
     audit(conn, "erpclaw-buying", audit_action, "purchase_invoice",
@@ -2321,10 +2419,11 @@ def submit_purchase_invoice(conn, args):
 
 def _update_po_invoice_status(conn, purchase_order_id):
     """Update PO per_invoiced and status based on invoiced quantities."""
-    po_items = conn.execute(
-        "SELECT quantity, invoiced_qty FROM purchase_order_item WHERE purchase_order_id = ?",
-        (purchase_order_id,),
-    ).fetchall()
+    poi_t = Table("purchase_order_item")
+    q = (Q.from_(poi_t)
+         .select(poi_t.quantity, poi_t.invoiced_qty)
+         .where(poi_t.purchase_order_id == P()))
+    po_items = conn.execute(q.get_sql(), (purchase_order_id,)).fetchall()
 
     total_ordered = Decimal("0")
     total_invoiced = Decimal("0")
@@ -2345,16 +2444,17 @@ def _update_po_invoice_status(conn, purchase_order_id):
         return  # No change needed
 
     # Only update if it makes sense (don't downgrade from fully_received etc.)
-    current = conn.execute(
-        "SELECT status FROM purchase_order WHERE id = ?",
-        (purchase_order_id,),
-    ).fetchone()
+    po_t = Table("purchase_order")
+    q = Q.from_(po_t).select(po_t.status).where(po_t.id == P())
+    current = conn.execute(q.get_sql(), (purchase_order_id,)).fetchone()
     if current and current["status"] not in ("cancelled",):
-        conn.execute(
-            """UPDATE purchase_order SET per_invoiced = ?, status = ?,
-               updated_at = datetime('now') WHERE id = ?""",
-            (str(per_invoiced), new_status, purchase_order_id),
-        )
+        q = (Q.update(po_t)
+             .set(po_t.per_invoiced, P())
+             .set(po_t.status, P())
+             .set(po_t.updated_at, LiteralValue("datetime('now')"))
+             .where(po_t.id == P()))
+        conn.execute(q.get_sql(),
+            (str(per_invoiced), new_status, purchase_order_id))
 
 
 # ---------------------------------------------------------------------------
@@ -2366,8 +2466,9 @@ def cancel_purchase_invoice(conn, args):
     if not args.purchase_invoice_id:
         err("--purchase-invoice-id is required")
 
-    pi = conn.execute("SELECT * FROM purchase_invoice WHERE id = ?",
-                      (args.purchase_invoice_id,)).fetchone()
+    pi_t = Table("purchase_invoice")
+    q = Q.from_(pi_t).select(pi_t.star).where(pi_t.id == P())
+    pi = conn.execute(q.get_sql(), (args.purchase_invoice_id,)).fetchone()
     if not pi:
         err(f"Purchase invoice {args.purchase_invoice_id} not found")
     if pi["status"] not in ("submitted", "overdue", "partially_paid"):
@@ -2406,21 +2507,23 @@ def cancel_purchase_invoice(conn, args):
             reversal_sle_ids = []
 
     # Cancel PLE entries
-    conn.execute(
-        """UPDATE payment_ledger_entry SET delinked = 1, updated_at = datetime('now')
-           WHERE voucher_type = 'purchase_invoice' AND voucher_id = ?""",
-        (args.purchase_invoice_id,),
-    )
+    ple_t = Table("payment_ledger_entry")
+    q = (Q.update(ple_t)
+         .set(ple_t.delinked, 1)
+         .set(ple_t.updated_at, LiteralValue("datetime('now')"))
+         .where(ple_t.voucher_type == ValueWrapper("purchase_invoice"))
+         .where(ple_t.voucher_id == P()))
+    conn.execute(q.get_sql(), (args.purchase_invoice_id,))
 
     # Reverse PO invoiced_qty if linked
     if pi_dict.get("purchase_order_id"):
-        items = conn.execute(
-            "SELECT * FROM purchase_invoice_item WHERE purchase_invoice_id = ?",
-            (args.purchase_invoice_id,),
-        ).fetchall()
+        pii_t = Table("purchase_invoice_item")
+        q = Q.from_(pii_t).select(pii_t.star).where(pii_t.purchase_invoice_id == P())
+        items = conn.execute(q.get_sql(), (args.purchase_invoice_id,)).fetchall()
         for item_row in items:
             item = row_to_dict(item_row)
             if item.get("purchase_order_item_id"):
+                # raw SQL — CAST+MAX arithmetic expression not expressible in PyPika
                 conn.execute(
                     """UPDATE purchase_order_item
                        SET invoiced_qty = CAST(
@@ -2430,11 +2533,11 @@ def cancel_purchase_invoice(conn, args):
                 )
         _update_po_invoice_status(conn, pi_dict["purchase_order_id"])
 
-    conn.execute(
-        """UPDATE purchase_invoice SET status = 'cancelled',
-           updated_at = datetime('now') WHERE id = ?""",
-        (args.purchase_invoice_id,),
-    )
+    q = (Q.update(pi_t)
+         .set(pi_t.status, ValueWrapper("cancelled"))
+         .set(pi_t.updated_at, LiteralValue("datetime('now')"))
+         .where(pi_t.id == P()))
+    conn.execute(q.get_sql(), (args.purchase_invoice_id,))
 
     audit(conn, "erpclaw-buying", "cancel-purchase-invoice", "purchase_invoice",
            args.purchase_invoice_id,
@@ -2457,8 +2560,9 @@ def create_debit_note(conn, args):
     if not args.items:
         err("--items is required (JSON array)")
 
-    orig = conn.execute("SELECT * FROM purchase_invoice WHERE id = ?",
-                        (args.against_invoice_id,)).fetchone()
+    pi_t = Table("purchase_invoice")
+    q = Q.from_(pi_t).select(pi_t.star).where(pi_t.id == P())
+    orig = conn.execute(q.get_sql(), (args.against_invoice_id,)).fetchone()
     if not orig:
         err(f"Purchase invoice {args.against_invoice_id} not found")
     if orig["status"] not in ("submitted", "partially_paid", "paid", "overdue"):
@@ -2474,16 +2578,17 @@ def create_debit_note(conn, args):
     total_amount = Decimal("0")
 
     # Insert parent (is_return=1, negative amounts)
-    conn.execute(
-        """INSERT INTO purchase_invoice
-           (id, supplier_id, posting_date, total_amount, tax_amount,
-            grand_total, outstanding_amount, status, is_return, return_against,
-            update_stock, company_id)
-           VALUES (?, ?, ?, '0', '0', '0', '0', 'draft', 1, ?, ?, ?)""",
+    q = (Q.into(pi_t)
+         .columns("id", "supplier_id", "posting_date", "total_amount",
+                  "tax_amount", "grand_total", "outstanding_amount", "status",
+                  "is_return", "return_against", "update_stock", "company_id")
+         .insert(P(), P(), P(), ValueWrapper("0"), ValueWrapper("0"),
+                 ValueWrapper("0"), ValueWrapper("0"), ValueWrapper("draft"),
+                 1, P(), P(), P()))
+    conn.execute(q.get_sql(),
         (dn_id, orig_dict["supplier_id"], posting_date,
          args.against_invoice_id, orig_dict.get("update_stock", 0),
-         orig_dict["company_id"]),
-    )
+         orig_dict["company_id"]))
 
     for i, item in enumerate(items):
         item_id = item.get("item_id")
@@ -2495,10 +2600,13 @@ def create_debit_note(conn, args):
         rate = to_decimal(item.get("rate", "0"))
         if rate <= 0:
             # Look up rate from original invoice
-            orig_item = conn.execute(
-                "SELECT rate FROM purchase_invoice_item WHERE purchase_invoice_id = ? AND item_id = ? LIMIT 1",
-                (args.against_invoice_id, item_id),
-            ).fetchone()
+            pii_t = Table("purchase_invoice_item")
+            q = (Q.from_(pii_t).select(pii_t.rate)
+                 .where(pii_t.purchase_invoice_id == P())
+                 .where(pii_t.item_id == P())
+                 .limit(1))
+            orig_item = conn.execute(q.get_sql(),
+                (args.against_invoice_id, item_id)).fetchone()
             rate = to_decimal(orig_item["rate"]) if orig_item else Decimal("0")
         if rate <= 0:
             err(f"Item {i}: rate must be > 0")
@@ -2519,12 +2627,14 @@ def create_debit_note(conn, args):
 
     grand_total = total_amount  # Already negative
 
-    conn.execute(
-        """UPDATE purchase_invoice SET total_amount = ?, grand_total = ?,
-           outstanding_amount = ? WHERE id = ?""",
+    q = (Q.update(pi_t)
+         .set(pi_t.total_amount, P())
+         .set(pi_t.grand_total, P())
+         .set(pi_t.outstanding_amount, P())
+         .where(pi_t.id == P()))
+    conn.execute(q.get_sql(),
         (str(round_currency(total_amount)), str(round_currency(grand_total)),
-         str(round_currency(grand_total)), dn_id),
-    )
+         str(round_currency(grand_total)), dn_id))
 
     audit(conn, "erpclaw-buying", "create-debit-note", "purchase_invoice", dn_id,
            new_values={"against_invoice_id": args.against_invoice_id,
@@ -2547,8 +2657,9 @@ def update_invoice_outstanding(conn, args):
     if not args.amount:
         err("--amount is required")
 
-    pi = conn.execute("SELECT * FROM purchase_invoice WHERE id = ?",
-                      (args.purchase_invoice_id,)).fetchone()
+    pi_t = Table("purchase_invoice")
+    q = Q.from_(pi_t).select(pi_t.star).where(pi_t.id == P())
+    pi = conn.execute(q.get_sql(), (args.purchase_invoice_id,)).fetchone()
     if not pi:
         err(f"Purchase invoice {args.purchase_invoice_id} not found")
 
@@ -2567,11 +2678,13 @@ def update_invoice_outstanding(conn, args):
     else:
         new_status = "partially_paid"
 
-    conn.execute(
-        """UPDATE purchase_invoice SET outstanding_amount = ?, status = ?,
-           updated_at = datetime('now') WHERE id = ?""",
-        (str(new_outstanding), new_status, args.purchase_invoice_id),
-    )
+    q = (Q.update(pi_t)
+         .set(pi_t.outstanding_amount, P())
+         .set(pi_t.status, P())
+         .set(pi_t.updated_at, LiteralValue("datetime('now')"))
+         .where(pi_t.id == P()))
+    conn.execute(q.get_sql(),
+        (str(new_outstanding), new_status, args.purchase_invoice_id))
 
     audit(conn, "erpclaw-buying", "update-invoice-outstanding", "purchase_invoice",
            args.purchase_invoice_id,
@@ -2606,18 +2719,22 @@ def add_landed_cost_voucher(conn, args):
         err("--charges must be a non-empty JSON array")
 
     # Validate receipts and gather items
+    pr_t = Table("purchase_receipt")
+    pr_q = (Q.from_(pr_t).select(pr_t.star)
+            .where(pr_t.id == P())
+            .where(pr_t.status == ValueWrapper("submitted")))
+    pr_sql = pr_q.get_sql()
+
+    pri_t = Table("purchase_receipt_item")
+    pri_q = Q.from_(pri_t).select(pri_t.star).where(pri_t.purchase_receipt_id == P())
+    pri_sql = pri_q.get_sql()
+
     all_items = []
     for pr_id in pr_ids:
-        pr = conn.execute(
-            "SELECT * FROM purchase_receipt WHERE id = ? AND status = 'submitted'",
-            (pr_id,),
-        ).fetchone()
+        pr = conn.execute(pr_sql, (pr_id,)).fetchone()
         if not pr:
             err(f"Purchase receipt {pr_id} not found or not submitted")
-        items = conn.execute(
-            "SELECT * FROM purchase_receipt_item WHERE purchase_receipt_id = ?",
-            (pr_id,),
-        ).fetchall()
+        items = conn.execute(pri_sql, (pr_id,)).fetchall()
         for item_row in items:
             all_items.append(row_to_dict(item_row))
 
@@ -2633,12 +2750,11 @@ def add_landed_cost_voucher(conn, args):
     total_landed_cost = Decimal("0")
 
     # Insert parent first
-    conn.execute(
-        """INSERT INTO landed_cost_voucher
-           (id, posting_date, total_landed_cost, status, company_id)
-           VALUES (?, ?, '0', 'submitted', ?)""",
-        (lcv_id, posting_date, args.company_id),
-    )
+    lcv_t = Table("landed_cost_voucher")
+    q = (Q.into(lcv_t)
+         .columns("id", "posting_date", "total_landed_cost", "status", "company_id")
+         .insert(P(), P(), ValueWrapper("0"), ValueWrapper("submitted"), P()))
+    conn.execute(q.get_sql(), (lcv_id, posting_date, args.company_id))
 
     fiscal_year = _get_fiscal_year(conn, posting_date)
     cost_center_id = _get_cost_center(conn, args.company_id)
@@ -2656,15 +2772,15 @@ def add_landed_cost_voucher(conn, args):
         total_landed_cost += charge_amount
 
         # Insert charge record
-        conn.execute(
-            """INSERT INTO landed_cost_charge
-               (id, landed_cost_voucher_id, description, amount,
-                expense_account_id, allocation_method)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+        lcc_t = Table("landed_cost_charge")
+        q = (Q.into(lcc_t)
+             .columns("id", "landed_cost_voucher_id", "description", "amount",
+                      "expense_account_id", "allocation_method")
+             .insert(P(), P(), P(), P(), P(), P()))
+        conn.execute(q.get_sql(),
             (str(uuid.uuid4()), lcv_id, desc, str(round_currency(charge_amount)),
              expense_account_id,
-             "by_qty" if alloc_method == "qty" else "by_amount"),
-        )
+             "by_qty" if alloc_method == "qty" else "by_amount"))
 
         # Allocate charge across receipt items
         allocated_so_far = Decimal("0")
@@ -2693,26 +2809,28 @@ def add_landed_cost_voucher(conn, args):
             per_unit_charge = round_currency(allocated_amount / item_qty) if item_qty > 0 else Decimal("0")
             final_rate = round_currency(original_rate + per_unit_charge)
 
-            conn.execute(
-                """INSERT INTO landed_cost_item
-                   (id, landed_cost_voucher_id, purchase_receipt_id,
-                    purchase_receipt_item_id, applicable_charges,
-                    original_rate, final_rate)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            lci_t = Table("landed_cost_item")
+            q = (Q.into(lci_t)
+                 .columns("id", "landed_cost_voucher_id", "purchase_receipt_id",
+                          "purchase_receipt_item_id", "applicable_charges",
+                          "original_rate", "final_rate")
+                 .insert(P(), P(), P(), P(), P(), P(), P()))
+            conn.execute(q.get_sql(),
                 (str(uuid.uuid4()), lcv_id, item["purchase_receipt_id"],
                  item["id"], str(round_currency(allocated_amount)),
                  str(round_currency(original_rate)),
-                 str(final_rate)),
-            )
+                 str(final_rate)))
 
         # GL: DR Stock In Hand / CR Expense account for this charge
         if expense_account_id:
             # Find stock account
-            stock_acct = conn.execute(
-                "SELECT id FROM account WHERE account_type = 'stock' "
-                "AND company_id = ? AND is_group = 0 LIMIT 1",
-                (args.company_id,),
-            ).fetchone()
+            acct_t = Table("account")
+            q = (Q.from_(acct_t).select(acct_t.id)
+                 .where(acct_t.account_type == ValueWrapper("stock"))
+                 .where(acct_t.company_id == P())
+                 .where(acct_t.is_group == 0)
+                 .limit(1))
+            stock_acct = conn.execute(q.get_sql(), (args.company_id,)).fetchone()
             stock_acct_id = stock_acct["id"] if stock_acct else None
 
             if stock_acct_id:
@@ -2731,10 +2849,10 @@ def add_landed_cost_voucher(conn, args):
                 })
 
     # Update total
-    conn.execute(
-        "UPDATE landed_cost_voucher SET total_landed_cost = ? WHERE id = ?",
-        (str(round_currency(total_landed_cost)), lcv_id),
-    )
+    q = (Q.update(lcv_t)
+         .set(lcv_t.total_landed_cost, P())
+         .where(lcv_t.id == P()))
+    conn.execute(q.get_sql(), (str(round_currency(total_landed_cost)), lcv_id))
 
     # Insert GL entries
     gl_ids = []
@@ -2769,46 +2887,51 @@ def status_action(conn, args):
     """Buying summary for a company."""
     company_id = args.company_id
     if not company_id:
-        row = conn.execute("SELECT id FROM company LIMIT 1").fetchone()
+        company_t = Table("company")
+        q = Q.from_(company_t).select(company_t.id).limit(1)
+        row = conn.execute(q.get_sql()).fetchone()
         if not row:
             err("No company found. Create one with erpclaw-setup first.",
                  suggestion="Run 'tutorial' to create a demo company, or 'setup company' to create your own.")
         company_id = row["id"]
 
-    supplier_count = conn.execute(
-        "SELECT COUNT(*) as cnt FROM supplier WHERE company_id = ?",
-        (company_id,),
-    ).fetchone()["cnt"]
+    sup_t = Table("supplier")
+    q = (Q.from_(sup_t)
+         .select(fn.Count("*").as_("cnt"))
+         .where(sup_t.company_id == P()))
+    supplier_count = conn.execute(q.get_sql(), (company_id,)).fetchone()["cnt"]
 
     # PO by status
-    po_rows = conn.execute(
-        """SELECT status, COUNT(*) as cnt FROM purchase_order
-           WHERE company_id = ? GROUP BY status""",
-        (company_id,),
-    ).fetchall()
+    po_t = Table("purchase_order")
+    q = (Q.from_(po_t)
+         .select(po_t.status, fn.Count("*").as_("cnt"))
+         .where(po_t.company_id == P())
+         .groupby(po_t.status))
+    po_rows = conn.execute(q.get_sql(), (company_id,)).fetchall()
     po_counts = {}
     for row in po_rows:
         po_counts[row["status"]] = row["cnt"]
     po_counts["total"] = sum(po_counts.values())
 
     # PI by status
-    pi_rows = conn.execute(
-        """SELECT status, COUNT(*) as cnt FROM purchase_invoice
-           WHERE company_id = ? GROUP BY status""",
-        (company_id,),
-    ).fetchall()
+    pi_t = Table("purchase_invoice")
+    q = (Q.from_(pi_t)
+         .select(pi_t.status, fn.Count("*").as_("cnt"))
+         .where(pi_t.company_id == P())
+         .groupby(pi_t.status))
+    pi_rows = conn.execute(q.get_sql(), (company_id,)).fetchall()
     pi_counts = {}
     for row in pi_rows:
         pi_counts[row["status"]] = row["cnt"]
     pi_counts["total"] = sum(v for k, v in pi_counts.items() if k != "total")
 
     # Total outstanding
-    outstanding = conn.execute(
-        """SELECT COALESCE(decimal_sum(outstanding_amount), '0') as total
-           FROM purchase_invoice
-           WHERE company_id = ? AND status IN ('submitted', 'overdue', 'partially_paid')""",
-        (company_id,),
-    ).fetchone()
+    q = (Q.from_(pi_t)
+         .select(fn.Coalesce(DecimalSum(pi_t.outstanding_amount), ValueWrapper("0")).as_("total"))
+         .where(pi_t.company_id == P())
+         .where(pi_t.status.isin([P(), P(), P()])))
+    outstanding = conn.execute(q.get_sql(),
+        (company_id, "submitted", "overdue", "partially_paid")).fetchone()
     total_outstanding = round_currency(to_decimal(str(outstanding["total"])))
 
     ok({
@@ -2858,27 +2981,29 @@ def import_suppliers(conn, args):
     for row in rows:
         name = row.get("name", "")
 
-        existing = conn.execute(
-            "SELECT id FROM supplier WHERE name = ? AND company_id = ?",
-            (name, company_id),
-        ).fetchone()
+        sup_t = Table("supplier")
+        q = (Q.from_(sup_t).select(sup_t.id)
+             .where(sup_t.name == P())
+             .where(sup_t.company_id == P()))
+        existing = conn.execute(q.get_sql(), (name, company_id)).fetchone()
         if existing:
             skipped += 1
             continue
 
         supplier_id = str(uuid.uuid4())
         naming = get_next_name(conn, "supplier")
-        conn.execute(
-            """INSERT INTO supplier (id, name, naming_series, supplier_type,
-               country, default_currency, email, phone, tax_id, company_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        q = (Q.into(sup_t)
+             .columns("id", "name", "naming_series", "supplier_type",
+                      "country", "default_currency", "email", "phone",
+                      "tax_id", "company_id")
+             .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P()))
+        conn.execute(q.get_sql(),
             (supplier_id, name, naming,
              row.get("supplier_type", "Company"),
              row.get("country"),
              row.get("default_currency", "USD"),
              row.get("email"), row.get("phone"), row.get("tax_id"),
-             company_id),
-        )
+             company_id))
         imported += 1
 
     conn.commit()

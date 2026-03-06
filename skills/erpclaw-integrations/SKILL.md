@@ -4,7 +4,7 @@ version: 1.0.0
 description: External integrations for ERPClaw — Plaid bank sync, Stripe payments, S3 cloud backups
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-integrations
 tier: 6
 category: integrations
 tags: [plaid, stripe, s3, bank, payments, backup, integration]
@@ -24,7 +24,7 @@ Plaid, Stripe, or AWS requests are made. All data is stored locally in SQLite wi
 ## Security Model
 
 - **Local-only**: All data stored in `~/.openclaw/erpclaw/data.sqlite`
-- **Fully offline**: Zero network calls in any code path. All API calls are mocked — no external HTTP requests, no telemetry. Does NOT contact Plaid, Stripe, AWS, or any external service.
+- **Fully offline**: All API calls are mocked — no external HTTP requests, no telemetry
 - **No credentials required**: Uses Python standard library + erpclaw_lib shared library (installed by erpclaw-setup). The shared library is also fully offline and stdlib-only.
 - **Optional env vars**: `ERPCLAW_DB_PATH` (custom DB location, defaults to `~/.openclaw/erpclaw/data.sqlite`)
 - **Credentials stored locally**: Keys in config tables, never transmitted

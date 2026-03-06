@@ -27,6 +27,8 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
+    from erpclaw_lib.query import Q, P, Table, Field, fn, Case, Order, Criterion, Not, NULL, insert_row, update_row
+    from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
@@ -44,6 +46,17 @@ VALID_OPP_TYPES = ("sales", "support", "maintenance")
 VALID_CAMPAIGN_TYPES = ("email", "social", "event", "referral", "content")
 VALID_CAMPAIGN_STATUSES = ("planned", "active", "completed")
 VALID_ACTIVITY_TYPES = ("call", "email", "meeting", "note", "task")
+
+# ---------------------------------------------------------------------------
+# PyPika table references
+# ---------------------------------------------------------------------------
+_t_company = Table("company")
+_t_lead = Table("lead")
+_t_opportunity = Table("opportunity")
+_t_customer = Table("customer")
+_t_campaign = Table("campaign")
+_t_campaign_lead = Table("campaign_lead")
+_t_activity = Table("crm_activity")
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +90,8 @@ def _resolve_company_id(conn, args):
     if not company_id:
         err("--company-id is required")
     # Validate company exists
-    comp = conn.execute("SELECT id FROM company WHERE id = ?", (company_id,)).fetchone()
+    q = Q.from_(_t_company).select(_t_company.id).where(_t_company.id == P())
+    comp = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not comp:
         err(f"Company {company_id} not found")
     # Set on conn so get_next_name() can find it
@@ -90,7 +104,8 @@ def _resolve_company_id(conn, args):
 # ---------------------------------------------------------------------------
 
 def _validate_lead_exists(conn, lead_id: str):
-    lead = conn.execute("SELECT * FROM lead WHERE id = ?", (lead_id,)).fetchone()
+    q = Q.from_(_t_lead).select(_t_lead.star).where(_t_lead.id == P())
+    lead = conn.execute(q.get_sql(), (lead_id,)).fetchone()
     if not lead:
         err(f"Lead {lead_id} not found",
              suggestion="Use 'list leads' to see available leads.")
@@ -98,7 +113,8 @@ def _validate_lead_exists(conn, lead_id: str):
 
 
 def _validate_opportunity_exists(conn, opp_id: str):
-    opp = conn.execute("SELECT * FROM opportunity WHERE id = ?", (opp_id,)).fetchone()
+    q = Q.from_(_t_opportunity).select(_t_opportunity.star).where(_t_opportunity.id == P())
+    opp = conn.execute(q.get_sql(), (opp_id,)).fetchone()
     if not opp:
         err(f"Opportunity {opp_id} not found",
              suggestion="Use 'list opportunities' to see available opportunities.")
@@ -106,14 +122,16 @@ def _validate_opportunity_exists(conn, opp_id: str):
 
 
 def _validate_customer_exists(conn, customer_id: str):
-    cust = conn.execute("SELECT * FROM customer WHERE id = ?", (customer_id,)).fetchone()
+    q = Q.from_(_t_customer).select(_t_customer.star).where(_t_customer.id == P())
+    cust = conn.execute(q.get_sql(), (customer_id,)).fetchone()
     if not cust:
         err(f"Customer {customer_id} not found")
     return cust
 
 
 def _validate_campaign_exists(conn, campaign_id: str):
-    camp = conn.execute("SELECT * FROM campaign WHERE id = ?", (campaign_id,)).fetchone()
+    q = Q.from_(_t_campaign).select(_t_campaign.star).where(_t_campaign.id == P())
+    camp = conn.execute(q.get_sql(), (campaign_id,)).fetchone()
     if not camp:
         err(f"Campaign {campaign_id} not found")
     return camp
@@ -140,11 +158,13 @@ def add_lead(conn, args):
     lead_id = str(uuid.uuid4())
     naming = get_next_name(conn, "lead")
 
-    conn.execute(
-        """INSERT INTO lead (id, naming_series, lead_name, company_name, email,
-           phone, source, territory, industry, status, assigned_to, notes,
-           company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)""",
+    sql, _ = insert_row("lead", {
+        "id": P(), "naming_series": P(), "lead_name": P(), "company_name": P(),
+        "email": P(), "phone": P(), "source": P(), "territory": P(),
+        "industry": P(), "status": ValueWrapper("new"), "assigned_to": P(),
+        "notes": P(), "company_id": P(),
+    })
+    conn.execute(sql,
         (lead_id, naming, args.lead_name, args.company_name, args.email,
          args.phone, args.source, args.territory, args.industry,
          args.assigned_to, args.notes, company_id),
@@ -197,9 +217,6 @@ def update_lead(conn, args):
     if args.status and args.status not in VALID_LEAD_STATUSES:
         err(f"--status must be one of {VALID_LEAD_STATUSES}")
 
-    updates = []
-    values = []
-
     field_map = {
         "lead_name": args.lead_name,
         "company_name": args.company_name,
@@ -213,18 +230,15 @@ def update_lead(conn, args):
         "notes": args.notes,
     }
 
-    for col, val in field_map.items():
-        if val is not None:
-            updates.append(f"{col} = ?")
-            values.append(val)
+    data = {k: P() for k, v in field_map.items() if v is not None}
+    values = [v for v in field_map.values() if v is not None]
 
-    if not updates:
+    if not data:
         err("No fields to update. Provide at least one optional flag.")
 
-    updates.append("updated_at = datetime('now')")
+    data["updated_at"] = LiteralValue("datetime('now')")
+    sql = update_row("lead", data, {"id": P()})
     values.append(args.lead_id)
-
-    sql = f"UPDATE lead SET {', '.join(updates)} WHERE id = ?"
     conn.execute(sql, values)
 
     audit(conn, "erpclaw-crm", "update-lead", "lead", args.lead_id,
@@ -232,7 +246,8 @@ def update_lead(conn, args):
            description="Updated lead")
     conn.commit()
 
-    updated = conn.execute("SELECT * FROM lead WHERE id = ?", (args.lead_id,)).fetchone()
+    q = Q.from_(_t_lead).select(_t_lead.star).where(_t_lead.id == P())
+    updated = conn.execute(q.get_sql(), (args.lead_id,)).fetchone()
 
     ok({
         "lead": row_to_dict(updated),
@@ -256,22 +271,20 @@ def get_lead(conn, args):
     lead_dict = row_to_dict(lead)
 
     # Fetch activities for this lead
-    activities = conn.execute(
-        """SELECT * FROM crm_activity WHERE lead_id = ?
-           ORDER BY activity_date DESC""",
-        (args.lead_id,),
-    ).fetchall()
+    q = (Q.from_(_t_activity).select(_t_activity.star)
+         .where(_t_activity.lead_id == P())
+         .orderby(_t_activity.activity_date, order=Order.desc))
+    activities = conn.execute(q.get_sql(), (args.lead_id,)).fetchall()
     lead_dict["activities"] = [row_to_dict(a) for a in activities]
 
     # Fetch campaigns this lead is linked to
-    campaigns = conn.execute(
-        """SELECT c.*, cl.added_date, cl.converted
-           FROM campaign c
-           JOIN campaign_lead cl ON cl.campaign_id = c.id
-           WHERE cl.lead_id = ?
-           ORDER BY cl.added_date DESC""",
-        (args.lead_id,),
-    ).fetchall()
+    c = _t_campaign
+    cl = _t_campaign_lead
+    q = (Q.from_(c).join(cl).on(cl.campaign_id == c.id)
+         .select(c.star, cl.added_date, cl.converted)
+         .where(cl.lead_id == P())
+         .orderby(cl.added_date, order=Order.desc))
+    campaigns = conn.execute(q.get_sql(), (args.lead_id,)).fetchall()
     lead_dict["campaigns"] = [row_to_dict(c) for c in campaigns]
 
     ok({"lead": lead_dict})
@@ -286,32 +299,34 @@ def list_leads(conn, args):
 
     Optional: --status, --source, --search, --limit, --offset
     """
-    conditions = ["1=1"]
+    t = _t_lead
+    q = Q.from_(t).select(t.star)
+    q_cnt = Q.from_(t).select(fn.Count("*").as_("cnt"))
     params = []
 
     if args.status:
-        conditions.append("status = ?")
+        q = q.where(t.status == P())
+        q_cnt = q_cnt.where(t.status == P())
         params.append(args.status)
     if args.source:
-        conditions.append("source = ?")
+        q = q.where(t.source == P())
+        q_cnt = q_cnt.where(t.source == P())
         params.append(args.source)
     if args.search:
-        conditions.append("(lead_name LIKE ? OR company_name LIKE ? OR email LIKE ?)")
+        search_crit = (
+            t.lead_name.like(P()) | t.company_name.like(P()) | t.email.like(P())
+        )
+        q = q.where(search_crit)
+        q_cnt = q_cnt.where(search_crit)
         params.extend([f"%{args.search}%"] * 3)
 
-    where = " AND ".join(conditions)
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
 
-    rows = conn.execute(
-        f"""SELECT * FROM lead WHERE {where}
-            ORDER BY created_at DESC LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
+    q = q.orderby(t.created_at, order=Order.desc).limit(P()).offset(P())
 
-    total = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM lead WHERE {where}", params,
-    ).fetchone()["cnt"]
+    rows = conn.execute(q.get_sql(), params + [limit, offset]).fetchall()
+    total = conn.execute(q_cnt.get_sql(), params).fetchone()["cnt"]
 
     ok({
         "leads": [row_to_dict(r) for r in rows],
@@ -356,27 +371,30 @@ def convert_lead_to_opportunity(conn, args):
     opp_naming = get_next_name(conn, "opportunity")
 
     # Single transaction: create opportunity + update lead
-    conn.execute(
-        """INSERT INTO opportunity (id, naming_series, opportunity_name, lead_id,
-           opportunity_type, source, probability, expected_revenue, weighted_revenue,
-           stage, expected_closing_date, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)""",
+    sql, _ = insert_row("opportunity", {
+        "id": P(), "naming_series": P(), "opportunity_name": P(), "lead_id": P(),
+        "opportunity_type": P(), "source": P(), "probability": P(),
+        "expected_revenue": P(), "weighted_revenue": P(),
+        "stage": ValueWrapper("new"), "expected_closing_date": P(), "company_id": P(),
+    })
+    conn.execute(sql,
         (opp_id, opp_naming, args.opportunity_name, args.lead_id,
          opp_type, lead["source"], probability, expected_revenue, weighted,
          args.expected_closing_date, company_id),
     )
 
-    conn.execute(
-        """UPDATE lead SET status = 'converted', converted_to_opportunity = ?,
-           updated_at = datetime('now') WHERE id = ?""",
-        (opp_id, args.lead_id),
-    )
+    sql = update_row("lead", {
+        "status": ValueWrapper("converted"),
+        "converted_to_opportunity": P(),
+        "updated_at": LiteralValue("datetime('now')"),
+    }, {"id": P()})
+    conn.execute(sql, (opp_id, args.lead_id))
 
     # Mark campaign_lead as converted if applicable
-    conn.execute(
-        "UPDATE campaign_lead SET converted = 1 WHERE lead_id = ?",
-        (args.lead_id,),
-    )
+    sql = update_row("campaign_lead", {
+        "converted": ValueWrapper(1),
+    }, {"lead_id": P()})
+    conn.execute(sql, (args.lead_id,))
 
     audit(conn, "erpclaw-crm", "convert-lead-to-opportunity", "lead", args.lead_id,
            new_values={"opportunity_id": opp_id},
@@ -435,15 +453,19 @@ def add_opportunity(conn, args):
 
     source = None
     if args.lead_id:
-        lead = conn.execute("SELECT source FROM lead WHERE id = ?", (args.lead_id,)).fetchone()
+        q = Q.from_(_t_lead).select(_t_lead.source).where(_t_lead.id == P())
+        lead = conn.execute(q.get_sql(), (args.lead_id,)).fetchone()
         if lead:
             source = lead["source"]
 
-    conn.execute(
-        """INSERT INTO opportunity (id, naming_series, opportunity_name, lead_id,
-           customer_id, opportunity_type, source, probability, expected_revenue,
-           weighted_revenue, stage, expected_closing_date, assigned_to, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)""",
+    sql, _ = insert_row("opportunity", {
+        "id": P(), "naming_series": P(), "opportunity_name": P(), "lead_id": P(),
+        "customer_id": P(), "opportunity_type": P(), "source": P(),
+        "probability": P(), "expected_revenue": P(), "weighted_revenue": P(),
+        "stage": ValueWrapper("new"), "expected_closing_date": P(),
+        "assigned_to": P(), "company_id": P(),
+    })
+    conn.execute(sql,
         (opp_id, naming, args.opportunity_name, args.lead_id,
          args.customer_id, opp_type, source, probability, expected_revenue,
          weighted, args.expected_closing_date, args.assigned_to, company_id),
@@ -498,9 +520,6 @@ def update_opportunity(conn, args):
     if args.stage in ("won", "lost"):
         err(f"Use mark-opportunity-{args.stage} to set terminal state")
 
-    updates = []
-    values = []
-
     field_map = {
         "opportunity_name": args.opportunity_name,
         "stage": args.stage,
@@ -511,25 +530,22 @@ def update_opportunity(conn, args):
         "next_follow_up_date": args.next_follow_up_date,
     }
 
-    for col, val in field_map.items():
-        if val is not None:
-            updates.append(f"{col} = ?")
-            values.append(val)
+    data = {k: P() for k, v in field_map.items() if v is not None}
+    values = [v for v in field_map.values() if v is not None]
 
-    if not updates:
+    if not data:
         err("No fields to update. Provide at least one optional flag.")
 
     # Recalculate weighted revenue if probability or expected_revenue changed
     new_prob = args.probability or opp["probability"]
     new_rev = args.expected_revenue or opp["expected_revenue"]
     new_weighted = _calc_weighted_revenue(new_rev, new_prob)
-    updates.append("weighted_revenue = ?")
+    data["weighted_revenue"] = P()
     values.append(new_weighted)
 
-    updates.append("updated_at = datetime('now')")
+    data["updated_at"] = LiteralValue("datetime('now')")
+    sql = update_row("opportunity", data, {"id": P()})
     values.append(args.opportunity_id)
-
-    sql = f"UPDATE opportunity SET {', '.join(updates)} WHERE id = ?"
     conn.execute(sql, values)
 
     audit(conn, "erpclaw-crm", "update-opportunity", "opportunity", args.opportunity_id,
@@ -537,9 +553,8 @@ def update_opportunity(conn, args):
            description="Updated opportunity")
     conn.commit()
 
-    updated = conn.execute(
-        "SELECT * FROM opportunity WHERE id = ?", (args.opportunity_id,),
-    ).fetchone()
+    q = Q.from_(_t_opportunity).select(_t_opportunity.star).where(_t_opportunity.id == P())
+    updated = conn.execute(q.get_sql(), (args.opportunity_id,)).fetchone()
 
     ok({
         "opportunity": row_to_dict(updated),
@@ -563,27 +578,29 @@ def get_opportunity(conn, args):
     opp_dict = row_to_dict(opp)
 
     # Fetch activities
-    activities = conn.execute(
-        """SELECT * FROM crm_activity WHERE opportunity_id = ?
-           ORDER BY activity_date DESC""",
-        (args.opportunity_id,),
-    ).fetchall()
+    q = (Q.from_(_t_activity).select(_t_activity.star)
+         .where(_t_activity.opportunity_id == P())
+         .orderby(_t_activity.activity_date, order=Order.desc))
+    activities = conn.execute(q.get_sql(), (args.opportunity_id,)).fetchall()
     opp_dict["activities"] = [row_to_dict(a) for a in activities]
 
     # Fetch lead info if linked
     if opp["lead_id"]:
-        lead = conn.execute(
-            "SELECT id, naming_series, lead_name, company_name, email, phone, source, status FROM lead WHERE id = ?",
-            (opp["lead_id"],),
-        ).fetchone()
+        t = _t_lead
+        q = (Q.from_(t).select(
+            t.id, t.naming_series, t.lead_name, t.company_name,
+            t.email, t.phone, t.source, t.status)
+            .where(t.id == P()))
+        lead = conn.execute(q.get_sql(), (opp["lead_id"],)).fetchone()
         opp_dict["lead"] = row_to_dict(lead) if lead else None
 
     # Fetch customer info if linked
     if opp["customer_id"]:
-        customer = conn.execute(
-            "SELECT id, name, customer_type, territory, status FROM customer WHERE id = ?",
-            (opp["customer_id"],),
-        ).fetchone()
+        t = _t_customer
+        q = (Q.from_(t).select(
+            t.id, t.name, t.customer_type, t.territory, t.status)
+            .where(t.id == P()))
+        customer = conn.execute(q.get_sql(), (opp["customer_id"],)).fetchone()
         opp_dict["customer"] = row_to_dict(customer) if customer else None
 
     ok({"opportunity": opp_dict})
@@ -598,29 +615,28 @@ def list_opportunities(conn, args):
 
     Optional: --stage, --search, --limit, --offset
     """
-    conditions = ["1=1"]
+    t = _t_opportunity
+    q = Q.from_(t).select(t.star)
+    q_cnt = Q.from_(t).select(fn.Count("*").as_("cnt"))
     params = []
 
     if args.stage:
-        conditions.append("stage = ?")
+        q = q.where(t.stage == P())
+        q_cnt = q_cnt.where(t.stage == P())
         params.append(args.stage)
     if args.search:
-        conditions.append("(opportunity_name LIKE ? OR source LIKE ?)")
+        search_crit = t.opportunity_name.like(P()) | t.source.like(P())
+        q = q.where(search_crit)
+        q_cnt = q_cnt.where(search_crit)
         params.extend([f"%{args.search}%"] * 2)
 
-    where = " AND ".join(conditions)
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
 
-    rows = conn.execute(
-        f"""SELECT * FROM opportunity WHERE {where}
-            ORDER BY created_at DESC LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
+    q = q.orderby(t.created_at, order=Order.desc).limit(P()).offset(P())
 
-    total = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM opportunity WHERE {where}", params,
-    ).fetchone()["cnt"]
+    rows = conn.execute(q.get_sql(), params + [limit, offset]).fetchall()
+    total = conn.execute(q_cnt.get_sql(), params).fetchone()["cnt"]
 
     ok({
         "opportunities": [row_to_dict(r) for r in rows],
@@ -702,10 +718,11 @@ def convert_opportunity_to_quotation(conn, args):
 
     # Update opportunity with quotation reference
     if quotation_id:
-        conn.execute(
-            "UPDATE opportunity SET quotation_id = ?, updated_at = datetime('now') WHERE id = ?",
-            (quotation_id, args.opportunity_id),
-        )
+        sql = update_row("opportunity", {
+            "quotation_id": P(),
+            "updated_at": LiteralValue("datetime('now')"),
+        }, {"id": P()})
+        conn.execute(sql, (quotation_id, args.opportunity_id))
         audit(conn, "erpclaw-crm", "convert-opportunity-to-quotation", "opportunity", args.opportunity_id,
                new_values={"quotation_id": quotation_id},
                description=f"Created quotation from opportunity")
@@ -738,12 +755,13 @@ def mark_opportunity_won(conn, args):
 
     new_weighted = opp["expected_revenue"]  # 100% probability
 
-    conn.execute(
-        """UPDATE opportunity SET stage = 'won', probability = '100',
-           weighted_revenue = ?, updated_at = datetime('now')
-           WHERE id = ?""",
-        (new_weighted, args.opportunity_id),
-    )
+    sql = update_row("opportunity", {
+        "stage": ValueWrapper("won"),
+        "probability": ValueWrapper("100"),
+        "weighted_revenue": P(),
+        "updated_at": LiteralValue("datetime('now')"),
+    }, {"id": P()})
+    conn.execute(sql, (new_weighted, args.opportunity_id))
 
     audit(conn, "erpclaw-crm", "mark-opportunity-won", "opportunity", args.opportunity_id,
            old_values={"stage": opp["stage"], "probability": opp["probability"]},
@@ -784,13 +802,14 @@ def mark_opportunity_lost(conn, args):
     if opp["stage"] in ("won", "lost"):
         err(f"Opportunity is already {opp['stage']}. Terminal states cannot be changed.")
 
-    conn.execute(
-        """UPDATE opportunity SET stage = 'lost', probability = '0',
-           weighted_revenue = '0', lost_reason = ?,
-           updated_at = datetime('now')
-           WHERE id = ?""",
-        (args.lost_reason, args.opportunity_id),
-    )
+    sql = update_row("opportunity", {
+        "stage": ValueWrapper("lost"),
+        "probability": ValueWrapper("0"),
+        "weighted_revenue": ValueWrapper("0"),
+        "lost_reason": P(),
+        "updated_at": LiteralValue("datetime('now')"),
+    }, {"id": P()})
+    conn.execute(sql, (args.lost_reason, args.opportunity_id))
 
     audit(conn, "erpclaw-crm", "mark-opportunity-lost", "opportunity", args.opportunity_id,
            old_values={"stage": opp["stage"]},
@@ -832,10 +851,12 @@ def add_campaign(conn, args):
     campaign_id = str(uuid.uuid4())
     budget = args.budget or "0"
 
-    conn.execute(
-        """INSERT INTO campaign (id, name, campaign_type, start_date, end_date,
-           budget, status, description)
-           VALUES (?, ?, ?, ?, ?, ?, 'planned', ?)""",
+    sql, _ = insert_row("campaign", {
+        "id": P(), "name": P(), "campaign_type": P(), "start_date": P(),
+        "end_date": P(), "budget": P(), "status": ValueWrapper("planned"),
+        "description": P(),
+    })
+    conn.execute(sql,
         (campaign_id, args.name, args.campaign_type, args.start_date,
          args.end_date, budget, args.description),
     )
@@ -845,11 +866,10 @@ def add_campaign(conn, args):
     if args.lead_id:
         _validate_lead_exists(conn, args.lead_id)
         cl_id = str(uuid.uuid4())
-        conn.execute(
-            """INSERT INTO campaign_lead (id, campaign_id, lead_id)
-               VALUES (?, ?, ?)""",
-            (cl_id, campaign_id, args.lead_id),
-        )
+        sql, _ = insert_row("campaign_lead", {
+            "id": P(), "campaign_id": P(), "lead_id": P(),
+        })
+        conn.execute(sql, (cl_id, campaign_id, args.lead_id))
         lead_linked = True
 
     audit(conn, "erpclaw-crm", "add-campaign", "campaign", campaign_id,
@@ -955,11 +975,12 @@ def add_activity(conn, args):
 
     activity_id = str(uuid.uuid4())
 
-    conn.execute(
-        """INSERT INTO crm_activity (id, activity_type, subject, description,
-           activity_date, lead_id, opportunity_id, customer_id, created_by,
-           next_action_date)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+    sql, _ = insert_row("crm_activity", {
+        "id": P(), "activity_type": P(), "subject": P(), "description": P(),
+        "activity_date": P(), "lead_id": P(), "opportunity_id": P(),
+        "customer_id": P(), "created_by": P(), "next_action_date": P(),
+    })
+    conn.execute(sql,
         (activity_id, args.activity_type, args.subject, args.description,
          args.activity_date, args.lead_id, args.opportunity_id,
          args.customer_id, args.created_by, args.next_action_date),
@@ -993,32 +1014,31 @@ def list_activities(conn, args):
 
     Optional: --lead-id, --opportunity-id, --activity-type, --limit, --offset
     """
-    conditions = ["1=1"]
+    t = _t_activity
+    q = Q.from_(t).select(t.star)
+    q_cnt = Q.from_(t).select(fn.Count("*").as_("cnt"))
     params = []
 
     if args.lead_id:
-        conditions.append("lead_id = ?")
+        q = q.where(t.lead_id == P())
+        q_cnt = q_cnt.where(t.lead_id == P())
         params.append(args.lead_id)
     if args.opportunity_id:
-        conditions.append("opportunity_id = ?")
+        q = q.where(t.opportunity_id == P())
+        q_cnt = q_cnt.where(t.opportunity_id == P())
         params.append(args.opportunity_id)
     if args.activity_type:
-        conditions.append("activity_type = ?")
+        q = q.where(t.activity_type == P())
+        q_cnt = q_cnt.where(t.activity_type == P())
         params.append(args.activity_type)
 
-    where = " AND ".join(conditions)
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
 
-    rows = conn.execute(
-        f"""SELECT * FROM crm_activity WHERE {where}
-            ORDER BY activity_date DESC LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
+    q = q.orderby(t.activity_date, order=Order.desc).limit(P()).offset(P())
 
-    total = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM crm_activity WHERE {where}", params,
-    ).fetchone()["cnt"]
+    rows = conn.execute(q.get_sql(), params + [limit, offset]).fetchall()
+    total = conn.execute(q_cnt.get_sql(), params).fetchone()["cnt"]
 
     ok({
         "activities": [row_to_dict(r) for r in rows],
@@ -1119,18 +1139,25 @@ def pipeline_report(conn, args):
 
 def status_action(conn, args):
     """CRM status summary."""
-    lead_count = conn.execute("SELECT COUNT(*) AS cnt FROM lead").fetchone()["cnt"]
-    active_leads = conn.execute(
-        "SELECT COUNT(*) AS cnt FROM lead WHERE status NOT IN ('converted', 'lost')",
-    ).fetchone()["cnt"]
+    q = Q.from_(_t_lead).select(fn.Count("*").as_("cnt"))
+    lead_count = conn.execute(q.get_sql()).fetchone()["cnt"]
 
-    opp_count = conn.execute("SELECT COUNT(*) AS cnt FROM opportunity").fetchone()["cnt"]
-    open_opps = conn.execute(
-        "SELECT COUNT(*) AS cnt FROM opportunity WHERE stage NOT IN ('won', 'lost')",
-    ).fetchone()["cnt"]
+    q = (Q.from_(_t_lead).select(fn.Count("*").as_("cnt"))
+         .where(_t_lead.status.notin([ValueWrapper("converted"), ValueWrapper("lost")])))
+    active_leads = conn.execute(q.get_sql()).fetchone()["cnt"]
 
-    campaign_count = conn.execute("SELECT COUNT(*) AS cnt FROM campaign").fetchone()["cnt"]
-    activity_count = conn.execute("SELECT COUNT(*) AS cnt FROM crm_activity").fetchone()["cnt"]
+    q = Q.from_(_t_opportunity).select(fn.Count("*").as_("cnt"))
+    opp_count = conn.execute(q.get_sql()).fetchone()["cnt"]
+
+    q = (Q.from_(_t_opportunity).select(fn.Count("*").as_("cnt"))
+         .where(_t_opportunity.stage.notin([ValueWrapper("won"), ValueWrapper("lost")])))
+    open_opps = conn.execute(q.get_sql()).fetchone()["cnt"]
+
+    q = Q.from_(_t_campaign).select(fn.Count("*").as_("cnt"))
+    campaign_count = conn.execute(q.get_sql()).fetchone()["cnt"]
+
+    q = Q.from_(_t_activity).select(fn.Count("*").as_("cnt"))
+    activity_count = conn.execute(q.get_sql()).fetchone()["cnt"]
 
     ok({
         "crm_status": {

@@ -4,7 +4,7 @@ version: 1.0.0
 description: Cross-module KPIs, financial ratios, trends, and dashboards for ERPClaw — read-only, gracefully degrades when optional skills are missing
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-analytics
 tier: 3
 category: analytics
 requires: [erpclaw-setup, erpclaw-gl]

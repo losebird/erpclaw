@@ -4,7 +4,7 @@ version: 1.0.0
 description: Project management, tasks, milestones, and timesheets for ERPClaw
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-projects
 tier: 5
 category: projects
 database: ~/.openclaw/erpclaw/data.sqlite

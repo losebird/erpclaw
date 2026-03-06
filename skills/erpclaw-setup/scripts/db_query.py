@@ -43,6 +43,12 @@ from erpclaw_lib.decimal_utils import to_decimal
 from erpclaw_lib.validation import check_input_lengths
 from erpclaw_lib.response import ok, err, row_to_dict
 from erpclaw_lib.audit import audit
+from erpclaw_lib.query import Q, P, Table, Field, fn
+from erpclaw_lib.vendor.pypika import Order
+from erpclaw_lib.vendor.pypika.terms import LiteralValue
+
+# Convenience alias for datetime('now') SQLite expression
+_NOW = LiteralValue("datetime('now')")
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ASSETS_DIR = os.path.join(SKILL_DIR, "assets")
@@ -67,10 +73,13 @@ def setup_company(conn, args):
 
     company_id = str(uuid.uuid4())
     try:
+        t = Table("company")
+        q = Q.into(t).columns(
+            "id", "name", "abbr", "default_currency", "country",
+            "fiscal_year_start_month",
+        ).insert(P(), P(), P(), P(), P(), P())
         conn.execute(
-            """INSERT INTO company (id, name, abbr, default_currency, country,
-               fiscal_year_start_month)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+            q.get_sql(),
             (company_id, name, abbr,
              args.currency or "USD",
              args.country or "United States",
@@ -92,14 +101,17 @@ def update_company(conn, args):
     company_id = args.company_id
     if not company_id:
         # Default to first company
-        row = conn.execute("SELECT id FROM company LIMIT 1").fetchone()
+        t = Table("company")
+        q = Q.from_(t).select(t.id).limit(1)
+        row = conn.execute(q.get_sql()).fetchone()
         if not row:
             err("No company found",
                  suggestion="Run 'tutorial' to create a demo company, or 'setup company' to create your own.")
         company_id = row["id"]
 
-    old = row_to_dict(conn.execute(
-        "SELECT * FROM company WHERE id = ?", (company_id,)).fetchone())
+    t = Table("company")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    old = row_to_dict(conn.execute(q.get_sql(), (company_id,)).fetchone())
     if not old:
         err(f"Company {company_id} not found")
 
@@ -133,10 +145,9 @@ def update_company(conn, args):
     ]
     for field in account_fields:
         if field in updates and updates[field]:
-            acct = conn.execute(
-                "SELECT name, account_number, is_group FROM account WHERE id = ?",
-                (updates[field],)
-            ).fetchone()
+            ta = Table("account")
+            qa = Q.from_(ta).select(ta.name, ta.account_number, ta.is_group).where(ta.id == P())
+            acct = conn.execute(qa.get_sql(), (updates[field],)).fetchone()
             if acct and acct["is_group"]:
                 err(
                     f"Cannot set {field} to group account "
@@ -144,10 +155,14 @@ def update_company(conn, args):
                     f"Use a leaf account (is_group=0) instead."
                 )
 
-    set_clause = ", ".join(f"{k} = ?" for k in updates)
-    set_clause += ", updated_at = datetime('now')"
+    tc = Table("company")
+    qu = Q.update(tc)
+    for k in updates:
+        qu = qu.set(Field(k), P())
+    qu = qu.set(Field("updated_at"), _NOW)
+    qu = qu.where(tc.id == P())
     values = list(updates.values()) + [company_id]
-    conn.execute(f"UPDATE company SET {set_clause} WHERE id = ?", values)
+    conn.execute(qu.get_sql(), values)
     audit(conn, "erpclaw-setup", "update", "company", company_id,
            old_values={k: old.get(k) for k in updates},
            new_values=updates,
@@ -160,11 +175,13 @@ def update_company(conn, args):
 def get_company(conn, args):
     """Get a single company record."""
     company_id = args.company_id
+    t = Table("company")
     if not company_id:
-        row = conn.execute("SELECT * FROM company LIMIT 1").fetchone()
+        q = Q.from_(t).select(t.star).limit(1)
+        row = conn.execute(q.get_sql()).fetchone()
     else:
-        row = conn.execute(
-            "SELECT * FROM company WHERE id = ?", (company_id,)).fetchone()
+        q = Q.from_(t).select(t.star).where(t.id == P())
+        row = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not row:
         err("No company found",
              suggestion="Run 'tutorial' to create a demo company, or 'setup company' to create your own.")
@@ -175,9 +192,11 @@ def list_companies(conn, args):
     """List all companies."""
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
-    total_count = conn.execute("SELECT COUNT(*) as cnt FROM company").fetchone()["cnt"]
-    rows = conn.execute("SELECT * FROM company ORDER BY name LIMIT ? OFFSET ?",
-                        (limit, offset)).fetchall()
+    t = Table("company")
+    qc = Q.from_(t).select(fn.Count("*").as_("cnt"))
+    total_count = conn.execute(qc.get_sql()).fetchone()["cnt"]
+    q = Q.from_(t).select(t.star).orderby(t.name).limit(limit).offset(offset)
+    rows = conn.execute(q.get_sql()).fetchall()
     ok({"companies": [row_to_dict(r) for r in rows],
          "total_count": total_count, "limit": limit, "offset": offset,
          "has_more": offset + limit < total_count})
@@ -194,8 +213,12 @@ def add_currency(conn, args):
         err("--code is required")
     name = args.name or code
     try:
+        t = Table("currency")
+        q = Q.into(t).columns("code", "name", "symbol", "decimal_places", "enabled").insert(
+            P(), P(), P(), P(), P()
+        )
         conn.execute(
-            "INSERT INTO currency (code, name, symbol, decimal_places, enabled) VALUES (?, ?, ?, ?, ?)",
+            q.get_sql(),
             (code.upper(), name, args.symbol or "", args.decimal_places or 2,
              1 if args.enabled else 0),
         )
@@ -211,17 +234,17 @@ def list_currencies(conn, args):
     """List currencies, optionally only enabled."""
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
+    t = Table("currency")
     if args.enabled_only:
-        total_count = conn.execute(
-            "SELECT COUNT(*) as cnt FROM currency WHERE enabled = 1").fetchone()["cnt"]
-        rows = conn.execute(
-            "SELECT * FROM currency WHERE enabled = 1 ORDER BY code LIMIT ? OFFSET ?",
-            (limit, offset)).fetchall()
+        qc = Q.from_(t).select(fn.Count("*").as_("cnt")).where(t.enabled == 1)
+        total_count = conn.execute(qc.get_sql()).fetchone()["cnt"]
+        q = Q.from_(t).select(t.star).where(t.enabled == 1).orderby(t.code).limit(limit).offset(offset)
+        rows = conn.execute(q.get_sql()).fetchall()
     else:
-        total_count = conn.execute(
-            "SELECT COUNT(*) as cnt FROM currency").fetchone()["cnt"]
-        rows = conn.execute("SELECT * FROM currency ORDER BY code LIMIT ? OFFSET ?",
-                            (limit, offset)).fetchall()
+        qc = Q.from_(t).select(fn.Count("*").as_("cnt"))
+        total_count = conn.execute(qc.get_sql()).fetchone()["cnt"]
+        q = Q.from_(t).select(t.star).orderby(t.code).limit(limit).offset(offset)
+        rows = conn.execute(q.get_sql()).fetchall()
     ok({"currencies": [row_to_dict(r) for r in rows],
          "total_count": total_count, "limit": limit, "offset": offset,
          "has_more": offset + limit < total_count})
@@ -237,9 +260,12 @@ def add_exchange_rate(conn, args):
     source = args.source or "manual"
 
     try:
+        t = Table("exchange_rate")
+        q = Q.into(t).columns(
+            "id", "from_currency", "to_currency", "rate", "effective_date", "source"
+        ).insert(P(), P(), P(), P(), P(), P())
         conn.execute(
-            """INSERT INTO exchange_rate (id, from_currency, to_currency, rate,
-               effective_date, source) VALUES (?, ?, ?, ?, ?, ?)""",
+            q.get_sql(),
             (rate_id, args.from_currency.upper(), args.to_currency.upper(),
              args.rate, effective_date, source),
         )
@@ -260,11 +286,15 @@ def get_exchange_rate(conn, args):
         err("--from-currency and --to-currency are required")
 
     date = args.effective_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    t = Table("exchange_rate")
+    q = (Q.from_(t).select(t.star)
+         .where(t.from_currency == P())
+         .where(t.to_currency == P())
+         .where(t.effective_date <= P())
+         .orderby(t.effective_date, order=Order.desc)
+         .limit(1))
     row = conn.execute(
-        """SELECT * FROM exchange_rate
-           WHERE from_currency = ? AND to_currency = ?
-             AND effective_date <= ?
-           ORDER BY effective_date DESC LIMIT 1""",
+        q.get_sql(),
         (args.from_currency.upper(), args.to_currency.upper(), date),
     ).fetchone()
 
@@ -278,28 +308,31 @@ def list_exchange_rates(conn, args):
     """List exchange rates with optional filters."""
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
-    query = "SELECT * FROM exchange_rate WHERE 1=1"
+    t = Table("exchange_rate")
     params = []
+    qc = Q.from_(t).select(fn.Count("*").as_("cnt"))
+    q = Q.from_(t).select(t.star)
     if args.from_currency:
-        query += " AND from_currency = ?"
+        qc = qc.where(t.from_currency == P())
+        q = q.where(t.from_currency == P())
         params.append(args.from_currency.upper())
     if args.to_currency:
-        query += " AND to_currency = ?"
+        qc = qc.where(t.to_currency == P())
+        q = q.where(t.to_currency == P())
         params.append(args.to_currency.upper())
     if args.from_date:
-        query += " AND effective_date >= ?"
+        qc = qc.where(t.effective_date >= P())
+        q = q.where(t.effective_date >= P())
         params.append(args.from_date)
     if args.to_date:
-        query += " AND effective_date <= ?"
+        qc = qc.where(t.effective_date <= P())
+        q = q.where(t.effective_date <= P())
         params.append(args.to_date)
 
-    count_query = query.replace("SELECT * FROM exchange_rate", "SELECT COUNT(*) as cnt FROM exchange_rate")
-    total_count = conn.execute(count_query, params).fetchone()["cnt"]
+    total_count = conn.execute(qc.get_sql(), params).fetchone()["cnt"]
 
-    query += " ORDER BY effective_date DESC LIMIT ? OFFSET ?"
-    params.extend([limit, offset])
-
-    rows = conn.execute(query, params).fetchall()
+    q = q.orderby(t.effective_date, order=Order.desc).limit(limit).offset(offset)
+    rows = conn.execute(q.get_sql(), params + []).fetchall()
     ok({"rates": [row_to_dict(r) for r in rows],
          "total_count": total_count, "limit": limit, "offset": offset,
          "has_more": offset + limit < total_count})
@@ -317,9 +350,12 @@ def add_payment_terms(conn, args):
 
     pt_id = str(uuid.uuid4())
     try:
+        t = Table("payment_terms")
+        q = Q.into(t).columns(
+            "id", "name", "due_days", "discount_percentage", "discount_days", "description"
+        ).insert(P(), P(), P(), P(), P(), P())
         conn.execute(
-            """INSERT INTO payment_terms (id, name, due_days, discount_percentage,
-               discount_days, description) VALUES (?, ?, ?, ?, ?, ?)""",
+            q.get_sql(),
             (pt_id, name, args.due_days or 30,
              args.discount_percentage, args.discount_days,
              args.description),
@@ -336,10 +372,11 @@ def list_payment_terms(conn, args):
     """List all payment terms."""
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
-    total_count = conn.execute("SELECT COUNT(*) as cnt FROM payment_terms").fetchone()["cnt"]
-    rows = conn.execute(
-        "SELECT * FROM payment_terms ORDER BY due_days, name LIMIT ? OFFSET ?",
-        (limit, offset)).fetchall()
+    t = Table("payment_terms")
+    qc = Q.from_(t).select(fn.Count("*").as_("cnt"))
+    total_count = conn.execute(qc.get_sql()).fetchone()["cnt"]
+    q = Q.from_(t).select(t.star).orderby(t.due_days).orderby(t.name).limit(limit).offset(offset)
+    rows = conn.execute(q.get_sql()).fetchall()
     ok({"terms": [row_to_dict(r) for r in rows],
          "total_count": total_count, "limit": limit, "offset": offset,
          "has_more": offset + limit < total_count})
@@ -357,8 +394,10 @@ def add_uom(conn, args):
 
     uom_id = str(uuid.uuid4())
     try:
+        t = Table("uom")
+        q = Q.into(t).columns("id", "name", "must_be_whole_number").insert(P(), P(), P())
         conn.execute(
-            "INSERT INTO uom (id, name, must_be_whole_number) VALUES (?, ?, ?)",
+            q.get_sql(),
             (uom_id, name, 1 if args.must_be_whole_number else 0),
         )
         audit(conn, "erpclaw-setup", "create", "uom", uom_id, new_values={"name": name})
@@ -372,9 +411,11 @@ def list_uoms(conn, args):
     """List all units of measure."""
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
-    total_count = conn.execute("SELECT COUNT(*) as cnt FROM uom").fetchone()["cnt"]
-    rows = conn.execute("SELECT * FROM uom ORDER BY name LIMIT ? OFFSET ?",
-                        (limit, offset)).fetchall()
+    t = Table("uom")
+    qc = Q.from_(t).select(fn.Count("*").as_("cnt"))
+    total_count = conn.execute(qc.get_sql()).fetchone()["cnt"]
+    q = Q.from_(t).select(t.star).orderby(t.name).limit(limit).offset(offset)
+    rows = conn.execute(q.get_sql()).fetchall()
     ok({"uoms": [row_to_dict(r) for r in rows],
          "total_count": total_count, "limit": limit, "offset": offset,
          "has_more": offset + limit < total_count})
@@ -387,9 +428,12 @@ def add_uom_conversion(conn, args):
 
     conv_id = str(uuid.uuid4())
     try:
+        t = Table("uom_conversion")
+        q = Q.into(t).columns(
+            "id", "from_uom", "to_uom", "conversion_factor", "item_id"
+        ).insert(P(), P(), P(), P(), P())
         conn.execute(
-            """INSERT INTO uom_conversion (id, from_uom, to_uom,
-               conversion_factor, item_id) VALUES (?, ?, ?, ?, ?)""",
+            q.get_sql(),
             (conv_id, args.from_uom, args.to_uom,
              args.conversion_factor, args.item_id),
         )
@@ -411,7 +455,9 @@ def seed_defaults(conn, args):
     """Load standard seed data (currencies, UoMs, payment terms). Idempotent."""
     company_id = args.company_id
     if not company_id:
-        row = conn.execute("SELECT id FROM company LIMIT 1").fetchone()
+        t = Table("company")
+        q = Q.from_(t).select(t.id).limit(1)
+        row = conn.execute(q.get_sql()).fetchone()
         if not row:
             err("No company found. Run setup-company first.",
                  suggestion="Run 'tutorial' to create a demo company, or 'setup company' to create your own.")
@@ -477,29 +523,28 @@ def seed_defaults(conn, args):
 
 def get_audit_log(conn, args):
     """Query audit log with optional filters."""
-    query = "SELECT * FROM audit_log WHERE 1=1"
+    t = Table("audit_log")
+    q = Q.from_(t).select(t.star)
     params = []
     if args.entity_type:
-        query += " AND entity_type = ?"
+        q = q.where(t.entity_type == P())
         params.append(args.entity_type)
     if args.entity_id:
-        query += " AND entity_id = ?"
+        q = q.where(t.entity_id == P())
         params.append(args.entity_id)
     if args.audit_action:
-        query += " AND action = ?"
+        q = q.where(t.action == P())
         params.append(args.audit_action)
     if args.from_date:
-        query += " AND timestamp >= ?"
+        q = q.where(t.timestamp >= P())
         params.append(args.from_date)
     if args.to_date:
-        query += " AND timestamp <= ?"
+        q = q.where(t.timestamp <= P())
         params.append(args.to_date)
-    query += " ORDER BY timestamp DESC"
-    limit = args.limit or 50
-    query += " LIMIT ?"
-    params.append(int(limit))
+    limit = int(args.limit or 50)
+    q = q.orderby(t.timestamp, order=Order.desc).limit(limit)
 
-    rows = conn.execute(query, params).fetchall()
+    rows = conn.execute(q.get_sql(), params).fetchall()
     entries = []
     for r in rows:
         entry = row_to_dict(r)
@@ -515,8 +560,9 @@ def get_audit_log(conn, args):
 def get_schema_version(conn, args):
     """Read schema version for a module."""
     module = args.module or "erpclaw-setup"
-    row = conn.execute(
-        "SELECT * FROM schema_version WHERE module = ?", (module,)).fetchone()
+    t = Table("schema_version")
+    q = Q.from_(t).select(t.star).where(t.module == P())
+    row = conn.execute(q.get_sql(), (module,)).fetchone()
     if not row:
         err(f"No schema version found for module '{module}'")
     ok({"module": row["module"], "version": row["version"],
@@ -527,7 +573,9 @@ def update_regional_settings(conn, args):
     """Set company-level regional settings."""
     company_id = args.company_id
     if not company_id:
-        row = conn.execute("SELECT id FROM company LIMIT 1").fetchone()
+        t = Table("company")
+        q = Q.from_(t).select(t.id).limit(1)
+        row = conn.execute(q.get_sql()).fetchone()
         if not row:
             err("No company found",
                  suggestion="Run 'tutorial' to create a demo company, or 'setup company' to create your own.")
@@ -854,13 +902,27 @@ def restore_database(conn, args):
 
 def status(conn, args):
     """Overall system status."""
-    companies = conn.execute("SELECT COUNT(*) as cnt FROM company").fetchone()["cnt"]
-    currencies = conn.execute("SELECT COUNT(*) as cnt FROM currency WHERE enabled = 1").fetchone()["cnt"]
-    uoms = conn.execute("SELECT COUNT(*) as cnt FROM uom").fetchone()["cnt"]
-    payment_terms = conn.execute("SELECT COUNT(*) as cnt FROM payment_terms").fetchone()["cnt"]
+    tc = Table("company")
+    tcu = Table("currency")
+    tu = Table("uom")
+    tpt = Table("payment_terms")
+    tsv = Table("schema_version")
+    companies = conn.execute(
+        Q.from_(tc).select(fn.Count("*").as_("cnt")).get_sql()
+    ).fetchone()["cnt"]
+    currencies = conn.execute(
+        Q.from_(tcu).select(fn.Count("*").as_("cnt")).where(tcu.enabled == 1).get_sql()
+    ).fetchone()["cnt"]
+    uoms = conn.execute(
+        Q.from_(tu).select(fn.Count("*").as_("cnt")).get_sql()
+    ).fetchone()["cnt"]
+    payment_terms = conn.execute(
+        Q.from_(tpt).select(fn.Count("*").as_("cnt")).get_sql()
+    ).fetchone()["cnt"]
 
     versions = {}
-    for row in conn.execute("SELECT module, version FROM schema_version").fetchall():
+    q = Q.from_(tsv).select(tsv.module, tsv.version)
+    for row in conn.execute(q.get_sql()).fetchall():
         versions[row["module"]] = row["version"]
 
     ok({
@@ -881,6 +943,7 @@ def install_shared_library():
 
     Called automatically during initialize-database. Ensures every other
     ERPClaw skill can import from the standard shared lib path.
+    Recursively copies all .py files including vendor/ subdirectories.
     """
     target_dir = os.path.expanduser("~/.openclaw/erpclaw/lib/erpclaw_lib")
     bundled_dir = os.path.join(
@@ -889,13 +952,18 @@ def install_shared_library():
     )
     if not os.path.isdir(bundled_dir):
         return  # Not bundled (dev environment) — skip
-    os.makedirs(target_dir, exist_ok=True)
     copied = 0
-    for fname in os.listdir(bundled_dir):
-        if fname.endswith(".py"):
-            shutil.copy2(os.path.join(bundled_dir, fname),
-                         os.path.join(target_dir, fname))
-            copied += 1
+    for root, dirs, files in os.walk(bundled_dir):
+        # Skip __pycache__ directories
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        rel_path = os.path.relpath(root, bundled_dir)
+        dest_dir = os.path.join(target_dir, rel_path) if rel_path != "." else target_dir
+        os.makedirs(dest_dir, exist_ok=True)
+        for fname in files:
+            if fname.endswith(".py"):
+                shutil.copy2(os.path.join(root, fname),
+                             os.path.join(dest_dir, fname))
+                copied += 1
     return copied
 
 
@@ -972,15 +1040,14 @@ def tutorial(conn, args):
     now_year = datetime.now(timezone.utc).strftime("%Y")
 
     # Check if Acme Corp already exists
-    existing = conn.execute(
-        "SELECT id FROM company WHERE name = 'Acme Corp'"
-    ).fetchone()
+    tco = Table("company")
+    q_existing = Q.from_(tco).select(tco.id).where(tco.name == "Acme Corp")
+    existing = conn.execute(q_existing.get_sql()).fetchone()
     if existing:
         company_id = existing["id"]
-        accounts = conn.execute(
-            "SELECT id, name, account_type FROM account WHERE company_id = ?",
-            (company_id,),
-        ).fetchall()
+        ta = Table("account")
+        q_accts = Q.from_(ta).select(ta.id, ta.name, ta.account_type).where(ta.company_id == P())
+        accounts = conn.execute(q_accts.get_sql(), (company_id,)).fetchall()
         ok({
             "message": "Acme Corp already exists. Demo data is ready.",
             "company_id": company_id,
@@ -991,12 +1058,11 @@ def tutorial(conn, args):
     company_id = str(uuid.uuid4())
 
     # 1. Create Acme Corp
-    conn.execute(
-        """INSERT INTO company (id, name, abbr, default_currency, country,
-           fiscal_year_start_month)
-           VALUES (?, 'Acme Corp', 'AC', 'USD', 'United States', 1)""",
-        (company_id,),
-    )
+    tco2 = Table("company")
+    q_ins_co = Q.into(tco2).columns(
+        "id", "name", "abbr", "default_currency", "country", "fiscal_year_start_month"
+    ).insert(P(), "Acme Corp", "AC", "USD", "United States", 1)
+    conn.execute(q_ins_co.get_sql(), (company_id,))
 
     # 2. Create chart of accounts (minimal but functional)
     account_map = {}
@@ -1023,13 +1089,15 @@ def tutorial(conn, args):
         ("Equity", "3000", None, "equity", 1),
         ("Retained Earnings", "3100", "equity", "equity", 0),
     ]
+    tacct = Table("account")
+    q_ins_acct = Q.into(tacct).columns(
+        "id", "name", "account_number", "account_type", "root_type",
+        "is_group", "company_id", "balance_direction"
+    ).insert(P(), P(), P(), P(), P(), P(), P(), P())
     for name, acct_num, acct_type, root_type, is_group in acct_defs:
         acct_id = str(uuid.uuid4())
         conn.execute(
-            """INSERT INTO account
-               (id, name, account_number, account_type, root_type,
-                is_group, company_id, balance_direction)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            q_ins_acct.get_sql(),
             (acct_id, name, acct_num, acct_type, root_type,
              is_group, company_id,
              "debit_normal" if root_type in ("asset", "expense") else "credit_normal"),
@@ -1037,15 +1105,17 @@ def tutorial(conn, args):
         account_map[acct_num] = acct_id
 
     # 3. Set company default accounts
+    tco3 = Table("company")
+    q_upd_co = (Q.update(tco3)
+                .set(Field("default_receivable_account_id"), P())
+                .set(Field("default_payable_account_id"), P())
+                .set(Field("default_income_account_id"), P())
+                .set(Field("default_expense_account_id"), P())
+                .set(Field("default_bank_account_id"), P())
+                .set(Field("default_cash_account_id"), P())
+                .where(tco3.id == P()))
     conn.execute(
-        """UPDATE company SET
-           default_receivable_account_id = ?,
-           default_payable_account_id = ?,
-           default_income_account_id = ?,
-           default_expense_account_id = ?,
-           default_bank_account_id = ?,
-           default_cash_account_id = ?
-           WHERE id = ?""",
+        q_upd_co.get_sql(),
         (account_map["1300"], account_map["2100"], account_map["4100"],
          account_map["5200"], account_map["1100"], account_map["1200"],
          company_id),
@@ -1053,22 +1123,22 @@ def tutorial(conn, args):
 
     # 4. Create cost center
     cc_id = str(uuid.uuid4())
-    conn.execute(
-        "INSERT INTO cost_center (id, name, company_id, is_group) VALUES (?, 'Main', ?, 0)",
-        (cc_id, company_id),
-    )
-    conn.execute(
-        "UPDATE company SET default_cost_center_id = ? WHERE id = ?",
-        (cc_id, company_id),
-    )
+    tcc = Table("cost_center")
+    q_ins_cc = Q.into(tcc).columns("id", "name", "company_id", "is_group").insert(P(), "Main", P(), 0)
+    conn.execute(q_ins_cc.get_sql(), (cc_id, company_id))
+    tco4 = Table("company")
+    q_upd_cc = Q.update(tco4).set(Field("default_cost_center_id"), P()).where(tco4.id == P())
+    conn.execute(q_upd_cc.get_sql(), (cc_id, company_id))
 
     # 5. Create fiscal year
     fy_id = str(uuid.uuid4())
+    tfy = Table("fiscal_year")
+    q_ins_fy = Q.into(tfy).columns(
+        "id", "name", "start_date", "end_date", "company_id", "is_closed"
+    ).insert(P(), P(), P(), P(), P(), 0)
     conn.execute(
-        """INSERT INTO fiscal_year (id, name, start_date, end_date, company_id, is_closed)
-           VALUES (?, ?, ?, ?, ?, 0)""",
-        (fy_id, f"FY {now_year}", f"{now_year}-01-01", f"{now_year}-12-31",
-         company_id),
+        q_ins_fy.get_sql(),
+        (fy_id, f"FY {now_year}", f"{now_year}-01-01", f"{now_year}-12-31", company_id),
     )
 
     audit(conn, "erpclaw-setup", "create", "company", company_id,
@@ -1226,28 +1296,26 @@ def fetch_exchange_rates(conn, args):
         rate_str = str(Decimal(str(rate_value)))
 
         # Check if a rate already exists for this pair + date
-        existing = conn.execute(
-            """SELECT id FROM exchange_rate
-               WHERE from_currency = 'USD' AND to_currency = ?
-                 AND effective_date = ?""",
-            (currency_code, today),
-        ).fetchone()
+        ter = Table("exchange_rate")
+        q_check = (Q.from_(ter).select(ter.id)
+                   .where(ter.from_currency == "USD")
+                   .where(ter.to_currency == P())
+                   .where(ter.effective_date == P()))
+        existing = conn.execute(q_check.get_sql(), (currency_code, today)).fetchone()
 
         if existing:
-            conn.execute(
-                """UPDATE exchange_rate SET rate = ?, source = 'api',
-                   updated_at = datetime('now')
-                   WHERE id = ?""",
-                (rate_str, existing["id"]),
-            )
+            q_upd = (Q.update(ter)
+                     .set(ter.rate, P())
+                     .set(ter.source, "api")
+                     .set(Field("updated_at"), _NOW)
+                     .where(ter.id == P()))
+            conn.execute(q_upd.get_sql(), (rate_str, existing["id"]))
         else:
             rate_id = str(uuid.uuid4())
-            conn.execute(
-                """INSERT INTO exchange_rate
-                   (id, from_currency, to_currency, rate, effective_date, source)
-                   VALUES (?, 'USD', ?, ?, ?, 'api')""",
-                (rate_id, currency_code, rate_str, today),
-            )
+            q_ins = Q.into(ter).columns(
+                "id", "from_currency", "to_currency", "rate", "effective_date", "source"
+            ).insert(P(), "USD", P(), P(), P(), "api")
+            conn.execute(q_ins.get_sql(), (rate_id, currency_code, rate_str, today))
         count += 1
 
     audit(conn, "erpclaw-setup", "fetch", "exchange_rate", "system",
@@ -1273,9 +1341,9 @@ def add_user(conn, args):
     company_id = args.company_id
 
     # Check uniqueness
-    existing = conn.execute(
-        "SELECT id FROM erp_user WHERE username = ?", (username,)
-    ).fetchone()
+    tu = Table("erp_user")
+    q_check = Q.from_(tu).select(tu.id).where(tu.username == P())
+    existing = conn.execute(q_check.get_sql(), (username,)).fetchone()
     if existing:
         err(f"Username '{username}' already exists",
              suggestion="Choose a different username")
@@ -1283,9 +1351,11 @@ def add_user(conn, args):
     user_id = str(uuid.uuid4())
     company_ids = json.dumps([company_id]) if company_id else None
 
+    q_ins = Q.into(tu).columns(
+        "id", "username", "email", "full_name", "company_ids"
+    ).insert(P(), P(), P(), P(), P())
     conn.execute(
-        """INSERT INTO erp_user (id, username, email, full_name, company_ids)
-           VALUES (?, ?, ?, ?, ?)""",
+        q_ins.get_sql(),
         (user_id, username, email, full_name, company_ids),
     )
     audit(conn, "erpclaw-setup", "add-user", "erp_user", user_id,
@@ -1300,9 +1370,9 @@ def update_user(conn, args):
     if not user_id:
         err("--user-id is required")
 
-    user = conn.execute(
-        "SELECT * FROM erp_user WHERE id = ?", (user_id,)
-    ).fetchone()
+    tu = Table("erp_user")
+    q_get = Q.from_(tu).select(tu.star).where(tu.id == P())
+    user = conn.execute(q_get.get_sql(), (user_id,)).fetchone()
     if not user:
         err("User not found")
 
@@ -1327,12 +1397,14 @@ def update_user(conn, args):
     if not updates:
         err("No fields to update")
 
-    sets = ", ".join(f"{k} = ?" for k in updates)
+    tu2 = Table("erp_user")
+    qu = Q.update(tu2)
+    for k in updates:
+        qu = qu.set(Field(k), P())
+    qu = qu.set(Field("updated_at"), _NOW)
+    qu = qu.where(tu2.id == P())
     vals = list(updates.values()) + [user_id]
-    conn.execute(
-        f"UPDATE erp_user SET {sets}, updated_at = datetime('now') WHERE id = ?",
-        vals,
-    )
+    conn.execute(qu.get_sql(), vals)
     audit(conn, "erpclaw-setup", "update-user", "erp_user", user_id,
            old_values=dict(user), new_values=updates)
     conn.commit()
@@ -1343,11 +1415,13 @@ def list_users(conn, args):
     """List all ERP users."""
     limit = args.limit or 50
     offset = args.offset or 0
-    rows = conn.execute(
-        """SELECT id, username, email, full_name, status, company_ids, created_at
-           FROM erp_user ORDER BY username LIMIT ? OFFSET ?""",
-        (limit + 1, offset),
-    ).fetchall()
+    tu = Table("erp_user")
+    q = (Q.from_(tu)
+         .select(tu.id, tu.username, tu.email, tu.full_name, tu.status, tu.company_ids, tu.created_at)
+         .orderby(tu.username)
+         .limit(limit + 1)
+         .offset(offset))
+    rows = conn.execute(q.get_sql()).fetchall()
     users = [dict(r) for r in rows[:limit]]
     ok({"users": users, "count": len(users),
          "has_more": len(rows) > limit})
@@ -1359,21 +1433,26 @@ def get_user(conn, args):
     if not user_id:
         err("--user-id is required")
 
-    user = conn.execute(
-        "SELECT * FROM erp_user WHERE id = ?", (user_id,)
-    ).fetchone()
+    tu = Table("erp_user")
+    q_user = Q.from_(tu).select(tu.star).where(tu.id == P())
+    user = conn.execute(q_user.get_sql(), (user_id,)).fetchone()
     if not user:
         err("User not found")
 
-    roles = conn.execute(
-        """SELECT r.name AS role_name, ur.company_id, c.name AS company_name
-           FROM user_role ur
-           JOIN role r ON r.id = ur.role_id
-           LEFT JOIN company c ON c.id = ur.company_id
-           WHERE ur.user_id = ?
-           ORDER BY r.name""",
-        (user_id,),
-    ).fetchall()
+    tur = Table("user_role").as_("ur")
+    tr = Table("role").as_("r")
+    tco = Table("company").as_("c")
+    q_roles = (Q.from_(tur)
+               .join(tr).on(tr.id == tur.role_id)
+               .left_join(tco).on(tco.id == tur.company_id)
+               .select(
+                   tr.name.as_("role_name"),
+                   tur.company_id,
+                   tco.name.as_("company_name"),
+               )
+               .where(tur.user_id == P())
+               .orderby(tr.name))
+    roles = conn.execute(q_roles.get_sql(), (user_id,)).fetchall()
 
     result = dict(user)
     result["roles"] = [dict(r) for r in roles]
@@ -1386,17 +1465,15 @@ def add_role(conn, args):
     if not role_name:
         err("--name is required")
 
-    existing = conn.execute(
-        "SELECT id FROM role WHERE name = ?", (role_name,)
-    ).fetchone()
+    tr = Table("role")
+    q_check = Q.from_(tr).select(tr.id).where(tr.name == P())
+    existing = conn.execute(q_check.get_sql(), (role_name,)).fetchone()
     if existing:
         err(f"Role '{role_name}' already exists")
 
     role_id = str(uuid.uuid4())
-    conn.execute(
-        "INSERT INTO role (id, name, description, is_system) VALUES (?, ?, ?, 0)",
-        (role_id, role_name, args.description),
-    )
+    q_ins = Q.into(tr).columns("id", "name", "description", "is_system").insert(P(), P(), P(), 0)
+    conn.execute(q_ins.get_sql(), (role_id, role_name, args.description))
     audit(conn, "erpclaw-setup", "add-role", "role", role_id,
            new_values={"name": role_name})
     conn.commit()
@@ -1405,14 +1482,16 @@ def add_role(conn, args):
 
 def list_roles(conn, args):
     """List all roles."""
-    rows = conn.execute(
-        """SELECT r.id, r.name, r.description, r.is_system,
-                  COUNT(ur.id) AS user_count
-           FROM role r
-           LEFT JOIN user_role ur ON ur.role_id = r.id
-           GROUP BY r.id
-           ORDER BY r.is_system DESC, r.name""",
-    ).fetchall()
+    tr = Table("role").as_("r")
+    tur = Table("user_role").as_("ur")
+    q = (Q.from_(tr)
+         .left_join(tur).on(tur.role_id == tr.id)
+         .select(tr.id, tr.name, tr.description, tr.is_system,
+                 fn.Count(tur.id).as_("user_count"))
+         .groupby(tr.id)
+         .orderby(tr.is_system, order=Order.desc)
+         .orderby(tr.name))
+    rows = conn.execute(q.get_sql()).fetchall()
     ok({"roles": [dict(r) for r in rows], "count": len(rows)})
 
 
@@ -1425,15 +1504,15 @@ def assign_role(conn, args):
     if not role_name:
         err("--role-name is required")
 
-    user = conn.execute(
-        "SELECT id FROM erp_user WHERE id = ?", (user_id,)
-    ).fetchone()
+    tu = Table("erp_user")
+    q_user = Q.from_(tu).select(tu.id).where(tu.id == P())
+    user = conn.execute(q_user.get_sql(), (user_id,)).fetchone()
     if not user:
         err("User not found")
 
-    role = conn.execute(
-        "SELECT id FROM role WHERE name = ?", (role_name,)
-    ).fetchone()
+    tr = Table("role")
+    q_role = Q.from_(tr).select(tr.id).where(tr.name == P())
+    role = conn.execute(q_role.get_sql(), (role_name,)).fetchone()
     if not role:
         err(f"Role '{role_name}' not found",
              suggestion="Use list-roles to see available roles")
@@ -1441,20 +1520,18 @@ def assign_role(conn, args):
     role_id = role["id"]
     company_id = args.company_id  # None = global assignment
 
-    # Check if already assigned
+    # Check if already assigned — use raw SQL for IS ? (NULL-safe comparison)
     existing = conn.execute(
-        """SELECT id FROM user_role
-           WHERE user_id = ? AND role_id = ? AND company_id IS ?""",
+        "SELECT id FROM user_role WHERE user_id = ? AND role_id = ? AND company_id IS ?",
         (user_id, role_id, company_id),
     ).fetchone()
     if existing:
         err(f"Role '{role_name}' already assigned to this user")
 
     ur_id = str(uuid.uuid4())
-    conn.execute(
-        "INSERT INTO user_role (id, user_id, role_id, company_id) VALUES (?, ?, ?, ?)",
-        (ur_id, user_id, role_id, company_id),
-    )
+    tur = Table("user_role")
+    q_ins = Q.into(tur).columns("id", "user_id", "role_id", "company_id").insert(P(), P(), P(), P())
+    conn.execute(q_ins.get_sql(), (ur_id, user_id, role_id, company_id))
     audit(conn, "erpclaw-setup", "assign-role", "user_role", ur_id,
            new_values={"user_id": user_id, "role_name": role_name,
                        "company_id": company_id})
@@ -1472,16 +1549,16 @@ def revoke_role(conn, args):
     if not role_name:
         err("--role-name is required")
 
-    role = conn.execute(
-        "SELECT id FROM role WHERE name = ?", (role_name,)
-    ).fetchone()
+    tr = Table("role")
+    q_role = Q.from_(tr).select(tr.id).where(tr.name == P())
+    role = conn.execute(q_role.get_sql(), (role_name,)).fetchone()
     if not role:
         err(f"Role '{role_name}' not found")
 
     company_id = args.company_id
+    # Use raw SQL for IS ? (NULL-safe comparison not supported by PyPika for SQLite)
     deleted = conn.execute(
-        """DELETE FROM user_role
-           WHERE user_id = ? AND role_id = ? AND company_id IS ?""",
+        "DELETE FROM user_role WHERE user_id = ? AND role_id = ? AND company_id IS ?",
         (user_id, role["id"], company_id),
     )
     if deleted.rowcount == 0:
@@ -1504,18 +1581,19 @@ def set_password(conn, args):
     if len(password) < 8:
         err("Password must be at least 8 characters")
 
-    user = conn.execute(
-        "SELECT id, username FROM erp_user WHERE id = ?", (user_id,)
-    ).fetchone()
+    tu = Table("erp_user")
+    q_get = Q.from_(tu).select(tu.id, tu.username).where(tu.id == P())
+    user = conn.execute(q_get.get_sql(), (user_id,)).fetchone()
     if not user:
         err("User not found")
 
     from erpclaw_lib.passwords import hash_password
     pw_hash = hash_password(password)
-    conn.execute(
-        "UPDATE erp_user SET password_hash = ?, updated_at = datetime('now') WHERE id = ?",
-        (pw_hash, user_id),
-    )
+    q_upd = (Q.update(tu)
+             .set(Field("password_hash"), P())
+             .set(Field("updated_at"), _NOW)
+             .where(tu.id == P()))
+    conn.execute(q_upd.get_sql(), (pw_hash, user_id))
     audit(conn, "erpclaw-setup", "set-password", "erp_user", user_id,
            description="Web password set")
     conn.commit()
@@ -1532,26 +1610,25 @@ def link_telegram_user(conn, args):
     if not telegram_user_id:
         err("--telegram-user-id is required")
 
-    user = conn.execute(
-        "SELECT id, username FROM erp_user WHERE id = ?", (user_id,)
-    ).fetchone()
+    tu = Table("erp_user")
+    q_get = Q.from_(tu).select(tu.id, tu.username).where(tu.id == P())
+    user = conn.execute(q_get.get_sql(), (user_id,)).fetchone()
     if not user:
         err("User not found")
 
     # Check if telegram_user_id already linked to another user
-    existing = conn.execute(
-        "SELECT id, username FROM erp_user WHERE telegram_user_id = ?",
-        (str(telegram_user_id),),
-    ).fetchone()
+    q_check = Q.from_(tu).select(tu.id, tu.username).where(tu.telegram_user_id == P())
+    existing = conn.execute(q_check.get_sql(), (str(telegram_user_id),)).fetchone()
     if existing:
         ex_id = existing["id"] if isinstance(existing, dict) else existing[0]
         if ex_id != user_id:
             err(f"Telegram user {telegram_user_id} is already linked to another account")
 
-    conn.execute(
-        "UPDATE erp_user SET telegram_user_id = ?, updated_at = datetime('now') WHERE id = ?",
-        (str(telegram_user_id), user_id),
-    )
+    q_upd = (Q.update(tu)
+             .set(Field("telegram_user_id"), P())
+             .set(Field("updated_at"), _NOW)
+             .where(tu.id == P()))
+    conn.execute(q_upd.get_sql(), (str(telegram_user_id), user_id))
     audit(conn, "erpclaw-setup", "link-telegram-user", "erp_user", user_id,
           new_values={"telegram_user_id": str(telegram_user_id)})
     conn.commit()
@@ -1567,18 +1644,18 @@ def unlink_telegram_user(conn, args):
     if not telegram_user_id:
         err("--telegram-user-id is required")
 
-    user = conn.execute(
-        "SELECT id, username FROM erp_user WHERE telegram_user_id = ?",
-        (str(telegram_user_id),),
-    ).fetchone()
+    tu = Table("erp_user")
+    q_get = Q.from_(tu).select(tu.id, tu.username).where(tu.telegram_user_id == P())
+    user = conn.execute(q_get.get_sql(), (str(telegram_user_id),)).fetchone()
     if not user:
         err(f"No user linked to Telegram user {telegram_user_id}")
 
     user_id = user["id"] if isinstance(user, dict) else user[0]
-    conn.execute(
-        "UPDATE erp_user SET telegram_user_id = NULL, updated_at = datetime('now') WHERE id = ?",
-        (user_id,),
-    )
+    q_upd = (Q.update(tu)
+             .set(Field("telegram_user_id"), None)
+             .set(Field("updated_at"), _NOW)
+             .where(tu.id == P()))
+    conn.execute(q_upd.get_sql(), (user_id,))
     audit(conn, "erpclaw-setup", "unlink-telegram-user", "erp_user", user_id,
           old_values={"telegram_user_id": str(telegram_user_id)})
     conn.commit()
@@ -1616,7 +1693,9 @@ def seed_permissions(conn, args):
     """Seed default role permissions from the shared RBAC library."""
     from erpclaw_lib.rbac import seed_role_permissions
     seed_role_permissions(conn)
-    count = conn.execute("SELECT COUNT(*) as cnt FROM role_permission").fetchone()
+    t = Table("role_permission")
+    q = Q.from_(t).select(fn.Count("*").as_("cnt"))
+    count = conn.execute(q.get_sql()).fetchone()
     ok({"permissions_seeded": count["cnt"]})
 
 

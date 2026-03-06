@@ -4,7 +4,7 @@ version: 1.0.0
 description: Quality inspection, non-conformance tracking, and quality goals for ERPClaw
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-quality
 tier: 5
 category: manufacturing
 requires: [erpclaw-setup]
@@ -45,7 +45,7 @@ If the database does not exist or you see "no such table" errors:
 python3 ~/.openclaw/erpclaw/init_db.py --db-path ~/.openclaw/erpclaw/data.sqlite
 ```
 
-No external Python dependencies required — uses only the standard library and erpclaw shared lib.
+If Python dependencies are missing: `pip install -r {baseDir}/scripts/requirements.txt`
 
 Database path: `~/.openclaw/erpclaw/data.sqlite`
 

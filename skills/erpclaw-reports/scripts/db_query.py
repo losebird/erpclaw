@@ -619,7 +619,7 @@ def _aging_report(conn, args, party_type_label, party_table, party_name_col="nam
             cust_t = Table("customer")
             party_sql = (
                 Q.from_(cust_t)
-                .select(cust_t.id, cust_t.customer_name.as_("pname"))
+                .select(cust_t.id, cust_t.name.as_("pname"))
                 .where(cust_t.id == P())
                 .get_sql()
             )
@@ -628,7 +628,7 @@ def _aging_report(conn, args, party_type_label, party_table, party_name_col="nam
             supp_t = Table("supplier")
             party_sql = (
                 Q.from_(supp_t)
-                .select(supp_t.id, supp_t.supplier_name.as_("pname"))
+                .select(supp_t.id, supp_t.name.as_("pname"))
                 .where(supp_t.id == P())
                 .get_sql()
             )

@@ -28,6 +28,9 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
+    from erpclaw_lib.query import (Q, P, Table, Field, fn, Case, Order, Criterion, Not, NULL,
+                                    DecimalSum, DecimalAbs, insert_row, update_row)
+    from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
@@ -80,9 +83,9 @@ def _validate_date(value: str, label: str) -> date:
 
 def _validate_company_exists(conn, company_id: str):
     """Validate that a company exists and return the row, or error."""
-    company = conn.execute(
-        "SELECT id FROM company WHERE id = ?", (company_id,),
-    ).fetchone()
+    t = Table("company")
+    q = Q.from_(t).select(t.id).where(t.id == P())
+    company = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not company:
         err(f"Company {company_id} not found")
     return company
@@ -90,9 +93,9 @@ def _validate_company_exists(conn, company_id: str):
 
 def _validate_employee_exists(conn, employee_id: str):
     """Validate that an employee exists and return the full row, or error."""
-    emp = conn.execute(
-        "SELECT * FROM employee WHERE id = ?", (employee_id,),
-    ).fetchone()
+    t = Table("employee")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    emp = conn.execute(q.get_sql(), (employee_id,)).fetchone()
     if not emp:
         err(f"Employee {employee_id} not found",
              suggestion="Use 'list employees' to see available employees.")
@@ -101,9 +104,9 @@ def _validate_employee_exists(conn, employee_id: str):
 
 def _validate_salary_component_exists(conn, component_id: str):
     """Validate that a salary component exists and return the row, or error."""
-    comp = conn.execute(
-        "SELECT * FROM salary_component WHERE id = ?", (component_id,),
-    ).fetchone()
+    t = Table("salary_component")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    comp = conn.execute(q.get_sql(), (component_id,)).fetchone()
     if not comp:
         err(f"Salary component {component_id} not found")
     return comp
@@ -111,9 +114,9 @@ def _validate_salary_component_exists(conn, component_id: str):
 
 def _validate_salary_structure_exists(conn, structure_id: str):
     """Validate that a salary structure exists and return the row, or error."""
-    ss = conn.execute(
-        "SELECT * FROM salary_structure WHERE id = ?", (structure_id,),
-    ).fetchone()
+    t = Table("salary_structure")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    ss = conn.execute(q.get_sql(), (structure_id,)).fetchone()
     if not ss:
         err(f"Salary structure {structure_id} not found")
     return ss
@@ -121,9 +124,9 @@ def _validate_salary_structure_exists(conn, structure_id: str):
 
 def _validate_salary_assignment_exists(conn, assignment_id: str):
     """Validate that a salary assignment exists and return the row, or error."""
-    sa = conn.execute(
-        "SELECT * FROM salary_assignment WHERE id = ?", (assignment_id,),
-    ).fetchone()
+    t = Table("salary_assignment")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    sa = conn.execute(q.get_sql(), (assignment_id,)).fetchone()
     if not sa:
         err(f"Salary assignment {assignment_id} not found")
     return sa
@@ -131,9 +134,9 @@ def _validate_salary_assignment_exists(conn, assignment_id: str):
 
 def _validate_payroll_run_exists(conn, payroll_run_id: str):
     """Validate that a payroll run exists and return the row, or error."""
-    pr = conn.execute(
-        "SELECT * FROM payroll_run WHERE id = ?", (payroll_run_id,),
-    ).fetchone()
+    t = Table("payroll_run")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    pr = conn.execute(q.get_sql(), (payroll_run_id,)).fetchone()
     if not pr:
         err(f"Payroll run {payroll_run_id} not found")
     return pr
@@ -141,9 +144,9 @@ def _validate_payroll_run_exists(conn, payroll_run_id: str):
 
 def _validate_account_exists(conn, account_id: str, label: str = "Account"):
     """Validate that an account exists and return the row, or error."""
-    acct = conn.execute(
-        "SELECT * FROM account WHERE id = ?", (account_id,),
-    ).fetchone()
+    t = Table("account")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    acct = conn.execute(q.get_sql(), (account_id,)).fetchone()
     if not acct:
         err(f"{label} account {account_id} not found")
     return acct
@@ -151,29 +154,32 @@ def _validate_account_exists(conn, account_id: str, label: str = "Account"):
 
 def _get_fiscal_year_row(conn, target_date: str) -> dict | None:
     """Return the full fiscal year row for a date, or None."""
-    fy = conn.execute(
-        """SELECT id, name, start_date, end_date, company_id
-           FROM fiscal_year
-           WHERE start_date <= ? AND end_date >= ? AND is_closed = 0""",
-        (target_date, target_date),
-    ).fetchone()
+    t = Table("fiscal_year")
+    q = (Q.from_(t)
+         .select(t.id, t.name, t.start_date, t.end_date, t.company_id)
+         .where(t.start_date <= P())
+         .where(t.end_date >= P())
+         .where(t.is_closed == 0))
+    fy = conn.execute(q.get_sql(), (target_date, target_date)).fetchone()
     return row_to_dict(fy) if fy else None
 
 
 def _get_cost_center(conn, company_id: str) -> str | None:
     """Return the first non-group cost center for a company, or None."""
-    cc = conn.execute(
-        "SELECT id FROM cost_center WHERE company_id = ? AND is_group = 0 LIMIT 1",
-        (company_id,),
-    ).fetchone()
+    t = Table("cost_center")
+    q = (Q.from_(t).select(t.id)
+         .where(t.company_id == P())
+         .where(t.is_group == 0)
+         .limit(1))
+    cc = conn.execute(q.get_sql(), (company_id,)).fetchone()
     return cc["id"] if cc else None
 
 
 def _get_employee_company_id(conn, employee_id: str) -> str:
     """Return the company_id for an employee, or error if not found."""
-    emp = conn.execute(
-        "SELECT company_id FROM employee WHERE id = ?", (employee_id,),
-    ).fetchone()
+    t = Table("employee")
+    q = Q.from_(t).select(t.company_id).where(t.id == P())
+    emp = conn.execute(q.get_sql(), (employee_id,)).fetchone()
     if not emp:
         err(f"Employee {employee_id} not found")
     return emp["company_id"]
@@ -206,9 +212,9 @@ def add_salary_component(conn, args):
         )
 
     # Check uniqueness
-    existing = conn.execute(
-        "SELECT id FROM salary_component WHERE name = ?", (name,),
-    ).fetchone()
+    sc_t = Table("salary_component")
+    q = Q.from_(sc_t).select(sc_t.id).where(sc_t.name == P())
+    existing = conn.execute(q.get_sql(), (name,)).fetchone()
     if existing:
         err(f"Salary component with name '{name}' already exists")
 
@@ -238,21 +244,18 @@ def add_salary_component(conn, args):
     component_id = str(uuid.uuid4())
     now = _now_iso()
 
-    conn.execute(
-        """INSERT INTO salary_component (
-            id, name, component_type, is_tax_applicable, is_statutory,
-            is_pre_tax, variable_based_on_taxable_salary,
-            depends_on_payment_days, gl_account_id, description,
-            created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            component_id, name, component_type,
-            is_tax_applicable, is_statutory, is_pre_tax, variable_based,
-            depends_on_payment_days, args.gl_account_id,
-            args.description,
-            now, now,
-        ),
-    )
+    ins_sql, _ = insert_row("salary_component", {
+        "id": P(), "name": P(), "component_type": P(),
+        "is_tax_applicable": P(), "is_statutory": P(), "is_pre_tax": P(),
+        "variable_based_on_taxable_salary": P(), "depends_on_payment_days": P(),
+        "gl_account_id": P(), "description": P(), "created_at": P(), "updated_at": P(),
+    })
+    conn.execute(ins_sql, (
+        component_id, name, component_type,
+        is_tax_applicable, is_statutory, is_pre_tax, variable_based,
+        depends_on_payment_days, args.gl_account_id,
+        args.description, now, now,
+    ))
     conn.commit()
 
     audit(conn, "erpclaw-payroll", "add-salary-component", "salary_component", component_id,
@@ -278,8 +281,17 @@ def list_salary_components(conn, args):
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
 
-    conditions = []
+    sc_t = Table("salary_component")
     params = []
+
+    # Build base queries
+    count_q = Q.from_(sc_t).select(fn.Count("*"))
+    list_q = Q.from_(sc_t).select(
+        sc_t.id, sc_t.name, sc_t.component_type, sc_t.is_tax_applicable,
+        sc_t.is_statutory, sc_t.is_pre_tax, sc_t.variable_based_on_taxable_salary,
+        sc_t.depends_on_payment_days, sc_t.gl_account_id, sc_t.description,
+        sc_t.created_at, sc_t.updated_at,
+    )
 
     if args.component_type:
         ct = args.component_type.strip().lower()
@@ -288,31 +300,21 @@ def list_salary_components(conn, args):
                 f"Invalid component type filter '{ct}'. "
                 f"Valid: {VALID_COMPONENT_TYPES}"
             )
-        conditions.append("component_type = ?")
+        count_q = count_q.where(sc_t.component_type == P())
+        list_q = list_q.where(sc_t.component_type == P())
         params.append(ct)
 
     if args.search:
-        conditions.append("name LIKE ?")
+        count_q = count_q.where(sc_t.name.like(P()))
+        list_q = list_q.where(sc_t.name.like(P()))
         params.append(f"%{args.search}%")
 
-    where = "WHERE " + " AND ".join(conditions) if conditions else ""
-
     # Count total
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM salary_component {where}", params,
-    ).fetchone()[0]
+    total = conn.execute(count_q.get_sql(), params).fetchone()[0]
 
     # Fetch rows
-    rows = conn.execute(
-        f"""SELECT id, name, component_type, is_tax_applicable, is_statutory,
-               is_pre_tax, variable_based_on_taxable_salary,
-               depends_on_payment_days, gl_account_id, description,
-               created_at, updated_at
-           FROM salary_component {where}
-           ORDER BY name ASC
-           LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
+    list_q = list_q.orderby(sc_t.name).limit(P()).offset(P())
+    rows = conn.execute(list_q.get_sql(), params + [limit, offset]).fetchall()
 
     ok({
         "count": total,
@@ -364,9 +366,9 @@ def add_salary_structure(conn, args):
     _validate_company_exists(conn, company_id)
 
     # Check uniqueness
-    existing = conn.execute(
-        "SELECT id FROM salary_structure WHERE name = ?", (name,),
-    ).fetchone()
+    ss_t = Table("salary_structure")
+    q = Q.from_(ss_t).select(ss_t.id).where(ss_t.name == P())
+    existing = conn.execute(q.get_sql(), (name,)).fetchone()
     if existing:
         err(f"Salary structure with name '{name}' already exists")
 
@@ -389,10 +391,9 @@ def add_salary_structure(conn, args):
             err(f"Component at index {idx} missing 'salary_component_id'")
 
         # Validate component exists
-        sc_row = conn.execute(
-            "SELECT id, name, component_type FROM salary_component WHERE id = ?",
-            (comp_id,),
-        ).fetchone()
+        sc_t2 = Table("salary_component")
+        sc_q = Q.from_(sc_t2).select(sc_t2.id, sc_t2.name, sc_t2.component_type).where(sc_t2.id == P())
+        sc_row = conn.execute(sc_q.get_sql(), (comp_id,)).fetchone()
         if not sc_row:
             err(f"Salary component {comp_id} (index {idx}) not found")
 
@@ -440,10 +441,9 @@ def add_salary_structure(conn, args):
         # Validate base_component_id if given with percentage
         base_component_id = comp.get("base_component_id")
         if base_component_id:
-            base_comp = conn.execute(
-                "SELECT id FROM salary_component WHERE id = ?",
-                (base_component_id,),
-            ).fetchone()
+            bc_t = Table("salary_component")
+            bc_q = Q.from_(bc_t).select(bc_t.id).where(bc_t.id == P())
+            base_comp = conn.execute(bc_q.get_sql(), (base_component_id,)).fetchone()
             if not base_comp:
                 err(f"Base component {base_component_id} (index {idx}) not found")
 
@@ -462,28 +462,27 @@ def add_salary_structure(conn, args):
     structure_id = str(uuid.uuid4())
     now = _now_iso()
 
-    conn.execute(
-        """INSERT INTO salary_structure (
-            id, name, payroll_frequency, currency, company_id,
-            is_active, created_at, updated_at
-        ) VALUES (?, ?, ?, 'USD', ?, 1, ?, ?)""",
-        (structure_id, name, payroll_frequency, company_id, now, now),
-    )
+    ins_ss_sql, _ = insert_row("salary_structure", {
+        "id": P(), "name": P(), "payroll_frequency": P(),
+        "currency": P(), "company_id": P(), "is_active": P(),
+        "created_at": P(), "updated_at": P(),
+    })
+    conn.execute(ins_ss_sql, (structure_id, name, payroll_frequency,
+                              "USD", company_id, 1, now, now))
 
     # Insert salary structure details
+    ins_det_sql, _ = insert_row("salary_structure_detail", {
+        "id": P(), "salary_structure_id": P(), "salary_component_id": P(),
+        "amount": P(), "percentage": P(), "formula": P(),
+        "base_component_id": P(), "sort_order": P(),
+    })
     for comp in validated_components:
         detail_id = str(uuid.uuid4())
-        conn.execute(
-            """INSERT INTO salary_structure_detail (
-                id, salary_structure_id, salary_component_id,
-                amount, percentage, formula, base_component_id, sort_order
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                detail_id, structure_id, comp["salary_component_id"],
-                comp["amount"], comp["percentage"], comp["formula"],
-                comp["base_component_id"], comp["sort_order"],
-            ),
-        )
+        conn.execute(ins_det_sql, (
+            detail_id, structure_id, comp["salary_component_id"],
+            comp["amount"], comp["percentage"], comp["formula"],
+            comp["base_component_id"], comp["sort_order"],
+        ))
 
     conn.commit()
 
@@ -515,27 +514,26 @@ def get_salary_structure(conn, args):
     ss_dict = row_to_dict(ss)
 
     # Fetch component details with component names
-    details = conn.execute(
-        """SELECT ssd.id, ssd.salary_component_id,
-               sc.name AS component_name, sc.component_type,
-               ssd.amount, ssd.percentage, ssd.formula,
-               ssd.base_component_id, ssd.sort_order
-           FROM salary_structure_detail ssd
-           JOIN salary_component sc ON sc.id = ssd.salary_component_id
-           WHERE ssd.salary_structure_id = ?
-           ORDER BY ssd.sort_order ASC""",
-        (args.salary_structure_id,),
-    ).fetchall()
+    ssd = Table("salary_structure_detail")
+    sc = Table("salary_component")
+    det_q = (Q.from_(ssd)
+             .join(sc).on(sc.id == ssd.salary_component_id)
+             .select(ssd.id, ssd.salary_component_id,
+                     sc.name.as_("component_name"), sc.component_type,
+                     ssd.amount, ssd.percentage, ssd.formula,
+                     ssd.base_component_id, ssd.sort_order)
+             .where(ssd.salary_structure_id == P())
+             .orderby(ssd.sort_order))
+    details = conn.execute(det_q.get_sql(), (args.salary_structure_id,)).fetchall()
 
     # Enrich base_component names
+    sc_name_q = Q.from_(sc).select(sc.name).where(sc.id == P())
     components = []
     for d in details:
         comp_dict = row_to_dict(d)
         if comp_dict.get("base_component_id"):
-            base_row = conn.execute(
-                "SELECT name FROM salary_component WHERE id = ?",
-                (comp_dict["base_component_id"],),
-            ).fetchone()
+            base_row = conn.execute(sc_name_q.get_sql(),
+                                    (comp_dict["base_component_id"],)).fetchone()
             comp_dict["base_component_name"] = base_row["name"] if base_row else None
         else:
             comp_dict["base_component_name"] = None
@@ -559,33 +557,34 @@ def list_salary_structures(conn, args):
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
 
-    conditions = []
+    ss = Table("salary_structure").as_("ss")
     params = []
 
+    count_q = Q.from_(ss).select(fn.Count("*"))
+    # raw SQL — correlated subquery for component_count not easily expressed in PyPika
+    list_q = Q.from_(ss).select(
+        ss.id, ss.name, ss.payroll_frequency, ss.currency,
+        ss.company_id, ss.is_active, ss.created_at, ss.updated_at,
+        LiteralValue(
+            '(SELECT COUNT(*) FROM "salary_structure_detail" "ssd"'
+            ' WHERE "ssd"."salary_structure_id"="ss"."id")'
+        ).as_("component_count"),
+    )
+
     if args.company_id:
-        conditions.append("ss.company_id = ?")
+        count_q = count_q.where(ss.company_id == P())
+        list_q = list_q.where(ss.company_id == P())
         params.append(args.company_id)
 
     if args.search:
-        conditions.append("ss.name LIKE ?")
+        count_q = count_q.where(ss.name.like(P()))
+        list_q = list_q.where(ss.name.like(P()))
         params.append(f"%{args.search}%")
 
-    where = "WHERE " + " AND ".join(conditions) if conditions else ""
+    total = conn.execute(count_q.get_sql(), params).fetchone()[0]
 
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM salary_structure ss {where}", params,
-    ).fetchone()[0]
-
-    rows = conn.execute(
-        f"""SELECT ss.id, ss.name, ss.payroll_frequency, ss.currency,
-               ss.company_id, ss.is_active, ss.created_at, ss.updated_at,
-               (SELECT COUNT(*) FROM salary_structure_detail ssd
-                WHERE ssd.salary_structure_id = ss.id) AS component_count
-           FROM salary_structure ss {where}
-           ORDER BY ss.name ASC
-           LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
+    list_q = list_q.orderby(ss.name).limit(P()).offset(P())
+    rows = conn.execute(list_q.get_sql(), params + [limit, offset]).fetchall()
 
     ok({
         "count": total,
@@ -657,6 +656,7 @@ def add_salary_assignment(conn, args):
     # Auto-close previous assignment: find the most recent active assignment
     # for this employee that has no effective_to or whose effective_to is
     # on or after the new effective_from
+    # raw SQL — uses IS NULL in OR clause which PyPika handles differently
     previous = conn.execute(
         """SELECT id, effective_from, effective_to
            FROM salary_assignment
@@ -670,31 +670,26 @@ def add_salary_assignment(conn, args):
     if previous:
         # Close the previous assignment the day before the new one starts
         close_date = (effective_from - timedelta(days=1)).isoformat()
-        conn.execute(
-            """UPDATE salary_assignment
-               SET effective_to = ?, updated_at = ?
-               WHERE id = ?""",
-            (close_date, _now_iso(), previous["id"]),
-        )
+        sa_upd = update_row("salary_assignment",
+                            data={"effective_to": P(), "updated_at": P()},
+                            where={"id": P()})
+        conn.execute(sa_upd, (close_date, _now_iso(), previous["id"]))
 
     # Create new assignment
     assignment_id = str(uuid.uuid4())
     now = _now_iso()
 
-    conn.execute(
-        """INSERT INTO salary_assignment (
-            id, employee_id, salary_structure_id, base_amount,
-            effective_from, effective_to, currency, company_id,
-            created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'USD', ?, ?, ?)""",
-        (
-            assignment_id, employee_id, structure_id,
-            str(round_currency(base_amount)),
-            args.effective_from,
-            args.effective_to,
-            company_id, now, now,
-        ),
-    )
+    ins_sa_sql, _ = insert_row("salary_assignment", {
+        "id": P(), "employee_id": P(), "salary_structure_id": P(),
+        "base_amount": P(), "effective_from": P(), "effective_to": P(),
+        "currency": P(), "company_id": P(), "created_at": P(), "updated_at": P(),
+    })
+    conn.execute(ins_sa_sql, (
+        assignment_id, employee_id, structure_id,
+        str(round_currency(base_amount)),
+        args.effective_from, args.effective_to,
+        "USD", company_id, now, now,
+    ))
     conn.commit()
 
     audit(conn, "erpclaw-payroll", "add-salary-assignment", "salary_assignment", assignment_id,
@@ -736,6 +731,7 @@ def list_salary_assignments(conn, args):
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
 
+    # raw SQL — IS NULL in OR clause used for date range filters
     conditions = []
     params = []
 
@@ -922,33 +918,28 @@ def add_income_tax_slab(conn, args):
     slab_id = str(uuid.uuid4())
     now = _now_iso()
 
-    conn.execute(
-        """INSERT INTO income_tax_slab (
-            id, name, tax_jurisdiction, state_code, filing_status,
-            effective_from, standard_deduction, is_active,
-            created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
-        (
-            slab_id, name, tax_jurisdiction, state_code, filing_status,
-            effective_from, standard_deduction,
-            now, now,
-        ),
-    )
+    ins_slab_sql, _ = insert_row("income_tax_slab", {
+        "id": P(), "name": P(), "tax_jurisdiction": P(),
+        "state_code": P(), "filing_status": P(), "effective_from": P(),
+        "standard_deduction": P(), "is_active": P(), "created_at": P(), "updated_at": P(),
+    })
+    conn.execute(ins_slab_sql, (
+        slab_id, name, tax_jurisdiction, state_code, filing_status,
+        effective_from, standard_deduction, 1, now, now,
+    ))
 
     # Insert rate brackets
+    ins_rate_sql, _ = insert_row("income_tax_slab_rate", {
+        "id": P(), "slab_id": P(), "from_amount": P(), "to_amount": P(), "rate": P(),
+    })
     for rate_entry in validated_rates:
         rate_id = str(uuid.uuid4())
-        conn.execute(
-            """INSERT INTO income_tax_slab_rate (
-                id, slab_id, from_amount, to_amount, rate
-            ) VALUES (?, ?, ?, ?, ?)""",
-            (
-                rate_id, slab_id,
-                rate_entry["from_amount"],
-                rate_entry["to_amount"],
-                rate_entry["rate"],
-            ),
-        )
+        conn.execute(ins_rate_sql, (
+            rate_id, slab_id,
+            rate_entry["from_amount"],
+            rate_entry["to_amount"],
+            rate_entry["rate"],
+        ))
 
     conn.commit()
 
@@ -1036,12 +1027,12 @@ def update_fica_config(conn, args):
         validated[field_name] = str(round_currency(val))
 
     # Check for existing row (for audit old_values)
-    existing = conn.execute(
-        "SELECT * FROM fica_config WHERE tax_year = ?", (tax_year,),
-    ).fetchone()
+    fc_t = Table("fica_config")
+    fc_q = Q.from_(fc_t).select(fc_t.star).where(fc_t.tax_year == P())
+    existing = conn.execute(fc_q.get_sql(), (tax_year,)).fetchone()
     old_values = row_to_dict(existing) if existing else None
 
-    # UPSERT
+    # raw SQL — INSERT ON CONFLICT (UPSERT) not supported by PyPika
     config_id = str(uuid.uuid4())
     now = _now_iso()
 
@@ -1156,7 +1147,7 @@ def update_futa_suta_config(conn, args):
     state_code = args.state_code
     config_type = f"SUTA ({state_code})" if state_code else "FUTA (federal)"
 
-    # Check for existing row
+    # raw SQL — IS NULL comparison in WHERE clause
     existing = conn.execute(
         """SELECT * FROM futa_suta_config
            WHERE tax_year = ? AND (state_code = ? OR (state_code IS NULL AND ? IS NULL))""",
@@ -1164,7 +1155,7 @@ def update_futa_suta_config(conn, args):
     ).fetchone()
     old_values = row_to_dict(existing) if existing else None
 
-    # UPSERT
+    # raw SQL — INSERT ON CONFLICT (UPSERT) not supported by PyPika
     config_id = str(uuid.uuid4())
     now = _now_iso()
 
@@ -1252,16 +1243,19 @@ def add_garnishment(conn, args):
     max_pct = "50" if garnishment_type == "child_support" else "25"
 
     g_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO wage_garnishment
-           (id, employee_id, order_number, creditor_name, garnishment_type,
-            amount_or_percentage, is_percentage, max_percentage, priority,
-            status, cumulative_paid, total_owed, start_date, end_date, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', '0', ?, ?, ?, ?)""",
-        (g_id, employee_id, order_number, creditor_name, garnishment_type,
-         amount_or_pct, is_pct, max_pct, priority,
-         total_owed, start_date, end_date, company_id),
-    )
+    ins_garn_sql, _ = insert_row("wage_garnishment", {
+        "id": P(), "employee_id": P(), "order_number": P(),
+        "creditor_name": P(), "garnishment_type": P(),
+        "amount_or_percentage": P(), "is_percentage": P(),
+        "max_percentage": P(), "priority": P(), "status": P(),
+        "cumulative_paid": P(), "total_owed": P(),
+        "start_date": P(), "end_date": P(), "company_id": P(),
+    })
+    conn.execute(ins_garn_sql, (
+        g_id, employee_id, order_number, creditor_name, garnishment_type,
+        amount_or_pct, is_pct, max_pct, priority, "active", "0",
+        total_owed, start_date, end_date, company_id,
+    ))
     audit(conn, "erpclaw-payroll", "add-garnishment", "wage_garnishment", g_id,
            new_values={"employee_id": employee_id, "type": garnishment_type,
                        "amount": amount_or_pct})
@@ -1275,10 +1269,13 @@ def update_garnishment(conn, args):
     if not g_id:
         err("--garnishment-id is required")
 
-    row = conn.execute("SELECT * FROM wage_garnishment WHERE id = ?", (g_id,)).fetchone()
+    wg_t = Table("wage_garnishment")
+    q = Q.from_(wg_t).select(wg_t.star).where(wg_t.id == P())
+    row = conn.execute(q.get_sql(), (g_id,)).fetchone()
     if not row:
         err(f"Garnishment {g_id} not found")
 
+    # raw SQL — dynamic column building (columns determined at runtime)
     updates = []
     params = []
     if args.status:
@@ -1314,23 +1311,22 @@ def list_garnishments(conn, args):
     employee_id = args.employee_id
     company_id = args.company_id
 
-    where = []
+    wg_t = Table("wage_garnishment")
+    q = Q.from_(wg_t).select(wg_t.star)
     params = []
+
     if employee_id:
-        where.append("employee_id = ?")
+        q = q.where(wg_t.employee_id == P())
         params.append(employee_id)
     if company_id:
-        where.append("company_id = ?")
+        q = q.where(wg_t.company_id == P())
         params.append(company_id)
     if args.status:
-        where.append("status = ?")
+        q = q.where(wg_t.status == P())
         params.append(args.status)
 
-    where_clause = "WHERE " + " AND ".join(where) if where else ""
-    rows = conn.execute(
-        f"SELECT * FROM wage_garnishment {where_clause} ORDER BY priority, created_at",
-        params,
-    ).fetchall()
+    q = q.orderby(wg_t.priority).orderby(wg_t.created_at)
+    rows = conn.execute(q.get_sql(), params).fetchall()
 
     ok({"garnishments": [dict(r) for r in rows], "count": len(rows)})
 
@@ -1340,7 +1336,9 @@ def get_garnishment(conn, args):
     g_id = args.garnishment_id
     if not g_id:
         err("--garnishment-id is required")
-    row = conn.execute("SELECT * FROM wage_garnishment WHERE id = ?", (g_id,)).fetchone()
+    wg_t = Table("wage_garnishment")
+    q = Q.from_(wg_t).select(wg_t.star).where(wg_t.id == P())
+    row = conn.execute(q.get_sql(), (g_id,)).fetchone()
     if not row:
         err(f"Garnishment {g_id} not found")
     ok(dict(row))
@@ -1359,6 +1357,7 @@ def status_action(conn, args):
     payroll runs by status, total salary slips, FICA config years,
     and income tax slabs.
     """
+    # raw SQL — many queries use IS NULL in dynamic company_filter and 1=1 pattern
     company_filter = ""
     params = []
     if args.company_id:
@@ -1366,16 +1365,15 @@ def status_action(conn, args):
         params = [args.company_id]
 
     # Salary components (no company filter -- they are global)
+    sc_t = Table("salary_component")
     total_components = conn.execute(
-        "SELECT COUNT(*) FROM salary_component",
+        Q.from_(sc_t).select(fn.Count("*")).get_sql(),
     ).fetchone()[0]
 
     components_by_type = {}
+    sc_ct_q = Q.from_(sc_t).select(fn.Count("*")).where(sc_t.component_type == P())
     for ct in VALID_COMPONENT_TYPES:
-        cnt = conn.execute(
-            "SELECT COUNT(*) FROM salary_component WHERE component_type = ?",
-            (ct,),
-        ).fetchone()[0]
+        cnt = conn.execute(sc_ct_q.get_sql(), (ct,)).fetchone()[0]
         if cnt > 0:
             components_by_type[ct] = cnt
 
@@ -1424,32 +1422,33 @@ def status_action(conn, args):
     ).fetchone()[0]
 
     # FICA configs
+    fc_t = Table("fica_config")
     fica_configs = conn.execute(
-        "SELECT COUNT(*) FROM fica_config",
+        Q.from_(fc_t).select(fn.Count("*")).get_sql(),
     ).fetchone()[0]
 
     fica_years = conn.execute(
-        "SELECT tax_year FROM fica_config ORDER BY tax_year DESC",
+        Q.from_(fc_t).select(fc_t.tax_year).orderby(fc_t.tax_year, order=Order.desc).get_sql(),
     ).fetchall()
     fica_year_list = [r["tax_year"] for r in fica_years]
 
     # Income tax slabs
+    its_t = Table("income_tax_slab")
     total_tax_slabs = conn.execute(
-        "SELECT COUNT(*) FROM income_tax_slab WHERE is_active = 1",
+        Q.from_(its_t).select(fn.Count("*")).where(its_t.is_active == 1).get_sql(),
     ).fetchone()[0]
 
     tax_slabs_by_jurisdiction = {}
+    its_jq = Q.from_(its_t).select(fn.Count("*")).where(its_t.tax_jurisdiction == P()).where(its_t.is_active == 1)
     for jurisdiction in VALID_TAX_JURISDICTIONS:
-        cnt = conn.execute(
-            "SELECT COUNT(*) FROM income_tax_slab WHERE tax_jurisdiction = ? AND is_active = 1",
-            (jurisdiction,),
-        ).fetchone()[0]
+        cnt = conn.execute(its_jq.get_sql(), (jurisdiction,)).fetchone()[0]
         if cnt > 0:
             tax_slabs_by_jurisdiction[jurisdiction] = cnt
 
     # FUTA/SUTA configs
+    fs_t = Table("futa_suta_config")
     futa_suta_configs = conn.execute(
-        "SELECT COUNT(*) FROM futa_suta_config",
+        Q.from_(fs_t).select(fn.Count("*")).get_sql(),
     ).fetchone()[0]
 
     # Most recent payroll run
@@ -1597,97 +1596,58 @@ def _get_ytd_values(conn: sqlite3.Connection, employee_id: str,
     year_start = f"{year_str}-01-01"
 
     # Sum gross from previous submitted slips in same year
-    row = conn.execute(
-        """
-        SELECT
-            COALESCE(decimal_sum(ss.gross_pay), '0') AS ytd_gross,
-            COALESCE(decimal_sum(ss.total_deductions), '0') AS ytd_deductions,
-            COALESCE(decimal_sum(ss.net_pay), '0') AS ytd_net
-        FROM salary_slip ss
-        WHERE ss.employee_id = ?
-          AND ss.company_id = ?
-          AND ss.status = 'submitted'
-          AND ss.period_end >= ?
-          AND ss.period_end < ?
-        """,
-        (employee_id, company_id, year_start, period_end),
-    ).fetchone()
+    ss_t = Table("salary_slip").as_("ss")
+    ytd_q = (Q.from_(ss_t)
+             .select(
+                 fn.Coalesce(DecimalSum(ss_t.gross_pay), ValueWrapper("0")).as_("ytd_gross"),
+                 fn.Coalesce(DecimalSum(ss_t.total_deductions), ValueWrapper("0")).as_("ytd_deductions"),
+                 fn.Coalesce(DecimalSum(ss_t.net_pay), ValueWrapper("0")).as_("ytd_net"),
+             )
+             .where(ss_t.employee_id == P())
+             .where(ss_t.company_id == P())
+             .where(ss_t.status == ValueWrapper("submitted"))
+             .where(ss_t.period_end >= P())
+             .where(ss_t.period_end < P()))
+    row = conn.execute(ytd_q.get_sql(), (employee_id, company_id, year_start, period_end)).fetchone()
 
     ytd_gross = to_decimal(str(row["ytd_gross"])) if row else Decimal("0")
 
+    # Helper: build a YTD deduction query for a specific component name
+    ssd_t = Table("salary_slip_detail").as_("ssd")
+    ss_t2 = Table("salary_slip").as_("ss")
+    sc_t = Table("salary_component").as_("sc")
+
+    def _ytd_deduction_query():
+        return (Q.from_(ssd_t)
+                .join(ss_t2).on(ss_t2.id == ssd_t.salary_slip_id)
+                .join(sc_t).on(sc_t.id == ssd_t.salary_component_id)
+                .select(fn.Coalesce(DecimalSum(ssd_t.amount), ValueWrapper("0")).as_("total"))
+                .where(ss_t2.employee_id == P())
+                .where(ss_t2.company_id == P())
+                .where(ss_t2.status == ValueWrapper("submitted"))
+                .where(ss_t2.period_end >= P())
+                .where(ss_t2.period_end < P())
+                .where(ssd_t.component_type == ValueWrapper("deduction")))
+
+    ytd_params = (employee_id, company_id, year_start, period_end)
+
     # Get YTD federal tax from salary_slip_detail
-    fed_row = conn.execute(
-        """
-        SELECT COALESCE(decimal_sum(ssd.amount), '0') AS total
-        FROM salary_slip_detail ssd
-        JOIN salary_slip ss ON ss.id = ssd.salary_slip_id
-        JOIN salary_component sc ON sc.id = ssd.salary_component_id
-        WHERE ss.employee_id = ?
-          AND ss.company_id = ?
-          AND ss.status = 'submitted'
-          AND ss.period_end >= ?
-          AND ss.period_end < ?
-          AND sc.name = 'Federal Income Tax'
-          AND ssd.component_type = 'deduction'
-        """,
-        (employee_id, company_id, year_start, period_end),
-    ).fetchone()
+    fed_q = _ytd_deduction_query().where(sc_t.name == ValueWrapper("Federal Income Tax"))
+    fed_row = conn.execute(fed_q.get_sql(), ytd_params).fetchone()
     ytd_federal_tax = to_decimal(str(fed_row["total"])) if fed_row else Decimal("0")
 
     # Get YTD Social Security wages (employee SS deduction details)
-    ss_row = conn.execute(
-        """
-        SELECT COALESCE(decimal_sum(ssd.amount), '0') AS total
-        FROM salary_slip_detail ssd
-        JOIN salary_slip ss ON ss.id = ssd.salary_slip_id
-        JOIN salary_component sc ON sc.id = ssd.salary_component_id
-        WHERE ss.employee_id = ?
-          AND ss.company_id = ?
-          AND ss.status = 'submitted'
-          AND ss.period_end >= ?
-          AND ss.period_end < ?
-          AND sc.name = 'Social Security Tax'
-          AND ssd.component_type = 'deduction'
-        """,
-        (employee_id, company_id, year_start, period_end),
-    ).fetchone()
+    ss_q = _ytd_deduction_query().where(sc_t.name == ValueWrapper("Social Security Tax"))
+    ss_row = conn.execute(ss_q.get_sql(), ytd_params).fetchone()
 
     # Get YTD 401k
-    k401_row = conn.execute(
-        """
-        SELECT COALESCE(decimal_sum(ssd.amount), '0') AS total
-        FROM salary_slip_detail ssd
-        JOIN salary_slip ss ON ss.id = ssd.salary_slip_id
-        JOIN salary_component sc ON sc.id = ssd.salary_component_id
-        WHERE ss.employee_id = ?
-          AND ss.company_id = ?
-          AND ss.status = 'submitted'
-          AND ss.period_end >= ?
-          AND ss.period_end < ?
-          AND sc.name = '401k Contribution'
-          AND ssd.component_type = 'deduction'
-        """,
-        (employee_id, company_id, year_start, period_end),
-    ).fetchone()
+    k401_q = _ytd_deduction_query().where(sc_t.name == ValueWrapper("401k Contribution"))
+    k401_row = conn.execute(k401_q.get_sql(), ytd_params).fetchone()
     ytd_pretax_401k = to_decimal(str(k401_row["total"])) if k401_row else Decimal("0")
 
     # Get YTD HSA
-    hsa_row = conn.execute(
-        """
-        SELECT COALESCE(decimal_sum(ssd.amount), '0') AS total
-        FROM salary_slip_detail ssd
-        JOIN salary_slip ss ON ss.id = ssd.salary_slip_id
-        JOIN salary_component sc ON sc.id = ssd.salary_component_id
-        WHERE ss.employee_id = ?
-          AND ss.company_id = ?
-          AND ss.status = 'submitted'
-          AND ss.period_end >= ?
-          AND ss.period_end < ?
-          AND sc.name = 'HSA Contribution'
-          AND ssd.component_type = 'deduction'
-        """,
-        (employee_id, company_id, year_start, period_end),
-    ).fetchone()
+    hsa_q = _ytd_deduction_query().where(sc_t.name == ValueWrapper("HSA Contribution"))
+    hsa_row = conn.execute(hsa_q.get_sql(), ytd_params).fetchone()
     ytd_pretax_hsa = to_decimal(str(hsa_row["total"])) if hsa_row else Decimal("0")
 
     return {
@@ -1740,104 +1700,73 @@ def _find_payroll_accounts(conn: sqlite3.Connection,
         "suta_payable": None,
     }
 
+    # raw SQL — complex LIKE patterns with OR conditions and LOWER() not easily expressed in PyPika
+    acct_t = Table("account")
+
+    def _acct_query(root_type, like_patterns, extra_where=None):
+        """Helper to build account lookup with LIKE OR patterns."""
+        like_clauses = " OR ".join(f"LOWER(name) LIKE '{p}'" for p in like_patterns)
+        extra = f"AND {extra_where}" if extra_where else ""
+        return conn.execute(
+            f"""SELECT id FROM account
+               WHERE company_id = ? AND root_type = '{root_type}'
+                 AND is_group = 0 AND disabled = 0
+                 AND ({like_clauses})
+                 {extra}
+               LIMIT 1""",
+            (company_id,),
+        ).fetchone()
+
     # --- Salary Expense ---
-    row = conn.execute(
-        """SELECT id FROM account
-           WHERE company_id = ? AND root_type = 'expense'
-             AND is_group = 0 AND disabled = 0
-             AND (LOWER(name) LIKE '%salary%expense%'
-                  OR LOWER(name) LIKE '%salary expense%')
-           LIMIT 1""",
-        (company_id,),
-    ).fetchone()
+    row = _acct_query("expense", ["%salary%expense%", "%salary expense%"])
     if row:
         accounts["salary_expense"] = row["id"]
     else:
         # Fallback: any expense account
-        row = conn.execute(
-            """SELECT id FROM account
-               WHERE company_id = ? AND root_type = 'expense'
-                 AND is_group = 0 AND disabled = 0
-               ORDER BY name LIMIT 1""",
-            (company_id,),
-        ).fetchone()
+        q = (Q.from_(acct_t).select(acct_t.id)
+             .where(acct_t.company_id == P())
+             .where(acct_t.root_type == ValueWrapper("expense"))
+             .where(acct_t.is_group == 0)
+             .where(acct_t.disabled == 0)
+             .orderby(acct_t.name).limit(1))
+        row = conn.execute(q.get_sql(), (company_id,)).fetchone()
         if row:
             accounts["salary_expense"] = row["id"]
 
     # --- Payroll Payable ---
-    row = conn.execute(
-        """SELECT id FROM account
-           WHERE company_id = ? AND root_type = 'liability'
-             AND is_group = 0 AND disabled = 0
-             AND (LOWER(name) LIKE '%payroll%payable%'
-                  OR LOWER(name) LIKE '%payroll payable%')
-           LIMIT 1""",
-        (company_id,),
-    ).fetchone()
+    row = _acct_query("liability", ["%payroll%payable%", "%payroll payable%"])
     if row:
         accounts["payroll_payable"] = row["id"]
     else:
         # Fallback: any payable liability
-        row = conn.execute(
-            """SELECT id FROM account
-               WHERE company_id = ? AND root_type = 'liability'
-                 AND account_type = 'payable'
-                 AND is_group = 0 AND disabled = 0
-               ORDER BY name LIMIT 1""",
-            (company_id,),
-        ).fetchone()
+        q = (Q.from_(acct_t).select(acct_t.id)
+             .where(acct_t.company_id == P())
+             .where(acct_t.root_type == ValueWrapper("liability"))
+             .where(acct_t.account_type == ValueWrapper("payable"))
+             .where(acct_t.is_group == 0)
+             .where(acct_t.disabled == 0)
+             .orderby(acct_t.name).limit(1))
+        row = conn.execute(q.get_sql(), (company_id,)).fetchone()
         if row:
             accounts["payroll_payable"] = row["id"]
 
     # --- Federal Income Tax Payable ---
-    row = conn.execute(
-        """SELECT id FROM account
-           WHERE company_id = ? AND root_type = 'liability'
-             AND is_group = 0 AND disabled = 0
-             AND (LOWER(name) LIKE '%federal%'
-                  OR LOWER(name) LIKE '%income tax%withheld%')
-           LIMIT 1""",
-        (company_id,),
-    ).fetchone()
+    row = _acct_query("liability", ["%federal%", "%income tax%withheld%"])
     if row:
         accounts["federal_tax_payable"] = row["id"]
 
     # --- Social Security Payable ---
-    row = conn.execute(
-        """SELECT id FROM account
-           WHERE company_id = ? AND root_type = 'liability'
-             AND is_group = 0 AND disabled = 0
-             AND (LOWER(name) LIKE '%social%security%'
-                  OR LOWER(name) LIKE '%ss%payable%'
-                  OR LOWER(name) LIKE '%social security%')
-           LIMIT 1""",
-        (company_id,),
-    ).fetchone()
+    row = _acct_query("liability", ["%social%security%", "%ss%payable%", "%social security%"])
     if row:
         accounts["ss_payable"] = row["id"]
 
     # --- Medicare Payable ---
-    row = conn.execute(
-        """SELECT id FROM account
-           WHERE company_id = ? AND root_type = 'liability'
-             AND is_group = 0 AND disabled = 0
-             AND LOWER(name) LIKE '%medicare%'
-           LIMIT 1""",
-        (company_id,),
-    ).fetchone()
+    row = _acct_query("liability", ["%medicare%"])
     if row:
         accounts["medicare_payable"] = row["id"]
 
     # --- Employer Tax Expense ---
-    row = conn.execute(
-        """SELECT id FROM account
-           WHERE company_id = ? AND root_type = 'expense'
-             AND is_group = 0 AND disabled = 0
-             AND (LOWER(name) LIKE '%employer%tax%'
-                  OR LOWER(name) LIKE '%payroll tax%expense%')
-           LIMIT 1""",
-        (company_id,),
-    ).fetchone()
+    row = _acct_query("expense", ["%employer%tax%", "%payroll tax%expense%"])
     if row:
         accounts["employer_tax_expense"] = row["id"]
     else:
@@ -1845,26 +1774,12 @@ def _find_payroll_accounts(conn: sqlite3.Connection,
         accounts["employer_tax_expense"] = accounts["salary_expense"]
 
     # --- FUTA Payable ---
-    row = conn.execute(
-        """SELECT id FROM account
-           WHERE company_id = ? AND root_type = 'liability'
-             AND is_group = 0 AND disabled = 0
-             AND LOWER(name) LIKE '%futa%'
-           LIMIT 1""",
-        (company_id,),
-    ).fetchone()
+    row = _acct_query("liability", ["%futa%"])
     if row:
         accounts["futa_payable"] = row["id"]
 
     # --- SUTA Payable ---
-    row = conn.execute(
-        """SELECT id FROM account
-           WHERE company_id = ? AND root_type = 'liability'
-             AND is_group = 0 AND disabled = 0
-             AND LOWER(name) LIKE '%suta%'
-           LIMIT 1""",
-        (company_id,),
-    ).fetchone()
+    row = _acct_query("liability", ["%suta%"])
     if row:
         accounts["suta_payable"] = row["id"]
 
@@ -1906,23 +1821,22 @@ def _get_or_create_statutory_component(conn: sqlite3.Connection,
     Returns:
         The salary_component.id (existing or newly created).
     """
-    row = conn.execute(
-        "SELECT id FROM salary_component WHERE name = ?",
-        (name,),
-    ).fetchone()
+    sc_t = Table("salary_component")
+    q = Q.from_(sc_t).select(sc_t.id).where(sc_t.name == P())
+    row = conn.execute(q.get_sql(), (name,)).fetchone()
     if row:
         return row["id"]
 
     # Create the component
     comp_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO salary_component
-           (id, name, component_type, is_statutory, is_pre_tax,
-            is_tax_applicable, depends_on_payment_days, gl_account_id)
-           VALUES (?, ?, ?, ?, ?, 0, 0, ?)""",
-        (comp_id, name, component_type, is_statutory, is_pre_tax,
-         gl_account_id),
-    )
+    ins_sql, _ = insert_row("salary_component", {
+        "id": P(), "name": P(), "component_type": P(),
+        "is_statutory": P(), "is_pre_tax": P(),
+        "is_tax_applicable": P(), "depends_on_payment_days": P(),
+        "gl_account_id": P(),
+    })
+    conn.execute(ins_sql, (comp_id, name, component_type, is_statutory,
+                           is_pre_tax, 0, 0, gl_account_id))
     return comp_id
 
 
@@ -2057,34 +1971,28 @@ def create_payroll_run(conn: sqlite3.Connection, args) -> None:
         err(f"--payroll-frequency must be one of: {', '.join(valid_frequencies)}")
 
     # Company must exist
-    company = conn.execute(
-        "SELECT id FROM company WHERE id = ?", (company_id,)
-    ).fetchone()
-    if not company:
-        err(f"Company {company_id} not found")
+    _validate_company_exists(conn, company_id)
 
     # Department must exist if specified
     if department_id:
-        dept = conn.execute(
-            "SELECT id FROM department WHERE id = ? OR name = ?",
-            (department_id, department_id),
-        ).fetchone()
+        dept_t = Table("department")
+        dept_q = Q.from_(dept_t).select(dept_t.id).where(
+            Criterion.any([dept_t.id == P(), dept_t.name == P()])
+        )
+        dept = conn.execute(dept_q.get_sql(), (department_id, department_id)).fetchone()
         if not dept:
             err(f"Department {department_id} not found")
         department_id = dept["id"]
 
     # Check for overlapping payroll run (same company, overlapping period, not cancelled)
-    overlap = conn.execute(
-        """
-        SELECT id, naming_series, period_start, period_end
-        FROM payroll_run
-        WHERE company_id = ?
-          AND status != 'cancelled'
-          AND period_start <= ?
-          AND period_end >= ?
-        """,
-        (company_id, period_end, period_start),
-    ).fetchone()
+    pr_t = Table("payroll_run")
+    overlap_q = (Q.from_(pr_t)
+                 .select(pr_t.id, pr_t.naming_series, pr_t.period_start, pr_t.period_end)
+                 .where(pr_t.company_id == P())
+                 .where(pr_t.status != ValueWrapper("cancelled"))
+                 .where(pr_t.period_start <= P())
+                 .where(pr_t.period_end >= P()))
+    overlap = conn.execute(overlap_q.get_sql(), (company_id, period_end, period_start)).fetchone()
     if overlap:
         err(
             f"Overlapping payroll run exists: {overlap['naming_series'] or overlap['id']} "
@@ -2095,17 +2003,14 @@ def create_payroll_run(conn: sqlite3.Connection, args) -> None:
     run_id = str(uuid.uuid4())
     naming = get_next_name(conn, "payroll_run", company_id=company_id)
 
-    conn.execute(
-        """
-        INSERT INTO payroll_run
-            (id, naming_series, period_start, period_end, payroll_frequency,
-             department_id, total_gross, total_deductions, total_net,
-             employee_count, status, company_id)
-        VALUES (?, ?, ?, ?, ?, ?, '0', '0', '0', 0, 'draft', ?)
-        """,
-        (run_id, naming, period_start, period_end, frequency,
-         department_id, company_id),
-    )
+    ins_pr_sql, _ = insert_row("payroll_run", {
+        "id": P(), "naming_series": P(), "period_start": P(),
+        "period_end": P(), "payroll_frequency": P(), "department_id": P(),
+        "total_gross": P(), "total_deductions": P(), "total_net": P(),
+        "employee_count": P(), "status": P(), "company_id": P(),
+    })
+    conn.execute(ins_pr_sql, (run_id, naming, period_start, period_end, frequency,
+                              department_id, "0", "0", "0", 0, "draft", company_id))
 
     audit(conn, "erpclaw-payroll", "create-payroll-run", "payroll_run", run_id,
            new_values={"period_start": period_start, "period_end": period_end,
@@ -2155,9 +2060,9 @@ def generate_salary_slips(conn: sqlite3.Connection, args) -> None:
         err("--payroll-run-id is required")
 
     # --- Validate payroll run ---
-    run = conn.execute(
-        "SELECT * FROM payroll_run WHERE id = ?", (payroll_run_id,)
-    ).fetchone()
+    pr_t = Table("payroll_run")
+    run_q = Q.from_(pr_t).select(pr_t.star).where(pr_t.id == P())
+    run = conn.execute(run_q.get_sql(), (payroll_run_id,)).fetchone()
     if not run:
         err(f"Payroll run {payroll_run_id} not found")
 
@@ -2173,29 +2078,26 @@ def generate_salary_slips(conn: sqlite3.Connection, args) -> None:
     periods_per_year = _get_periods_per_year(frequency)
 
     # --- Delete existing draft slips for this run (allows regeneration) ---
-    existing_slips = conn.execute(
-        "SELECT id FROM salary_slip WHERE payroll_run_id = ? AND status = 'draft'",
-        (payroll_run_id,),
-    ).fetchall()
+    ss_t = Table("salary_slip")
+    del_q = Q.from_(ss_t).select(ss_t.id).where(ss_t.payroll_run_id == P()).where(ss_t.status == ValueWrapper("draft"))
+    existing_slips = conn.execute(del_q.get_sql(), (payroll_run_id,)).fetchall()
+
+    ssd_t = Table("salary_slip_detail")
     for slip in existing_slips:
-        conn.execute(
-            "DELETE FROM salary_slip_detail WHERE salary_slip_id = ?",
-            (slip["id"],),
-        )
-        conn.execute(
-            "DELETE FROM salary_slip WHERE id = ?",
-            (slip["id"],),
-        )
+        del_det = Q.from_(ssd_t).delete().where(ssd_t.salary_slip_id == P())
+        conn.execute(del_det.get_sql(), (slip["id"],))
+        del_slip = Q.from_(ss_t).delete().where(ss_t.id == P())
+        conn.execute(del_slip.get_sql(), (slip["id"],))
 
     # --- Get FICA config for the tax year ---
     tax_year = int(period_end[:4])
-    fica_config = conn.execute(
-        "SELECT * FROM fica_config WHERE tax_year = ?", (tax_year,)
-    ).fetchone()
+    fc_t = Table("fica_config")
+    fc_q = Q.from_(fc_t).select(fc_t.star).where(fc_t.tax_year == P())
+    fica_config = conn.execute(fc_q.get_sql(), (tax_year,)).fetchone()
     fica = row_to_dict(fica_config) if fica_config else None
 
     # --- Find eligible employees ---
-    # Active employees with a salary assignment effective during the period
+    # raw SQL — uses IS NULL in OR clause for effective_to check
     emp_query = """
         SELECT DISTINCT e.*
         FROM employee e
@@ -2205,13 +2107,13 @@ def generate_salary_slips(conn: sqlite3.Connection, args) -> None:
           AND sa.effective_from <= ?
           AND (sa.effective_to IS NULL OR sa.effective_to >= ?)
     """
-    params = [company_id, period_end, period_start]
+    emp_params = [company_id, period_end, period_start]
 
     if department_id:
         emp_query += " AND e.department_id = ?"
-        params.append(department_id)
+        emp_params.append(department_id)
 
-    employees = conn.execute(emp_query, params).fetchall()
+    employees = conn.execute(emp_query, emp_params).fetchall()
 
     if not employees:
         err("No eligible employees found for this payroll period. "
@@ -2229,6 +2131,7 @@ def generate_salary_slips(conn: sqlite3.Connection, args) -> None:
         employee_id = emp["id"]
 
         # Step 0: Get the active salary assignment for this employee/period
+        # raw SQL — uses IS NULL in OR clause for effective_to
         assignment = conn.execute(
             """
             SELECT sa.*
@@ -2249,26 +2152,28 @@ def generate_salary_slips(conn: sqlite3.Connection, args) -> None:
         base_amount = to_decimal(assignment["base_amount"])
 
         # Get salary structure
-        structure = conn.execute(
-            "SELECT * FROM salary_structure WHERE id = ?", (structure_id,)
-        ).fetchone()
+        st_t = Table("salary_structure")
+        st_q = Q.from_(st_t).select(st_t.star).where(st_t.id == P())
+        structure = conn.execute(st_q.get_sql(), (structure_id,)).fetchone()
         if not structure:
             continue
         structure = row_to_dict(structure)
 
         # Get structure details (component definitions) with component info
-        details = conn.execute(
-            """
-            SELECT ssd.*, sc.name AS component_name, sc.component_type,
-                   sc.depends_on_payment_days, sc.is_tax_applicable,
-                   sc.is_pre_tax, sc.gl_account_id AS component_gl_account_id
-            FROM salary_structure_detail ssd
-            JOIN salary_component sc ON sc.id = ssd.salary_component_id
-            WHERE ssd.salary_structure_id = ?
-            ORDER BY ssd.sort_order ASC, sc.component_type ASC
-            """,
-            (structure_id,),
-        ).fetchall()
+        ssd_det = Table("salary_structure_detail").as_("ssd")
+        sc_det = Table("salary_component").as_("sc")
+        det_q = (Q.from_(ssd_det)
+                 .join(sc_det).on(sc_det.id == ssd_det.salary_component_id)
+                 .select(
+                     ssd_det.star,
+                     sc_det.name.as_("component_name"), sc_det.component_type,
+                     sc_det.depends_on_payment_days, sc_det.is_tax_applicable,
+                     sc_det.is_pre_tax, sc_det.gl_account_id.as_("component_gl_account_id"),
+                 )
+                 .where(ssd_det.salary_structure_id == P())
+                 .orderby(ssd_det.sort_order)
+                 .orderby(sc_det.component_type))
+        details = conn.execute(det_q.get_sql(), (structure_id,)).fetchall()
         details = [row_to_dict(d) for d in details]
 
         # Step 1: Calculate working days and payment days
@@ -2336,7 +2241,7 @@ def generate_salary_slips(conn: sqlite3.Connection, args) -> None:
         federal_tax = Decimal("0")
         filing_status = emp.get("federal_filing_status", "single")
 
-        # Find applicable federal tax slab
+        # raw SQL — uses IS NULL in OR clause and CASE in ORDER BY
         fed_slab = conn.execute(
             """
             SELECT its.*
@@ -2358,6 +2263,7 @@ def generate_salary_slips(conn: sqlite3.Connection, args) -> None:
             standard_deduction = to_decimal(fed_slab.get("standard_deduction", "0"))
 
             # Get slab rates
+            # raw SQL — ORDER BY from_amount + 0 (numeric cast) not easily expressed in PyPika
             fed_rates = conn.execute(
                 """
                 SELECT from_amount, to_amount, rate
@@ -2432,35 +2338,34 @@ def generate_salary_slips(conn: sqlite3.Connection, args) -> None:
         slip_id = str(uuid.uuid4())
         slip_naming = get_next_name(conn, "salary_slip", company_id=company_id)
 
-        conn.execute(
-            """
-            INSERT INTO salary_slip
-                (id, naming_series, payroll_run_id, employee_id,
-                 period_start, period_end, total_working_days, payment_days,
-                 gross_pay, total_deductions, net_pay, status, company_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)
-            """,
-            (slip_id, slip_naming, payroll_run_id, employee_id,
-             period_start, period_end,
-             str(round_currency(total_working_days)),
-             str(round_currency(payment_days)),
-             str(gross), str(total_deductions), str(net_pay),
-             company_id),
-        )
+        ins_slip_sql, _ = insert_row("salary_slip", {
+            "id": P(), "naming_series": P(), "payroll_run_id": P(),
+            "employee_id": P(), "period_start": P(), "period_end": P(),
+            "total_working_days": P(), "payment_days": P(),
+            "gross_pay": P(), "total_deductions": P(), "net_pay": P(),
+            "status": P(), "company_id": P(),
+        })
+        conn.execute(ins_slip_sql, (
+            slip_id, slip_naming, payroll_run_id, employee_id,
+            period_start, period_end,
+            str(round_currency(total_working_days)),
+            str(round_currency(payment_days)),
+            str(gross), str(total_deductions), str(net_pay),
+            "draft", company_id,
+        ))
 
         # --- Create salary_slip_detail rows ---
+
+        # Reusable INSERT for salary_slip_detail
+        ins_det_sql, _ = insert_row("salary_slip_detail", {
+            "id": P(), "salary_slip_id": P(), "salary_component_id": P(),
+            "component_type": P(), "amount": P(), "year_to_date": P(),
+        })
 
         # Earnings
         for comp_id, comp_name, amt in earnings_details:
             detail_id = str(uuid.uuid4())
-            conn.execute(
-                """
-                INSERT INTO salary_slip_detail
-                    (id, salary_slip_id, salary_component_id, component_type, amount, year_to_date)
-                VALUES (?, ?, ?, 'earning', ?, '0')
-                """,
-                (detail_id, slip_id, comp_id, str(amt)),
-            )
+            conn.execute(ins_det_sql, (detail_id, slip_id, comp_id, "earning", str(amt), "0"))
 
         # Deductions: pre-tax (401k, HSA)
         if pretax_401k > 0:
@@ -2468,28 +2373,14 @@ def generate_salary_slips(conn: sqlite3.Connection, args) -> None:
                 conn, "401k Contribution", "deduction", is_statutory=0, is_pre_tax=1
             )
             detail_id = str(uuid.uuid4())
-            conn.execute(
-                """
-                INSERT INTO salary_slip_detail
-                    (id, salary_slip_id, salary_component_id, component_type, amount, year_to_date)
-                VALUES (?, ?, ?, 'deduction', ?, '0')
-                """,
-                (detail_id, slip_id, comp_401k_id, str(pretax_401k)),
-            )
+            conn.execute(ins_det_sql, (detail_id, slip_id, comp_401k_id, "deduction", str(pretax_401k), "0"))
 
         if pretax_hsa > 0:
             comp_hsa_id = _get_or_create_statutory_component(
                 conn, "HSA Contribution", "deduction", is_statutory=0, is_pre_tax=1
             )
             detail_id = str(uuid.uuid4())
-            conn.execute(
-                """
-                INSERT INTO salary_slip_detail
-                    (id, salary_slip_id, salary_component_id, component_type, amount, year_to_date)
-                VALUES (?, ?, ?, 'deduction', ?, '0')
-                """,
-                (detail_id, slip_id, comp_hsa_id, str(pretax_hsa)),
-            )
+            conn.execute(ins_det_sql, (detail_id, slip_id, comp_hsa_id, "deduction", str(pretax_hsa), "0"))
 
         # Deductions: federal income tax
         if federal_tax > 0:
@@ -2497,14 +2388,7 @@ def generate_salary_slips(conn: sqlite3.Connection, args) -> None:
                 conn, "Federal Income Tax", "deduction", is_statutory=1
             )
             detail_id = str(uuid.uuid4())
-            conn.execute(
-                """
-                INSERT INTO salary_slip_detail
-                    (id, salary_slip_id, salary_component_id, component_type, amount, year_to_date)
-                VALUES (?, ?, ?, 'deduction', ?, '0')
-                """,
-                (detail_id, slip_id, comp_fed_id, str(federal_tax)),
-            )
+            conn.execute(ins_det_sql, (detail_id, slip_id, comp_fed_id, "deduction", str(federal_tax), "0"))
 
         # Deductions: state income tax
         if state_tax > 0:
@@ -2512,14 +2396,7 @@ def generate_salary_slips(conn: sqlite3.Connection, args) -> None:
                 conn, "State Income Tax", "deduction", is_statutory=1
             )
             detail_id = str(uuid.uuid4())
-            conn.execute(
-                """
-                INSERT INTO salary_slip_detail
-                    (id, salary_slip_id, salary_component_id, component_type, amount, year_to_date)
-                VALUES (?, ?, ?, 'deduction', ?, '0')
-                """,
-                (detail_id, slip_id, comp_state_id, str(state_tax)),
-            )
+            conn.execute(ins_det_sql, (detail_id, slip_id, comp_state_id, "deduction", str(state_tax), "0"))
 
         # Deductions: FICA
         if ss_employee > 0:
@@ -2527,28 +2404,14 @@ def generate_salary_slips(conn: sqlite3.Connection, args) -> None:
                 conn, "Social Security Tax", "deduction", is_statutory=1
             )
             detail_id = str(uuid.uuid4())
-            conn.execute(
-                """
-                INSERT INTO salary_slip_detail
-                    (id, salary_slip_id, salary_component_id, component_type, amount, year_to_date)
-                VALUES (?, ?, ?, 'deduction', ?, '0')
-                """,
-                (detail_id, slip_id, comp_ss_id, str(ss_employee)),
-            )
+            conn.execute(ins_det_sql, (detail_id, slip_id, comp_ss_id, "deduction", str(ss_employee), "0"))
 
         if medicare_employee > 0:
             comp_med_id = _get_or_create_statutory_component(
                 conn, "Medicare Tax", "deduction", is_statutory=1
             )
             detail_id = str(uuid.uuid4())
-            conn.execute(
-                """
-                INSERT INTO salary_slip_detail
-                    (id, salary_slip_id, salary_component_id, component_type, amount, year_to_date)
-                VALUES (?, ?, ?, 'deduction', ?, '0')
-                """,
-                (detail_id, slip_id, comp_med_id, str(medicare_employee)),
-            )
+            conn.execute(ins_det_sql, (detail_id, slip_id, comp_med_id, "deduction", str(medicare_employee), "0"))
 
         # Include structure-defined deduction components
         for detail in details:
@@ -2584,34 +2447,24 @@ def generate_salary_slips(conn: sqlite3.Connection, args) -> None:
             amt = round_currency(amt)
             if amt > 0:
                 detail_id = str(uuid.uuid4())
-                conn.execute(
-                    """
-                    INSERT INTO salary_slip_detail
-                        (id, salary_slip_id, salary_component_id, component_type,
-                         amount, year_to_date)
-                    VALUES (?, ?, ?, 'deduction', ?, '0')
-                    """,
-                    (detail_id, slip_id, comp_id, str(amt)),
-                )
+                conn.execute(ins_det_sql, (detail_id, slip_id, comp_id, "deduction", str(amt), "0"))
                 total_deductions += amt
                 net_pay -= amt
 
                 # Rewrite the slip totals with the additional deduction
-                conn.execute(
-                    """UPDATE salary_slip
-                       SET total_deductions = ?, net_pay = ?
-                       WHERE id = ?""",
-                    (str(round_currency(total_deductions)), str(round_currency(net_pay)),
-                     slip_id),
-                )
+                upd_slip_sql = update_row("salary_slip",
+                                          data={"total_deductions": P(), "net_pay": P()},
+                                          where={"id": P()})
+                conn.execute(upd_slip_sql, (str(round_currency(total_deductions)),
+                                            str(round_currency(net_pay)), slip_id))
 
         # ---- Wage garnishments (post-tax, priority-ordered, with federal caps) ----
-        garnishments = conn.execute(
-            """SELECT * FROM wage_garnishment
-               WHERE employee_id = ? AND status = 'active'
-               ORDER BY priority, created_at""",
-            (employee_id,),
-        ).fetchall()
+        wg_t = Table("wage_garnishment")
+        garn_q = (Q.from_(wg_t).select(wg_t.star)
+                  .where(wg_t.employee_id == P())
+                  .where(wg_t.status == ValueWrapper("active"))
+                  .orderby(wg_t.priority).orderby(wg_t.created_at))
+        garnishments = conn.execute(garn_q.get_sql(), (employee_id,)).fetchall()
 
         if garnishments:
             disposable_income = net_pay  # After taxes and other deductions
@@ -2658,14 +2511,13 @@ def generate_salary_slips(conn: sqlite3.Connection, args) -> None:
                     is_statutory=1,
                 )
                 detail_id = str(uuid.uuid4())
-                conn.execute(
-                    """INSERT INTO salary_slip_detail
-                        (id, salary_slip_id, salary_component_id, component_type,
-                         amount, year_to_date)
-                    VALUES (?, ?, ?, 'deduction', ?, ?)""",
-                    (detail_id, slip_id, comp_garn_id, str(garn_amt),
-                     str(cumulative + garn_amt)),
-                )
+                ins_garn_det_sql, _ = insert_row("salary_slip_detail", {
+                    "id": P(), "salary_slip_id": P(), "salary_component_id": P(),
+                    "component_type": P(), "amount": P(), "year_to_date": P(),
+                })
+                conn.execute(ins_garn_det_sql, (detail_id, slip_id, comp_garn_id,
+                                                "deduction", str(garn_amt),
+                                                str(cumulative + garn_amt)))
 
                 total_deductions += garn_amt
                 net_pay -= garn_amt
@@ -2673,6 +2525,7 @@ def generate_salary_slips(conn: sqlite3.Connection, args) -> None:
 
                 # Update cumulative paid on the garnishment record
                 new_cumulative = cumulative + garn_amt
+                # raw SQL — uses datetime('now') which is a SQLite function
                 conn.execute(
                     "UPDATE wage_garnishment SET cumulative_paid = ?, updated_at = datetime('now') WHERE id = ?",
                     (str(new_cumulative), garn["id"]),
@@ -2680,19 +2533,18 @@ def generate_salary_slips(conn: sqlite3.Connection, args) -> None:
 
                 # Auto-complete if fully paid
                 if total_owed_val and new_cumulative >= total_owed_val:
+                    # raw SQL — uses datetime('now') which is a SQLite function
                     conn.execute(
                         "UPDATE wage_garnishment SET status = 'completed', updated_at = datetime('now') WHERE id = ?",
                         (garn["id"],),
                     )
 
             if total_garnishment > 0:
-                conn.execute(
-                    """UPDATE salary_slip
-                       SET total_deductions = ?, net_pay = ?
-                       WHERE id = ?""",
-                    (str(round_currency(total_deductions)),
-                     str(round_currency(net_pay)), slip_id),
-                )
+                upd_slip_garn = update_row("salary_slip",
+                                           data={"total_deductions": P(), "net_pay": P()},
+                                           where={"id": P()})
+                conn.execute(upd_slip_garn, (str(round_currency(total_deductions)),
+                                             str(round_currency(net_pay)), slip_id))
 
         # Accumulate run totals
         run_total_gross += gross
@@ -2701,6 +2553,7 @@ def generate_salary_slips(conn: sqlite3.Connection, args) -> None:
         slips_generated += 1
 
     # --- Update payroll_run totals ---
+    # raw SQL — uses datetime('now') SQLite function
     conn.execute(
         """
         UPDATE payroll_run
@@ -2753,31 +2606,29 @@ def get_salary_slip(conn: sqlite3.Connection, args) -> None:
     if not slip_id:
         err("--salary-slip-id is required")
 
-    slip = conn.execute(
-        """
-        SELECT ss.*, e.full_name AS employee_name, e.first_name, e.last_name
-        FROM salary_slip ss
-        JOIN employee e ON e.id = ss.employee_id
-        WHERE ss.id = ?
-        """,
-        (slip_id,),
-    ).fetchone()
+    ss_t = Table("salary_slip").as_("ss")
+    e_t = Table("employee").as_("e")
+    slip_q = (Q.from_(ss_t)
+              .join(e_t).on(e_t.id == ss_t.employee_id)
+              .select(ss_t.star,
+                      e_t.full_name.as_("employee_name"),
+                      e_t.first_name, e_t.last_name)
+              .where(ss_t.id == P()))
+    slip = conn.execute(slip_q.get_sql(), (slip_id,)).fetchone()
     if not slip:
         err(f"Salary slip {slip_id} not found")
 
     slip_dict = row_to_dict(slip)
 
     # Get details split by type
-    details = conn.execute(
-        """
-        SELECT ssd.*, sc.name AS component_name
-        FROM salary_slip_detail ssd
-        JOIN salary_component sc ON sc.id = ssd.salary_component_id
-        WHERE ssd.salary_slip_id = ?
-        ORDER BY ssd.component_type, sc.name
-        """,
-        (slip_id,),
-    ).fetchall()
+    ssd_t = Table("salary_slip_detail").as_("ssd")
+    sc_t = Table("salary_component").as_("sc")
+    det_q = (Q.from_(ssd_t)
+             .join(sc_t).on(sc_t.id == ssd_t.salary_component_id)
+             .select(ssd_t.star, sc_t.name.as_("component_name"))
+             .where(ssd_t.salary_slip_id == P())
+             .orderby(ssd_t.component_type).orderby(sc_t.name))
+    details = conn.execute(det_q.get_sql(), (slip_id,)).fetchall()
 
     earnings = []
     deductions = []
@@ -2825,44 +2676,36 @@ def list_salary_slips(conn: sqlite3.Connection, args) -> None:
     limit = int(args.limit or "20")
     offset = int(args.offset or "0")
 
-    query = """
-        SELECT ss.*, e.full_name AS employee_name
-        FROM salary_slip ss
-        JOIN employee e ON e.id = ss.employee_id
-        WHERE 1=1
-    """
-    count_query = """
-        SELECT COUNT(*) AS cnt FROM salary_slip ss WHERE 1=1
-    """
+    ss_t = Table("salary_slip").as_("ss")
+    e_t = Table("employee").as_("e")
     params = []
-    count_params = []
+
+    list_q = (Q.from_(ss_t)
+              .join(e_t).on(e_t.id == ss_t.employee_id)
+              .select(ss_t.star, e_t.full_name.as_("employee_name")))
+    count_q = Q.from_(ss_t).select(fn.Count("*").as_("cnt"))
 
     if args.payroll_run_id:
-        query += " AND ss.payroll_run_id = ?"
-        count_query += " AND ss.payroll_run_id = ?"
+        list_q = list_q.where(ss_t.payroll_run_id == P())
+        count_q = count_q.where(ss_t.payroll_run_id == P())
         params.append(args.payroll_run_id)
-        count_params.append(args.payroll_run_id)
 
     if args.employee_id:
-        query += " AND ss.employee_id = ?"
-        count_query += " AND ss.employee_id = ?"
+        list_q = list_q.where(ss_t.employee_id == P())
+        count_q = count_q.where(ss_t.employee_id == P())
         params.append(args.employee_id)
-        count_params.append(args.employee_id)
 
     if args.status:
-        query += " AND ss.status = ?"
-        count_query += " AND ss.status = ?"
+        list_q = list_q.where(ss_t.status == P())
+        count_q = count_q.where(ss_t.status == P())
         params.append(args.status)
-        count_params.append(args.status)
 
     # Count
-    total = conn.execute(count_query, count_params).fetchone()["cnt"]
+    total = conn.execute(count_q.get_sql(), params).fetchone()["cnt"]
 
     # Fetch with pagination
-    query += " ORDER BY ss.created_at DESC LIMIT ? OFFSET ?"
-    params.extend([limit, offset])
-
-    rows = conn.execute(query, params).fetchall()
+    list_q = list_q.orderby(ss_t.created_at, order=Order.desc).limit(P()).offset(P())
+    rows = conn.execute(list_q.get_sql(), params + [limit, offset]).fetchall()
     slips = [row_to_dict(r) for r in rows]
 
     ok({"count": total, "slips": slips,
@@ -2909,9 +2752,9 @@ def submit_payroll_run(conn: sqlite3.Connection, args) -> None:
         err("--payroll-run-id is required")
 
     # --- Validate payroll run ---
-    run = conn.execute(
-        "SELECT * FROM payroll_run WHERE id = ?", (payroll_run_id,)
-    ).fetchone()
+    pr_t = Table("payroll_run")
+    run_q = Q.from_(pr_t).select(pr_t.star).where(pr_t.id == P())
+    run = conn.execute(run_q.get_sql(), (payroll_run_id,)).fetchone()
     if not run:
         err(f"Payroll run {payroll_run_id} not found")
 
@@ -2924,10 +2767,9 @@ def submit_payroll_run(conn: sqlite3.Connection, args) -> None:
     tax_year = int(period_end[:4])
 
     # Must have slips
-    slips = conn.execute(
-        "SELECT * FROM salary_slip WHERE payroll_run_id = ? AND status = 'draft'",
-        (payroll_run_id,),
-    ).fetchall()
+    ss_t = Table("salary_slip")
+    slips_q = Q.from_(ss_t).select(ss_t.star).where(ss_t.payroll_run_id == P()).where(ss_t.status == ValueWrapper("draft"))
+    slips = conn.execute(slips_q.get_sql(), (payroll_run_id,)).fetchall()
     if not slips:
         err("Payroll run has no draft salary slips. Generate slips first.")
 
@@ -2941,24 +2783,25 @@ def submit_payroll_run(conn: sqlite3.Connection, args) -> None:
 
     # If no cost_center_id provided, try to find a default one
     if not cost_center_id:
-        cc = conn.execute(
-            """SELECT id FROM cost_center
-               WHERE company_id = ? AND is_group = 0
-               ORDER BY name LIMIT 1""",
-            (company_id,),
-        ).fetchone()
+        cc_t = Table("cost_center")
+        cc_q = (Q.from_(cc_t).select(cc_t.id)
+                .where(cc_t.company_id == P())
+                .where(cc_t.is_group == 0)
+                .orderby(cc_t.name).limit(1))
+        cc = conn.execute(cc_q.get_sql(), (company_id,)).fetchone()
         if cc:
             cost_center_id = cc["id"]
         else:
             err("--cost-center-id is required (no default cost center found)")
 
     # --- Gather FICA config for employer-side calculations ---
-    fica_config = conn.execute(
-        "SELECT * FROM fica_config WHERE tax_year = ?", (tax_year,)
-    ).fetchone()
+    fc_t = Table("fica_config")
+    fc_q = Q.from_(fc_t).select(fc_t.star).where(fc_t.tax_year == P())
+    fica_config = conn.execute(fc_q.get_sql(), (tax_year,)).fetchone()
     fica = row_to_dict(fica_config) if fica_config else None
 
     # --- Gather FUTA/SUTA config ---
+    # raw SQL — uses IS NULL and OR state_code = '' checks
     futa_config = conn.execute(
         """SELECT * FROM futa_suta_config
            WHERE tax_year = ? AND (state_code IS NULL OR state_code = '')""",
@@ -2966,6 +2809,7 @@ def submit_payroll_run(conn: sqlite3.Connection, args) -> None:
     ).fetchone()
     futa = row_to_dict(futa_config) if futa_config else None
 
+    # raw SQL — uses IS NOT NULL and state_code != '' checks
     suta_configs = conn.execute(
         """SELECT * FROM futa_suta_config
            WHERE tax_year = ? AND state_code IS NOT NULL AND state_code != ''""",
@@ -3011,15 +2855,14 @@ def submit_payroll_run(conn: sqlite3.Connection, args) -> None:
             employee_net_pay[employee_id] = slip_net
 
         # Get slip details for federal tax, SS, Medicare
-        slip_details = conn.execute(
-            """
-            SELECT ssd.amount, sc.name AS component_name
-            FROM salary_slip_detail ssd
-            JOIN salary_component sc ON sc.id = ssd.salary_component_id
-            WHERE ssd.salary_slip_id = ? AND ssd.component_type = 'deduction'
-            """,
-            (slip["id"],),
-        ).fetchall()
+        ssd_t2 = Table("salary_slip_detail").as_("ssd")
+        sc_t2 = Table("salary_component").as_("sc")
+        sd_q = (Q.from_(ssd_t2)
+                .join(sc_t2).on(sc_t2.id == ssd_t2.salary_component_id)
+                .select(ssd_t2.amount, sc_t2.name.as_("component_name"))
+                .where(ssd_t2.salary_slip_id == P())
+                .where(ssd_t2.component_type == ValueWrapper("deduction")))
+        slip_details = conn.execute(sd_q.get_sql(), (slip["id"],)).fetchall()
 
         for d in slip_details:
             d_dict = row_to_dict(d)
@@ -3034,17 +2877,15 @@ def submit_payroll_run(conn: sqlite3.Connection, args) -> None:
                 total_medicare_employee += amt
 
         # Accumulate per-employee pre-tax deductions for payroll payable tracking
-        pretax_row = conn.execute(
-            """
-            SELECT COALESCE(decimal_sum(ssd.amount), '0') AS total
-            FROM salary_slip_detail ssd
-            JOIN salary_component sc ON sc.id = ssd.salary_component_id
-            WHERE ssd.salary_slip_id = ?
-              AND ssd.component_type = 'deduction'
-              AND sc.is_pre_tax = 1
-            """,
-            (slip["id"],),
-        ).fetchone()
+        ssd_pt = Table("salary_slip_detail").as_("ssd")
+        sc_pt = Table("salary_component").as_("sc")
+        pt_q = (Q.from_(ssd_pt)
+                .join(sc_pt).on(sc_pt.id == ssd_pt.salary_component_id)
+                .select(fn.Coalesce(DecimalSum(ssd_pt.amount), ValueWrapper("0")).as_("total"))
+                .where(ssd_pt.salary_slip_id == P())
+                .where(ssd_pt.component_type == ValueWrapper("deduction"))
+                .where(sc_pt.is_pre_tax == 1))
+        pretax_row = conn.execute(pt_q.get_sql(), (slip["id"],)).fetchone()
         if pretax_row:
             emp_pretax = to_decimal(str(pretax_row["total"]))
             if employee_id in employee_pretax:
@@ -3053,15 +2894,14 @@ def submit_payroll_run(conn: sqlite3.Connection, args) -> None:
                 employee_pretax[employee_id] = emp_pretax
 
         # Accumulate earning component amounts by GL account
-        earning_details = conn.execute(
-            """
-            SELECT ssd.amount, sc.gl_account_id
-            FROM salary_slip_detail ssd
-            JOIN salary_component sc ON sc.id = ssd.salary_component_id
-            WHERE ssd.salary_slip_id = ? AND ssd.component_type = 'earning'
-            """,
-            (slip["id"],),
-        ).fetchall()
+        ssd_earn = Table("salary_slip_detail").as_("ssd")
+        sc_earn = Table("salary_component").as_("sc")
+        earn_q = (Q.from_(ssd_earn)
+                  .join(sc_earn).on(sc_earn.id == ssd_earn.salary_component_id)
+                  .select(ssd_earn.amount, sc_earn.gl_account_id)
+                  .where(ssd_earn.salary_slip_id == P())
+                  .where(ssd_earn.component_type == ValueWrapper("earning")))
+        earning_details = conn.execute(earn_q.get_sql(), (slip["id"],)).fetchall()
 
         for ed in earning_details:
             ed_dict = row_to_dict(ed)
@@ -3073,9 +2913,9 @@ def submit_payroll_run(conn: sqlite3.Connection, args) -> None:
                 component_expense_totals[gl_acct] = amt
 
         # --- Employer-side tax calculations per employee ---
-        emp = conn.execute(
-            "SELECT * FROM employee WHERE id = ?", (employee_id,)
-        ).fetchone()
+        emp_t = Table("employee")
+        emp_q = Q.from_(emp_t).select(emp_t.star).where(emp_t.id == P())
+        emp = conn.execute(emp_q.get_sql(), (employee_id,)).fetchone()
         emp_dict = row_to_dict(emp) if emp else {}
         is_exempt = bool(emp_dict.get("is_exempt_from_fica", 0))
 
@@ -3309,6 +3149,7 @@ def submit_payroll_run(conn: sqlite3.Connection, args) -> None:
         err(f"GL posting failed: {e}")
 
     # --- Mark all slips as submitted ---
+    # raw SQL — uses datetime('now') SQLite function
     conn.execute(
         """UPDATE salary_slip
            SET status = 'submitted', updated_at = datetime('now')
@@ -3317,6 +3158,7 @@ def submit_payroll_run(conn: sqlite3.Connection, args) -> None:
     )
 
     # --- Update payroll_run status ---
+    # raw SQL — uses datetime('now') SQLite function
     conn.execute(
         """UPDATE payroll_run
            SET status = 'submitted', updated_at = datetime('now')
@@ -3366,9 +3208,9 @@ def cancel_payroll_run(conn: sqlite3.Connection, args) -> None:
         err("--payroll-run-id is required")
 
     # --- Validate payroll run ---
-    run = conn.execute(
-        "SELECT * FROM payroll_run WHERE id = ?", (payroll_run_id,)
-    ).fetchone()
+    pr_t = Table("payroll_run")
+    run_q = Q.from_(pr_t).select(pr_t.star).where(pr_t.id == P())
+    run = conn.execute(run_q.get_sql(), (payroll_run_id,)).fetchone()
     if not run:
         err(f"Payroll run {payroll_run_id} not found")
 
@@ -3393,6 +3235,7 @@ def cancel_payroll_run(conn: sqlite3.Connection, args) -> None:
         err(f"GL reversal failed: {e}")
 
     # --- Mark all slips as cancelled ---
+    # raw SQL — uses datetime('now') SQLite function
     conn.execute(
         """UPDATE salary_slip
            SET status = 'cancelled', updated_at = datetime('now')
@@ -3401,6 +3244,7 @@ def cancel_payroll_run(conn: sqlite3.Connection, args) -> None:
     )
 
     # --- Update payroll_run status ---
+    # raw SQL — uses datetime('now') SQLite function
     conn.execute(
         """UPDATE payroll_run
            SET status = 'cancelled', updated_at = datetime('now')
@@ -3463,9 +3307,9 @@ def generate_w2_data(conn: sqlite3.Connection, args) -> None:
         err(f"--tax-year must be an integer, got: {tax_year_str}")
 
     # Validate company
-    company = conn.execute(
-        "SELECT id, name FROM company WHERE id = ?", (company_id,)
-    ).fetchone()
+    co_t = Table("company")
+    co_q = Q.from_(co_t).select(co_t.id, co_t.name).where(co_t.id == P())
+    company = conn.execute(co_q.get_sql(), (company_id,)).fetchone()
     if not company:
         err(f"Company {company_id} not found")
 
@@ -3474,12 +3318,13 @@ def generate_w2_data(conn: sqlite3.Connection, args) -> None:
     year_end = f"{tax_year}-12-31"
 
     # Get FICA config for SS wage base
-    fica_config = conn.execute(
-        "SELECT * FROM fica_config WHERE tax_year = ?", (tax_year,)
-    ).fetchone()
+    fc_t = Table("fica_config")
+    fc_q = Q.from_(fc_t).select(fc_t.star).where(fc_t.tax_year == P())
+    fica_config = conn.execute(fc_q.get_sql(), (tax_year,)).fetchone()
     ss_wage_base = to_decimal(fica_config["ss_wage_base"]) if fica_config else Decimal("168600")
 
     # Get all employees who had submitted salary slips this year
+    # raw SQL — DISTINCT with JOIN and multiple table references
     employees = conn.execute(
         """
         SELECT DISTINCT e.id, e.full_name, e.first_name, e.last_name,
@@ -3502,18 +3347,16 @@ def generate_w2_data(conn: sqlite3.Connection, args) -> None:
         employee_id = emp["id"]
 
         # Get all submitted slips for this employee in the tax year
-        slip_rows = conn.execute(
-            """
-            SELECT ss.id, ss.gross_pay, ss.total_deductions, ss.net_pay
-            FROM salary_slip ss
-            WHERE ss.employee_id = ?
-              AND ss.company_id = ?
-              AND ss.status = 'submitted'
-              AND ss.period_end >= ?
-              AND ss.period_start <= ?
-            """,
-            (employee_id, company_id, year_start, year_end),
-        ).fetchall()
+        ss_w2 = Table("salary_slip").as_("ss")
+        w2_slip_q = (Q.from_(ss_w2)
+                     .select(ss_w2.id, ss_w2.gross_pay, ss_w2.total_deductions, ss_w2.net_pay)
+                     .where(ss_w2.employee_id == P())
+                     .where(ss_w2.company_id == P())
+                     .where(ss_w2.status == ValueWrapper("submitted"))
+                     .where(ss_w2.period_end >= P())
+                     .where(ss_w2.period_start <= P()))
+        slip_rows = conn.execute(w2_slip_q.get_sql(),
+                                 (employee_id, company_id, year_start, year_end)).fetchall()
 
         total_gross = Decimal("0")
         total_federal_tax = Decimal("0")
@@ -3529,16 +3372,14 @@ def generate_w2_data(conn: sqlite3.Connection, args) -> None:
             total_gross += slip_gross
 
             # Get deduction details for this slip
-            details = conn.execute(
-                """
-                SELECT ssd.amount, sc.name AS component_name, sc.is_pre_tax
-                FROM salary_slip_detail ssd
-                JOIN salary_component sc ON sc.id = ssd.salary_component_id
-                WHERE ssd.salary_slip_id = ?
-                  AND ssd.component_type = 'deduction'
-                """,
-                (slip["id"],),
-            ).fetchall()
+            ssd_w2 = Table("salary_slip_detail").as_("ssd")
+            sc_w2 = Table("salary_component").as_("sc")
+            w2_det_q = (Q.from_(ssd_w2)
+                        .join(sc_w2).on(sc_w2.id == ssd_w2.salary_component_id)
+                        .select(ssd_w2.amount, sc_w2.name.as_("component_name"), sc_w2.is_pre_tax)
+                        .where(ssd_w2.salary_slip_id == P())
+                        .where(ssd_w2.component_type == ValueWrapper("deduction")))
+            details = conn.execute(w2_det_q.get_sql(), (slip["id"],)).fetchall()
 
             for d in details:
                 d_dict = row_to_dict(d)

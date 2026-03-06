@@ -27,6 +27,8 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict, rows_to_list
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
+    from erpclaw_lib.query import Q, P, Table, Field, fn, Case, Order, Criterion, insert_row, update_row
+    from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
@@ -86,9 +88,9 @@ MOCK_TRANSACTIONS = [
 
 def _plaid_get_config_or_err(conn, company_id: str) -> dict:
     """Fetch Plaid config for a company. Calls err() if not found."""
-    row = conn.execute(
-        "SELECT * FROM plaid_config WHERE company_id = ?", (company_id,)
-    ).fetchone()
+    pc = Table("plaid_config")
+    q = Q.from_(pc).select(pc.star).where(pc.company_id == P())
+    row = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not row:
         err(f"Plaid config not found for company {company_id}",
             suggestion="Run 'configure-plaid' first to set up Plaid credentials.")
@@ -97,9 +99,9 @@ def _plaid_get_config_or_err(conn, company_id: str) -> dict:
 
 def _plaid_get_linked_account_or_err(conn, linked_account_id: str) -> dict:
     """Fetch a linked account by ID. Calls err() if not found."""
-    row = conn.execute(
-        "SELECT * FROM plaid_linked_account WHERE id = ?", (linked_account_id,)
-    ).fetchone()
+    pla = Table("plaid_linked_account")
+    q = Q.from_(pla).select(pla.star).where(pla.id == P())
+    row = conn.execute(q.get_sql(), (linked_account_id,)).fetchone()
     if not row:
         err(f"Linked account {linked_account_id} not found",
             suggestion="Use 'list-transactions' or check the linked account ID.")
@@ -132,13 +134,15 @@ def configure_plaid(conn, args):
         err(f"Invalid environment '{environment}'. Must be: sandbox, development, production")
 
     # Validate company exists
-    if not conn.execute("SELECT id FROM company WHERE id = ?", (company_id,)).fetchone():
+    co = Table("company")
+    q = Q.from_(co).select(co.id).where(co.id == P())
+    if not conn.execute(q.get_sql(), (company_id,)).fetchone():
         err(f"Company {company_id} not found")
 
     # Check for existing config
-    existing = conn.execute(
-        "SELECT id FROM plaid_config WHERE company_id = ?", (company_id,)
-    ).fetchone()
+    pc = Table("plaid_config")
+    q = Q.from_(pc).select(pc.id).where(pc.company_id == P())
+    existing = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if existing:
         err(f"Config already exists for this company",
             suggestion="Each company can only have one Plaid configuration.")
@@ -152,11 +156,11 @@ def configure_plaid(conn, args):
     enc_secret = encrypt_field(secret, _fk)
 
     config_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO plaid_config (id, company_id, client_id, secret, environment)
-           VALUES (?, ?, ?, ?, ?)""",
-        (config_id, company_id, enc_client_id, enc_secret, environment),
-    )
+    sql, _ = insert_row("plaid_config", {
+        "id": P(), "company_id": P(), "client_id": P(),
+        "secret": P(), "environment": P(),
+    })
+    conn.execute(sql, (config_id, company_id, enc_client_id, enc_secret, environment))
 
     audit(conn, SKILL_NAME, "configure-plaid", "plaid_config", config_id,
           new_values={"company_id": company_id, "environment": environment})
@@ -193,7 +197,9 @@ def link_account(conn, args):
         err("--account-mask is required")
 
     # Validate company exists
-    if not conn.execute("SELECT id FROM company WHERE id = ?", (company_id,)).fetchone():
+    co = Table("company")
+    q = Q.from_(co).select(co.id).where(co.id == P())
+    if not conn.execute(q.get_sql(), (company_id,)).fetchone():
         err(f"Company {company_id} not found")
 
     # Validate Plaid config exists for this company
@@ -202,22 +208,22 @@ def link_account(conn, args):
     # Validate ERP account if provided
     erp_account_id = args.erp_account_id
     if erp_account_id:
-        if not conn.execute("SELECT id FROM account WHERE id = ?",
-                            (erp_account_id,)).fetchone():
+        acc = Table("account")
+        q = Q.from_(acc).select(acc.id).where(acc.id == P())
+        if not conn.execute(q.get_sql(), (erp_account_id,)).fetchone():
             err(f"ERP account {erp_account_id} not found")
 
     # Generate mock access token
     access_token = f"mock-access-{uuid.uuid4()}"
 
     linked_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO plaid_linked_account
-           (id, company_id, access_token, institution_name, account_name,
-            account_type, account_mask, erp_account_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (linked_id, company_id, access_token, institution_name,
-         account_name, account_type, account_mask, erp_account_id),
-    )
+    sql, _ = insert_row("plaid_linked_account", {
+        "id": P(), "company_id": P(), "access_token": P(),
+        "institution_name": P(), "account_name": P(),
+        "account_type": P(), "account_mask": P(), "erp_account_id": P(),
+    })
+    conn.execute(sql, (linked_id, company_id, access_token, institution_name,
+         account_name, account_type, account_mask, erp_account_id))
 
     audit(conn, SKILL_NAME, "link-account", "plaid_linked_account", linked_id,
           new_values={"institution_name": institution_name,
@@ -266,26 +272,26 @@ def sync_transactions(conn, args):
         txn_date = (base_date + timedelta(days=i * 5 + 1)).strftime("%Y-%m-%d")
 
         # Check if already synced (idempotent)
-        existing = conn.execute(
-            """SELECT id FROM plaid_transaction
-               WHERE plaid_linked_account_id = ? AND plaid_transaction_id = ?""",
-            (linked_account_id, txn_id),
-        ).fetchone()
+        pt = Table("plaid_transaction")
+        q = (Q.from_(pt).select(pt.id)
+             .where(pt.plaid_linked_account_id == P())
+             .where(pt.plaid_transaction_id == P()))
+        existing = conn.execute(q.get_sql(), (linked_account_id, txn_id)).fetchone()
 
         if existing:
             skipped_count += 1
             continue
 
         row_id = str(uuid.uuid4())
-        conn.execute(
-            """INSERT INTO plaid_transaction
-               (id, plaid_linked_account_id, plaid_transaction_id, date,
-                amount, name, category, merchant_name)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (row_id, linked_account_id, txn_id, txn_date,
+        sql, _ = insert_row("plaid_transaction", {
+            "id": P(), "plaid_linked_account_id": P(),
+            "plaid_transaction_id": P(), "date": P(),
+            "amount": P(), "name": P(), "category": P(),
+            "merchant_name": P(),
+        })
+        conn.execute(sql, (row_id, linked_account_id, txn_id, txn_date,
              mock["amount"], mock["name"], mock["category"],
-             mock["merchant_name"]),
-        )
+             mock["merchant_name"]))
         created_count += 1
         transactions.append({
             "id": row_id,
@@ -298,11 +304,13 @@ def sync_transactions(conn, args):
         })
 
     # Update last_synced_at
-    conn.execute(
-        """UPDATE plaid_linked_account SET last_synced_at = datetime('now'),
-           updated_at = datetime('now') WHERE id = ?""",
-        (linked_account_id,),
-    )
+    pla = Table("plaid_linked_account")
+    now_fn = LiteralValue("datetime('now')")
+    q = (Q.update(pla)
+         .set(pla.last_synced_at, now_fn)
+         .set(pla.updated_at, now_fn)
+         .where(pla.id == P()))
+    conn.execute(q.get_sql(), (linked_account_id,))
 
     audit(conn, SKILL_NAME, "sync-transactions", "plaid_linked_account",
           linked_account_id,
@@ -333,13 +341,13 @@ def match_transactions(conn, args):
     erp_account_id = linked.get("erp_account_id")
 
     # Get all unmatched transactions for this linked account
-    unmatched = conn.execute(
-        """SELECT id, plaid_transaction_id, date, amount, name
-           FROM plaid_transaction
-           WHERE plaid_linked_account_id = ? AND match_status = 'unmatched'
-           ORDER BY date""",
-        (linked_account_id,),
-    ).fetchall()
+    pt = Table("plaid_transaction")
+    q = (Q.from_(pt)
+         .select(pt.id, pt.plaid_transaction_id, pt.date, pt.amount, pt.name)
+         .where(pt.plaid_linked_account_id == P())
+         .where(pt.match_status == ValueWrapper("unmatched"))
+         .orderby(pt.date))
+    unmatched = conn.execute(q.get_sql(), (linked_account_id,)).fetchall()
 
     matched_count = 0
     unmatched_count = 0
@@ -396,12 +404,12 @@ def match_transactions(conn, args):
 
             if gl_net == txn_amount:
                 # Match found
-                conn.execute(
-                    """UPDATE plaid_transaction
-                       SET matched_gl_entry_id = ?, match_status = 'auto_matched'
-                       WHERE id = ?""",
-                    (gl_dict["id"], txn_dict["id"]),
-                )
+                pt_upd = Table("plaid_transaction")
+                q_upd = (Q.update(pt_upd)
+                         .set(pt_upd.matched_gl_entry_id, P())
+                         .set(pt_upd.match_status, ValueWrapper("auto_matched"))
+                         .where(pt_upd.id == P()))
+                conn.execute(q_upd.get_sql(), (gl_dict["id"], txn_dict["id"]))
                 matched_count += 1
                 matches.append({
                     "transaction_id": txn_dict["id"],
@@ -437,40 +445,37 @@ def list_transactions(conn, args):
     # Verify linked account exists
     _plaid_get_linked_account_or_err(conn, linked_account_id)
 
-    conditions = ["pt.plaid_linked_account_id = ?"]
+    pt = Table("plaid_transaction")
     params = [linked_account_id]
 
+    # Build base WHERE
+    q_base = Q.from_(pt).where(pt.plaid_linked_account_id == P())
     if args.match_status:
-        conditions.append("pt.match_status = ?")
+        q_base = q_base.where(pt.match_status == P())
         params.append(args.match_status)
     if args.from_date:
-        conditions.append("pt.date >= ?")
+        q_base = q_base.where(pt.date >= P())
         params.append(args.from_date)
     if args.to_date:
-        conditions.append("pt.date <= ?")
+        q_base = q_base.where(pt.date <= P())
         params.append(args.to_date)
 
-    where = " AND ".join(conditions)
-
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM plaid_transaction pt WHERE {where}", params
-    ).fetchone()
+    # Count query
+    q_count = q_base.select(fn.Count("*"))
+    count_row = conn.execute(q_count.get_sql(), params).fetchone()
     total_count = count_row[0]
 
     limit = int(args.limit) if args.limit else 20
     offset = int(args.offset) if args.offset else 0
-    params.extend([limit, offset])
 
-    rows = conn.execute(
-        f"""SELECT pt.id, pt.plaid_transaction_id, pt.date, pt.amount,
-               pt.name, pt.category, pt.merchant_name,
-               pt.matched_gl_entry_id, pt.match_status
-           FROM plaid_transaction pt
-           WHERE {where}
-           ORDER BY pt.date DESC
-           LIMIT ? OFFSET ?""",
-        params,
-    ).fetchall()
+    # Data query
+    q_data = (q_base
+              .select(pt.id, pt.plaid_transaction_id, pt.date, pt.amount,
+                      pt.name, pt.category, pt.merchant_name,
+                      pt.matched_gl_entry_id, pt.match_status)
+              .orderby(pt.date, order=Order.desc)
+              .limit(P()).offset(P()))
+    rows = conn.execute(q_data.get_sql(), params + [limit, offset]).fetchall()
 
     ok({"transactions": [row_to_dict(r) for r in rows],
         "total_count": total_count,
@@ -483,17 +488,19 @@ def plaid_status(conn, args):
     """Show Plaid integration status: config count, linked accounts, transactions."""
     company_id = args.company_id
     if not company_id:
-        row = conn.execute("SELECT id FROM company LIMIT 1").fetchone()
+        co = Table("company")
+        q = Q.from_(co).select(co.id).limit(1)
+        row = conn.execute(q.get_sql()).fetchone()
         if not row:
             err("No company found. Create one with erpclaw-setup first.",
                 suggestion="Run 'tutorial' to create a demo company, or 'setup company' to create your own.")
         company_id = row["id"]
 
     # Config status
-    config = conn.execute(
-        "SELECT id, environment, status FROM plaid_config WHERE company_id = ?",
-        (company_id,),
-    ).fetchone()
+    pc = Table("plaid_config")
+    q = (Q.from_(pc).select(pc.id, pc.environment, pc.status)
+         .where(pc.company_id == P()))
+    config = conn.execute(q.get_sql(), (company_id,)).fetchone()
 
     config_info = None
     if config:
@@ -505,22 +512,24 @@ def plaid_status(conn, args):
         }
 
     # Linked accounts
-    accounts = conn.execute(
-        """SELECT COUNT(*) AS total,
-               SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active
-           FROM plaid_linked_account WHERE company_id = ?""",
-        (company_id,),
-    ).fetchone()
+    pla = Table("plaid_linked_account")
+    q = (Q.from_(pla)
+         .select(
+             fn.Count("*").as_("total"),
+             fn.Sum(Case().when(pla.status == ValueWrapper("active"), 1).else_(0)).as_("active"),
+         )
+         .where(pla.company_id == P()))
+    accounts = conn.execute(q.get_sql(), (company_id,)).fetchone()
 
     # Transaction counts by match status
-    txn_counts = conn.execute(
-        """SELECT pt.match_status, COUNT(*) AS cnt
-           FROM plaid_transaction pt
-           JOIN plaid_linked_account pla ON pt.plaid_linked_account_id = pla.id
-           WHERE pla.company_id = ?
-           GROUP BY pt.match_status""",
-        (company_id,),
-    ).fetchall()
+    pt = Table("plaid_transaction")
+    pla2 = Table("plaid_linked_account")
+    q = (Q.from_(pt)
+         .join(pla2).on(pt.plaid_linked_account_id == pla2.id)
+         .select(pt.match_status, fn.Count("*").as_("cnt"))
+         .where(pla2.company_id == P())
+         .groupby(pt.match_status))
+    txn_counts = conn.execute(q.get_sql(), (company_id,)).fetchall()
 
     txn_summary = {}
     total_txns = 0
@@ -564,10 +573,11 @@ def _mock_stripe_id(prefix: str) -> str:
 
 def _stripe_get_config(conn, company_id: str):
     """Fetch stripe config for a company. Returns dict or calls err()."""
-    row = conn.execute(
-        "SELECT * FROM stripe_config WHERE company_id = ? AND status = 'active'",
-        (company_id,),
-    ).fetchone()
+    sc = Table("stripe_config")
+    q = (Q.from_(sc).select(sc.star)
+         .where(sc.company_id == P())
+         .where(sc.status == ValueWrapper("active")))
+    row = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not row:
         err(f"Stripe not configured for company {company_id}",
             suggestion="Use 'configure-stripe' action to set up Stripe credentials first.")
@@ -588,17 +598,16 @@ def configure_stripe(conn, args):
         err("--secret-key is required")
 
     # Validate company exists
-    company = conn.execute(
-        "SELECT id, name FROM company WHERE id = ?", (args.company_id,)
-    ).fetchone()
+    co = Table("company")
+    q = Q.from_(co).select(co.id, co.name).where(co.id == P())
+    company = conn.execute(q.get_sql(), (args.company_id,)).fetchone()
     if not company:
         err(f"Company not found: {args.company_id}")
 
     # Check for existing config
-    existing = conn.execute(
-        "SELECT id FROM stripe_config WHERE company_id = ?",
-        (args.company_id,),
-    ).fetchone()
+    sc = Table("stripe_config")
+    q = Q.from_(sc).select(sc.id).where(sc.company_id == P())
+    existing = conn.execute(q.get_sql(), (args.company_id,)).fetchone()
     if existing:
         err(f"Stripe already configured for company {args.company_id}. "
             "Only one configuration per company is allowed.",
@@ -618,22 +627,22 @@ def configure_stripe(conn, args):
     enc_webhook = encrypt_field(args.webhook_secret, _fk) if args.webhook_secret else None
 
     config_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO stripe_config
-           (id, company_id, publishable_key, secret_key, webhook_secret,
-            mode, status, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
-        (config_id, args.company_id, enc_publishable, enc_secret,
-         enc_webhook, mode, _now(), _now()),
-    )
+    now_ts = _now()
+    sql, _ = insert_row("stripe_config", {
+        "id": P(), "company_id": P(), "publishable_key": P(),
+        "secret_key": P(), "webhook_secret": P(),
+        "mode": P(), "status": P(), "created_at": P(), "updated_at": P(),
+    })
+    conn.execute(sql, (config_id, args.company_id, enc_publishable, enc_secret,
+         enc_webhook, mode, "active", now_ts, now_ts))
     conn.commit()
     audit(conn, SKILL_NAME, "configure-stripe", "stripe_config", config_id,
           new_values={"company_id": args.company_id, "mode": mode})
 
-    config = row_to_dict(conn.execute(
-        "SELECT id, company_id, mode, status, created_at FROM stripe_config WHERE id = ?",
-        (config_id,),
-    ).fetchone())
+    sc2 = Table("stripe_config")
+    q = (Q.from_(sc2).select(sc2.id, sc2.company_id, sc2.mode, sc2.status, sc2.created_at)
+         .where(sc2.id == P()))
+    config = row_to_dict(conn.execute(q.get_sql(), (config_id,)).fetchone())
     ok({"stripe_config": config,
         "message": f"Stripe configured for company {company['name']} in {mode} mode"})
 
@@ -651,20 +660,18 @@ def create_payment_intent(conn, args):
         err("Amount must be greater than zero")
 
     # Look up the sales invoice
-    invoice = conn.execute(
-        "SELECT id, customer_id, grand_total, currency, status "
-        "FROM sales_invoice WHERE id = ?",
-        (args.invoice_id,),
-    ).fetchone()
+    si = Table("sales_invoice")
+    q = (Q.from_(si).select(si.id, si.customer_id, si.grand_total, si.currency, si.status)
+         .where(si.id == P()))
+    invoice = conn.execute(q.get_sql(), (args.invoice_id,)).fetchone()
     if not invoice:
         err(f"Sales invoice not found: {args.invoice_id}",
             suggestion="Use erpclaw-selling 'list-sales-invoices' to find valid invoice IDs.")
 
     # Resolve company from customer
-    customer = conn.execute(
-        "SELECT company_id FROM customer WHERE id = ?",
-        (invoice["customer_id"],),
-    ).fetchone()
+    cust = Table("customer")
+    q = Q.from_(cust).select(cust.company_id).where(cust.id == P())
+    customer = conn.execute(q.get_sql(), (invoice["customer_id"],)).fetchone()
     if not customer:
         err(f"Customer not found for invoice {args.invoice_id}")
 
@@ -678,26 +685,25 @@ def create_payment_intent(conn, args):
     metadata = args.metadata or None
 
     intent_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO stripe_payment_intent
-           (id, company_id, stripe_id, amount, currency, customer_id,
-            sales_invoice_id, status, payment_entry_id, metadata,
-            created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'created', NULL, ?, ?, ?)""",
-        (intent_id, company_id, stripe_id, str(round_currency(amount)),
+    now_ts = _now()
+    sql, _ = insert_row("stripe_payment_intent", {
+        "id": P(), "company_id": P(), "stripe_id": P(),
+        "amount": P(), "currency": P(), "customer_id": P(),
+        "sales_invoice_id": P(), "status": P(), "payment_entry_id": P(),
+        "metadata": P(), "created_at": P(), "updated_at": P(),
+    })
+    conn.execute(sql, (intent_id, company_id, stripe_id, str(round_currency(amount)),
          currency, invoice["customer_id"], args.invoice_id,
-         metadata, _now(), _now()),
-    )
+         "created", None, metadata, now_ts, now_ts))
     conn.commit()
     audit(conn, SKILL_NAME, "create-payment-intent",
           "stripe_payment_intent", intent_id,
           new_values={"stripe_id": stripe_id, "amount": str(amount),
                       "invoice_id": args.invoice_id})
 
-    intent = row_to_dict(conn.execute(
-        "SELECT * FROM stripe_payment_intent WHERE id = ?",
-        (intent_id,),
-    ).fetchone())
+    spi = Table("stripe_payment_intent")
+    q = Q.from_(spi).select(spi.star).where(spi.id == P())
+    intent = row_to_dict(conn.execute(q.get_sql(), (intent_id,)).fetchone())
     ok({"payment_intent": intent})
 
 
@@ -714,22 +720,21 @@ def sync_payments(conn, args):
     _stripe_get_config(conn, args.company_id)
 
     # Find all created/processing intents for this company
-    pending = conn.execute(
-        """SELECT * FROM stripe_payment_intent
-           WHERE company_id = ? AND status IN ('created', 'processing')""",
-        (args.company_id,),
-    ).fetchall()
+    spi = Table("stripe_payment_intent")
+    q = (Q.from_(spi).select(spi.star)
+         .where(spi.company_id == P())
+         .where(spi.status.isin([ValueWrapper("created"), ValueWrapper("processing")])))
+    pending = conn.execute(q.get_sql(), (args.company_id,)).fetchall()
 
     synced = []
     for pi in pending:
         pi_dict = row_to_dict(pi)
         # Mock: all pending intents succeed
-        conn.execute(
-            """UPDATE stripe_payment_intent
-               SET status = 'succeeded', updated_at = ?
-               WHERE id = ?""",
-            (_now(), pi_dict["id"]),
-        )
+        q_upd = (Q.update(spi)
+                 .set(spi.status, ValueWrapper("succeeded"))
+                 .set(spi.updated_at, P())
+                 .where(spi.id == P()))
+        conn.execute(q_upd.get_sql(), (_now(), pi_dict["id"]))
         synced.append({
             "id": pi_dict["id"],
             "stripe_id": pi_dict["stripe_id"],
@@ -774,15 +779,13 @@ def handle_webhook(conn, args):
         err("--payload must be valid JSON")
 
     # Check for duplicate event (idempotency)
-    existing = conn.execute(
-        "SELECT id, processed FROM stripe_webhook_event WHERE stripe_event_id = ?",
-        (args.event_id,),
-    ).fetchone()
+    swe = Table("stripe_webhook_event")
+    q = (Q.from_(swe).select(swe.id, swe.processed)
+         .where(swe.stripe_event_id == P()))
+    existing = conn.execute(q.get_sql(), (args.event_id,)).fetchone()
     if existing:
-        evt = row_to_dict(conn.execute(
-            "SELECT * FROM stripe_webhook_event WHERE id = ?",
-            (existing["id"],),
-        ).fetchone())
+        q2 = Q.from_(swe).select(swe.star).where(swe.id == P())
+        evt = row_to_dict(conn.execute(q2.get_sql(), (existing["id"],)).fetchone())
         ok({"webhook_event": evt, "deduplicated": True,
             "message": "Duplicate webhook event -- already processed"})
 
@@ -793,20 +796,19 @@ def handle_webhook(conn, args):
     processed_at = None
 
     # Process based on event type
+    spi = Table("stripe_payment_intent")
     if args.event_type == "payment_intent.succeeded":
         stripe_pi_id = payload_data.get("payment_intent_id") or payload_data.get("stripe_id")
         if stripe_pi_id:
-            pi = conn.execute(
-                "SELECT id, status FROM stripe_payment_intent WHERE stripe_id = ?",
-                (stripe_pi_id,),
-            ).fetchone()
+            q = (Q.from_(spi).select(spi.id, spi.status)
+                 .where(spi.stripe_id == P()))
+            pi = conn.execute(q.get_sql(), (stripe_pi_id,)).fetchone()
             if pi:
-                conn.execute(
-                    """UPDATE stripe_payment_intent
-                       SET status = 'succeeded', updated_at = ?
-                       WHERE id = ?""",
-                    (_now(), pi["id"]),
-                )
+                q_upd = (Q.update(spi)
+                         .set(spi.status, ValueWrapper("succeeded"))
+                         .set(spi.updated_at, P())
+                         .where(spi.id == P()))
+                conn.execute(q_upd.get_sql(), (_now(), pi["id"]))
                 processed = 1
                 processed_at = _now()
             else:
@@ -817,17 +819,14 @@ def handle_webhook(conn, args):
     elif args.event_type == "payment_intent.payment_failed":
         stripe_pi_id = payload_data.get("payment_intent_id") or payload_data.get("stripe_id")
         if stripe_pi_id:
-            pi = conn.execute(
-                "SELECT id FROM stripe_payment_intent WHERE stripe_id = ?",
-                (stripe_pi_id,),
-            ).fetchone()
+            q = Q.from_(spi).select(spi.id).where(spi.stripe_id == P())
+            pi = conn.execute(q.get_sql(), (stripe_pi_id,)).fetchone()
             if pi:
-                conn.execute(
-                    """UPDATE stripe_payment_intent
-                       SET status = 'failed', updated_at = ?
-                       WHERE id = ?""",
-                    (_now(), pi["id"]),
-                )
+                q_upd = (Q.update(spi)
+                         .set(spi.status, ValueWrapper("failed"))
+                         .set(spi.updated_at, P())
+                         .where(spi.id == P()))
+                conn.execute(q_upd.get_sql(), (_now(), pi["id"]))
                 processed = 1
                 processed_at = _now()
             else:
@@ -839,14 +838,13 @@ def handle_webhook(conn, args):
         # Unknown event type -- store but mark as unprocessed
         error_message = f"Unhandled event type: {args.event_type}"
 
-    conn.execute(
-        """INSERT INTO stripe_webhook_event
-           (id, stripe_event_id, event_type, payload, processed,
-            processed_at, error_message, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (webhook_id, args.event_id, args.event_type, args.payload,
-         processed, processed_at, error_message, _now()),
-    )
+    sql, _ = insert_row("stripe_webhook_event", {
+        "id": P(), "stripe_event_id": P(), "event_type": P(),
+        "payload": P(), "processed": P(),
+        "processed_at": P(), "error_message": P(), "created_at": P(),
+    })
+    conn.execute(sql, (webhook_id, args.event_id, args.event_type, args.payload,
+         processed, processed_at, error_message, _now()))
     conn.commit()
     audit(conn, SKILL_NAME, "handle-webhook",
           "stripe_webhook_event", webhook_id,
@@ -854,48 +852,48 @@ def handle_webhook(conn, args):
                       "stripe_event_id": args.event_id,
                       "processed": processed})
 
-    evt = row_to_dict(conn.execute(
-        "SELECT * FROM stripe_webhook_event WHERE id = ?",
-        (webhook_id,),
-    ).fetchone())
+    q = Q.from_(swe).select(swe.star).where(swe.id == P())
+    evt = row_to_dict(conn.execute(q.get_sql(), (webhook_id,)).fetchone())
     ok({"webhook_event": evt, "deduplicated": False})
 
 
 def list_stripe_payments(conn, args):
     """List payment intents with optional filters."""
-    where, params = [], []
+    spi = Table("stripe_payment_intent")
+    c = Table("customer")
+    params = []
 
-    if args.company_id:
-        where.append("spi.company_id = ?")
-        params.append(args.company_id)
     if args.status:
         if args.status not in ("created", "processing", "succeeded", "failed", "cancelled"):
             err(f"Invalid status: {args.status}. "
                 "Must be one of: created, processing, succeeded, failed, cancelled")
-        where.append("spi.status = ?")
+
+    # Build base query with optional filters
+    q_base = Q.from_(spi)
+    if args.company_id:
+        q_base = q_base.where(spi.company_id == P())
+        params.append(args.company_id)
+    if args.status:
+        q_base = q_base.where(spi.status == P())
         params.append(args.status)
     if args.invoice_id:
-        where.append("spi.sales_invoice_id = ?")
+        q_base = q_base.where(spi.sales_invoice_id == P())
         params.append(args.invoice_id)
 
-    where_clause = f"WHERE {' AND '.join(where)}" if where else ""
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
 
-    total_count = conn.execute(
-        f"SELECT COUNT(*) AS cnt FROM stripe_payment_intent spi {where_clause}",
-        params,
-    ).fetchone()["cnt"]
+    # Count query
+    q_count = q_base.select(fn.Count("*").as_("cnt"))
+    total_count = conn.execute(q_count.get_sql(), params).fetchone()["cnt"]
 
-    rows = conn.execute(
-        f"""SELECT spi.*, c.name AS customer_name
-            FROM stripe_payment_intent spi
-            LEFT JOIN customer c ON spi.customer_id = c.id
-            {where_clause}
-            ORDER BY spi.created_at DESC
-            LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
+    # Data query with LEFT JOIN for customer name
+    q_data = (q_base
+              .left_join(c).on(spi.customer_id == c.id)
+              .select(spi.star, c.name.as_("customer_name"))
+              .orderby(spi.created_at, order=Order.desc)
+              .limit(P()).offset(P()))
+    rows = conn.execute(q_data.get_sql(), params + [limit, offset]).fetchall()
 
     ok({
         "payment_intents": [dict(r) for r in rows],
@@ -908,46 +906,41 @@ def list_stripe_payments(conn, args):
 
 def stripe_status(conn, args):
     """Stripe integration summary."""
-    where_pi = ""
-    params_pi = []
-
     if args.company_id:
-        company = conn.execute(
-            "SELECT id FROM company WHERE id = ?", (args.company_id,)
-        ).fetchone()
+        co = Table("company")
+        q = Q.from_(co).select(co.id).where(co.id == P())
+        company = conn.execute(q.get_sql(), (args.company_id,)).fetchone()
         if not company:
             err(f"Company not found: {args.company_id}")
-        where_pi = "WHERE company_id = ?"
-        params_pi = [args.company_id]
 
     # Config count
+    sc = Table("stripe_config")
+    q_cfg = Q.from_(sc).select(fn.Count("*").as_("cnt"))
     if args.company_id:
-        config_count = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM stripe_config WHERE company_id = ?",
-            (args.company_id,),
-        ).fetchone()["cnt"]
+        q_cfg = q_cfg.where(sc.company_id == P())
+        config_count = conn.execute(q_cfg.get_sql(), (args.company_id,)).fetchone()["cnt"]
     else:
-        config_count = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM stripe_config"
-        ).fetchone()["cnt"]
+        config_count = conn.execute(q_cfg.get_sql()).fetchone()["cnt"]
 
     # Payment intent counts by status
-    pi_q = f"""SELECT status, COUNT(*) AS cnt
-               FROM stripe_payment_intent {where_pi}
-               GROUP BY status"""
+    spi = Table("stripe_payment_intent")
+    q_pi = Q.from_(spi).select(spi.status, fn.Count("*").as_("cnt")).groupby(spi.status)
+    params_pi = []
+    if args.company_id:
+        q_pi = q_pi.where(spi.company_id == P())
+        params_pi = [args.company_id]
     pi_counts = {}
-    for row in conn.execute(pi_q, params_pi).fetchall():
+    for row in conn.execute(q_pi.get_sql(), params_pi).fetchall():
         pi_counts[row["status"]] = row["cnt"]
 
     pi_total = sum(pi_counts.values())
 
     # Webhook event counts
-    wh_total = conn.execute(
-        "SELECT COUNT(*) AS cnt FROM stripe_webhook_event"
-    ).fetchone()["cnt"]
-    wh_processed = conn.execute(
-        "SELECT COUNT(*) AS cnt FROM stripe_webhook_event WHERE processed = 1"
-    ).fetchone()["cnt"]
+    swe_t = Table("stripe_webhook_event")
+    q_wh = Q.from_(swe_t).select(fn.Count("*").as_("cnt"))
+    wh_total = conn.execute(q_wh.get_sql()).fetchone()["cnt"]
+    q_wh_proc = Q.from_(swe_t).select(fn.Count("*").as_("cnt")).where(swe_t.processed == 1)
+    wh_processed = conn.execute(q_wh_proc.get_sql()).fetchone()["cnt"]
     wh_unprocessed = wh_total - wh_processed
 
     return {
@@ -1007,9 +1000,9 @@ def _s3_generate_s3_key(prefix):
 
 def _s3_validate_company_exists(conn, company_id):
     """Validate that a company exists, or error."""
-    row = conn.execute(
-        "SELECT id, name FROM company WHERE id = ?", (company_id,)
-    ).fetchone()
+    co = Table("company")
+    q = Q.from_(co).select(co.id, co.name).where(co.id == P())
+    row = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not row:
         err(f"Company not found: {company_id}")
     return row
@@ -1017,17 +1010,18 @@ def _s3_validate_company_exists(conn, company_id):
 
 def _s3_get_config(conn, company_id):
     """Fetch the active S3 config for a company, or None."""
-    return conn.execute(
-        "SELECT * FROM s3_config WHERE company_id = ? AND status = 'active'",
-        (company_id,),
-    ).fetchone()
+    s3c = Table("s3_config")
+    q = (Q.from_(s3c).select(s3c.star)
+         .where(s3c.company_id == P())
+         .where(s3c.status == ValueWrapper("active")))
+    return conn.execute(q.get_sql(), (company_id,)).fetchone()
 
 
 def _s3_validate_backup_exists(conn, backup_id):
     """Fetch a backup record by ID, or error if not found."""
-    row = conn.execute(
-        "SELECT * FROM s3_backup_record WHERE id = ?", (backup_id,)
-    ).fetchone()
+    s3b = Table("s3_backup_record")
+    q = Q.from_(s3b).select(s3b.star).where(s3b.id == P())
+    row = conn.execute(q.get_sql(), (backup_id,)).fetchone()
     if not row:
         err(f"Backup record not found: {backup_id}")
     return row
@@ -1055,9 +1049,9 @@ def configure_s3(conn, args):
     _s3_validate_company_exists(conn, args.company_id)
 
     # Check for existing config
-    existing = conn.execute(
-        "SELECT id FROM s3_config WHERE company_id = ?", (args.company_id,)
-    ).fetchone()
+    s3c = Table("s3_config")
+    q = Q.from_(s3c).select(s3c.id).where(s3c.company_id == P())
+    existing = conn.execute(q.get_sql(), (args.company_id,)).fetchone()
     if existing:
         err("S3 configuration already exists for this company. "
             "Delete the existing config before reconfiguring.")
@@ -1074,14 +1068,13 @@ def configure_s3(conn, args):
     enc_secret_key = encrypt_field(args.secret_access_key, _fk)
 
     config_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO s3_config
-           (id, company_id, bucket_name, region, access_key_id,
-            secret_access_key, prefix, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'active')""",
-        (config_id, args.company_id, args.bucket_name, region,
-         enc_access_key, enc_secret_key, prefix),
-    )
+    sql, _ = insert_row("s3_config", {
+        "id": P(), "company_id": P(), "bucket_name": P(),
+        "region": P(), "access_key_id": P(),
+        "secret_access_key": P(), "prefix": P(), "status": P(),
+    })
+    conn.execute(sql, (config_id, args.company_id, args.bucket_name, region,
+         enc_access_key, enc_secret_key, prefix, "active"))
 
     audit(conn, SKILL_NAME, "configure-s3", "s3_config", config_id,
           new_values={"bucket_name": args.bucket_name, "region": region},
@@ -1137,14 +1130,13 @@ def upload_backup(conn, args):
         err("--backup-type must be 'full' or 'incremental'")
 
     record_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO s3_backup_record
-           (id, company_id, s3_key, file_size_bytes, backup_type,
-            encrypted, checksum, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'completed')""",
-        (record_id, args.company_id, s3_key, file_size,
-         backup_type, encrypted, checksum),
-    )
+    sql, _ = insert_row("s3_backup_record", {
+        "id": P(), "company_id": P(), "s3_key": P(),
+        "file_size_bytes": P(), "backup_type": P(),
+        "encrypted": P(), "checksum": P(), "status": P(),
+    })
+    conn.execute(sql, (record_id, args.company_id, s3_key, file_size,
+         backup_type, encrypted, checksum, "completed"))
 
     audit(conn, SKILL_NAME, "upload-backup", "s3_backup_record", record_id,
           new_values={"s3_key": s3_key, "file_size_bytes": file_size,
@@ -1180,29 +1172,31 @@ def list_remote_backups(conn, args):
 
     _s3_validate_company_exists(conn, args.company_id)
 
-    query = "SELECT * FROM s3_backup_record WHERE company_id = ?"
+    s3b = Table("s3_backup_record")
     params = [args.company_id]
+
+    q_base = Q.from_(s3b).where(s3b.company_id == P())
 
     if args.status:
         if args.status not in ("uploading", "completed", "failed", "deleted"):
             err("--status must be one of: uploading, completed, failed, deleted")
-        query += " AND status = ?"
+        q_base = q_base.where(s3b.status == P())
         params.append(args.status)
     else:
         # By default, exclude deleted backups
-        query += " AND status != 'deleted'"
+        q_base = q_base.where(s3b.status != ValueWrapper("deleted"))
 
     # Count
-    count_query = query.replace("SELECT *", "SELECT COUNT(*) AS cnt", 1)
-    total = conn.execute(count_query, params).fetchone()["cnt"]
+    q_count = q_base.select(fn.Count("*").as_("cnt"))
+    total = conn.execute(q_count.get_sql(), params).fetchone()["cnt"]
 
     # Paginate
-    query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
     limit = int(args.limit or 20)
     offset = int(args.offset or 0)
-    params.extend([limit, offset])
-
-    rows = conn.execute(query, params).fetchall()
+    q_data = (q_base.select(s3b.star)
+              .orderby(s3b.created_at, order=Order.desc)
+              .limit(P()).offset(P()))
+    rows = conn.execute(q_data.get_sql(), params + [limit, offset]).fetchall()
     backups = rows_to_list(rows)
 
     ok({
@@ -1281,10 +1275,11 @@ def delete_remote_backup(conn, args):
         err("Backup is already deleted")
 
     old_status = backup["status"]
-    conn.execute(
-        "UPDATE s3_backup_record SET status = 'deleted' WHERE id = ?",
-        (args.backup_id,),
-    )
+    s3b = Table("s3_backup_record")
+    q = (Q.update(s3b)
+         .set(s3b.status, ValueWrapper("deleted"))
+         .where(s3b.id == P()))
+    conn.execute(q.get_sql(), (args.backup_id,))
 
     audit(conn, SKILL_NAME, "delete-remote-backup", "s3_backup_record",
           args.backup_id,
@@ -1304,23 +1299,24 @@ def delete_remote_backup(conn, args):
 
 def s3_status(conn, args):
     """Return S3 backup status summary."""
-    config_count = conn.execute(
-        "SELECT COUNT(*) AS cnt FROM s3_config WHERE status = 'active'"
-    ).fetchone()["cnt"]
+    s3c = Table("s3_config")
+    q = (Q.from_(s3c).select(fn.Count("*").as_("cnt"))
+         .where(s3c.status == ValueWrapper("active")))
+    config_count = conn.execute(q.get_sql()).fetchone()["cnt"]
 
-    backup_rows = conn.execute(
-        """SELECT status, COUNT(*) AS cnt
-           FROM s3_backup_record
-           GROUP BY status"""
-    ).fetchall()
+    s3b = Table("s3_backup_record")
+    q = (Q.from_(s3b)
+         .select(s3b.status, fn.Count("*").as_("cnt"))
+         .groupby(s3b.status))
+    backup_rows = conn.execute(q.get_sql()).fetchall()
     backups_by_status = {r["status"]: r["cnt"] for r in backup_rows}
     total_backups = sum(backups_by_status.values())
 
     # Total size of completed backups
-    size_row = conn.execute(
-        """SELECT COALESCE(SUM(file_size_bytes), 0) AS total_bytes
-           FROM s3_backup_record WHERE status = 'completed'"""
-    ).fetchone()
+    q = (Q.from_(s3b)
+         .select(fn.Coalesce(fn.Sum(s3b.file_size_bytes), 0).as_("total_bytes"))
+         .where(s3b.status == ValueWrapper("completed")))
+    size_row = conn.execute(q.get_sql()).fetchone()
     total_size_bytes = size_row["total_bytes"]
 
     return {

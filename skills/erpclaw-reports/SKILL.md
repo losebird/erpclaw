@@ -4,7 +4,7 @@ version: 1.0.0
 description: Financial reporting and analytics for ERPClaw — trial balance, P&L, balance sheet, cash flow, general ledger, aging, budget variance, tax summary, payment summary, and comparative analysis
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-reports
 tier: 2
 category: accounting
 requires: [erpclaw-setup, erpclaw-gl, erpclaw-journals, erpclaw-payments, erpclaw-tax]

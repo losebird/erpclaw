@@ -4,7 +4,7 @@ version: 1.0.0
 description: Payment entry management with allocation, reconciliation, and bank reconciliation for ERPClaw ERP
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw
+source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-payments
 tier: 2
 category: accounting
 requires: [erpclaw-setup, erpclaw-gl]

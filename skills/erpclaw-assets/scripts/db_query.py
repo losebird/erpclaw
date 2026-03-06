@@ -28,6 +28,8 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
+    from erpclaw_lib.query import Q, P, Table, Field, fn, Case, Order, Criterion, Not, NULL, DecimalSum, DecimalAbs
+    from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
@@ -55,27 +57,31 @@ def _parse_json_arg(value, name):
 
 def _get_fiscal_year(conn, posting_date: str) -> str | None:
     """Return the fiscal year name for a posting date, or None."""
-    fy = conn.execute(
-        "SELECT name FROM fiscal_year WHERE start_date <= ? AND end_date >= ? AND is_closed = 0",
-        (posting_date, posting_date),
-    ).fetchone()
+    t = Table("fiscal_year")
+    q = (Q.from_(t).select(t.name)
+         .where(t.start_date <= P())
+         .where(t.end_date >= P())
+         .where(t.is_closed == 0))
+    fy = conn.execute(q.get_sql(), (posting_date, posting_date)).fetchone()
     return fy["name"] if fy else None
 
 
 def _get_cost_center(conn, company_id: str) -> str | None:
     """Return the first non-group cost center for a company, or None."""
-    cc = conn.execute(
-        "SELECT id FROM cost_center WHERE company_id = ? AND is_group = 0 LIMIT 1",
-        (company_id,),
-    ).fetchone()
+    t = Table("cost_center")
+    q = (Q.from_(t).select(t.id)
+         .where(t.company_id == P())
+         .where(t.is_group == 0)
+         .limit(1))
+    cc = conn.execute(q.get_sql(), (company_id,)).fetchone()
     return cc["id"] if cc else None
 
 
 def _validate_company_exists(conn, company_id: str):
     """Validate that a company exists and return the row, or error."""
-    company = conn.execute(
-        "SELECT id FROM company WHERE id = ?", (company_id,),
-    ).fetchone()
+    t = Table("company")
+    q = Q.from_(t).select(t.id).where(t.id == P())
+    company = conn.execute(q.get_sql(), (company_id,)).fetchone()
     if not company:
         err(f"Company {company_id} not found")
     return company
@@ -83,7 +89,9 @@ def _validate_company_exists(conn, company_id: str):
 
 def _validate_asset_exists(conn, asset_id: str):
     """Validate that an asset exists and return the row, or error."""
-    asset = conn.execute("SELECT * FROM asset WHERE id = ?", (asset_id,)).fetchone()
+    t = Table("asset")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    asset = conn.execute(q.get_sql(), (asset_id,)).fetchone()
     if not asset:
         err(f"Asset {asset_id} not found",
              suggestion="Use 'list assets' to see available assets.")
@@ -92,9 +100,9 @@ def _validate_asset_exists(conn, asset_id: str):
 
 def _validate_asset_category_exists(conn, category_id: str):
     """Validate that an asset category exists and return the row, or error."""
-    cat = conn.execute(
-        "SELECT * FROM asset_category WHERE id = ?", (category_id,),
-    ).fetchone()
+    t = Table("asset_category")
+    q = Q.from_(t).select(t.star).where(t.id == P())
+    cat = conn.execute(q.get_sql(), (category_id,)).fetchone()
     if not cat:
         err(f"Asset category {category_id} not found")
     return cat
@@ -152,37 +160,44 @@ def add_asset_category(conn, args):
         err("--useful-life-years must be greater than 0")
 
     # Validate account references if provided
+    acct_t = Table("account")
+    _acct_q = Q.from_(acct_t).select(acct_t.id).where(
+        (acct_t.id == P()) | (acct_t.name == P())
+    )
+    _acct_sql = _acct_q.get_sql()
+
     if args.asset_account_id:
-        acct = conn.execute("SELECT id FROM account WHERE id = ? OR name = ?", (args.asset_account_id, args.asset_account_id)).fetchone()
+        acct = conn.execute(_acct_sql, (args.asset_account_id, args.asset_account_id)).fetchone()
         if not acct:
             err(f"Asset account {args.asset_account_id} not found")
         args.asset_account_id = acct["id"]
     if args.depreciation_account_id:
-        acct = conn.execute("SELECT id FROM account WHERE id = ? OR name = ?", (args.depreciation_account_id, args.depreciation_account_id)).fetchone()
+        acct = conn.execute(_acct_sql, (args.depreciation_account_id, args.depreciation_account_id)).fetchone()
         if not acct:
             err(f"Depreciation account {args.depreciation_account_id} not found")
         args.depreciation_account_id = acct["id"]
     if args.accumulated_depreciation_account_id:
-        acct = conn.execute("SELECT id FROM account WHERE id = ? OR name = ?", (args.accumulated_depreciation_account_id, args.accumulated_depreciation_account_id)).fetchone()
+        acct = conn.execute(_acct_sql, (args.accumulated_depreciation_account_id, args.accumulated_depreciation_account_id)).fetchone()
         if not acct:
             err(f"Accumulated depreciation account {args.accumulated_depreciation_account_id} not found")
         args.accumulated_depreciation_account_id = acct["id"]
 
     # Check for duplicate name in same company
-    existing = conn.execute(
-        "SELECT id FROM asset_category WHERE name = ? AND company_id = ?",
-        (args.name, args.company_id),
-    ).fetchone()
+    ac_t = Table("asset_category")
+    dup_q = (Q.from_(ac_t).select(ac_t.id)
+             .where(ac_t.name == P())
+             .where(ac_t.company_id == P()))
+    existing = conn.execute(dup_q.get_sql(), (args.name, args.company_id)).fetchone()
     if existing:
         err(f"Asset category '{args.name}' already exists in this company")
 
     cat_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO asset_category
-           (id, name, depreciation_method, useful_life_years,
-            asset_account_id, depreciation_account_id,
-            accumulated_depreciation_account_id, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+    ins_q = (Q.into(ac_t)
+             .columns("id", "name", "depreciation_method", "useful_life_years",
+                       "asset_account_id", "depreciation_account_id",
+                       "accumulated_depreciation_account_id", "company_id")
+             .insert(P(), P(), P(), P(), P(), P(), P(), P()))
+    conn.execute(ins_q.get_sql(),
         (cat_id, args.name, method, useful_life,
          args.asset_account_id, args.depreciation_account_id,
          args.accumulated_depreciation_account_id, args.company_id),
@@ -214,17 +229,17 @@ def list_asset_categories(conn, args):
     limit = int(args.limit or "20")
     offset = int(args.offset or "0")
 
-    count_row = conn.execute(
-        "SELECT COUNT(*) AS cnt FROM asset_category WHERE company_id = ?",
-        (args.company_id,),
-    ).fetchone()
+    ac_t = Table("asset_category")
+    cnt_q = (Q.from_(ac_t).select(fn.Count("*").as_("cnt"))
+             .where(ac_t.company_id == P()))
+    count_row = conn.execute(cnt_q.get_sql(), (args.company_id,)).fetchone()
     total = count_row["cnt"]
 
-    rows = conn.execute(
-        """SELECT * FROM asset_category WHERE company_id = ?
-           ORDER BY name LIMIT ? OFFSET ?""",
-        (args.company_id, limit, offset),
-    ).fetchall()
+    list_q = (Q.from_(ac_t).select(ac_t.star)
+              .where(ac_t.company_id == P())
+              .orderby(ac_t.name)
+              .limit(P()).offset(P()))
+    rows = conn.execute(list_q.get_sql(), (args.company_id, limit, offset)).fetchall()
 
     categories = [row_to_dict(r) for r in rows]
     ok({"categories": categories, "total": total, "limit": limit, "offset": offset,
@@ -284,7 +299,9 @@ def add_asset(conn, args):
 
     # Validate item reference if provided
     if args.item_id:
-        item = conn.execute("SELECT id FROM item WHERE id = ?", (args.item_id,)).fetchone()
+        item_t = Table("item")
+        item_q = Q.from_(item_t).select(item_t.id).where(item_t.id == P())
+        item = conn.execute(item_q.get_sql(), (args.item_id,)).fetchone()
         if not item:
             err(f"Item {args.item_id} not found")
 
@@ -294,15 +311,17 @@ def add_asset(conn, args):
     asset_id = str(uuid.uuid4())
     current_book_value = str(round_currency(gross_value))
 
-    conn.execute(
-        """INSERT INTO asset
-           (id, naming_series, asset_name, asset_category_id, item_id,
-            purchase_date, purchase_invoice_id, gross_value, salvage_value,
-            depreciation_method, useful_life_years, depreciation_start_date,
-            current_book_value, accumulated_depreciation, status,
-            location, custodian_employee_id, warranty_expiry_date, company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '0', 'draft',
-                   ?, ?, ?, ?)""",
+    asset_t = Table("asset")
+    ins_q = (Q.into(asset_t)
+             .columns("id", "naming_series", "asset_name", "asset_category_id", "item_id",
+                       "purchase_date", "purchase_invoice_id", "gross_value", "salvage_value",
+                       "depreciation_method", "useful_life_years", "depreciation_start_date",
+                       "current_book_value", "accumulated_depreciation", "status",
+                       "location", "custodian_employee_id", "warranty_expiry_date", "company_id")
+             .insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(),
+                     P(), ValueWrapper("0"), ValueWrapper("draft"),
+                     P(), P(), P(), P()))
+    conn.execute(ins_q.get_sql(),
         (asset_id, naming, args.name, args.asset_category_id, args.item_id,
          args.purchase_date, args.purchase_invoice_id,
          str(round_currency(gross_value)), str(round_currency(salvage_value)),
@@ -390,6 +409,7 @@ def update_asset(conn, args):
     updates.append("updated_at = datetime('now')")
     params.append(args.asset_id)
 
+    # raw SQL — dynamic column building based on which args are provided
     conn.execute(
         f"UPDATE asset SET {', '.join(updates)} WHERE id = ?",
         params,
@@ -420,44 +440,39 @@ def get_asset(conn, args):
     asset_dict = row_to_dict(asset)
 
     # Fetch depreciation schedule
-    schedule_rows = conn.execute(
-        """SELECT * FROM depreciation_schedule
-           WHERE asset_id = ?
-           ORDER BY schedule_date""",
-        (args.asset_id,),
-    ).fetchall()
+    ds_t = Table("depreciation_schedule")
+    ds_q = (Q.from_(ds_t).select(ds_t.star)
+            .where(ds_t.asset_id == P())
+            .orderby(ds_t.schedule_date))
+    schedule_rows = conn.execute(ds_q.get_sql(), (args.asset_id,)).fetchall()
     asset_dict["depreciation_schedule"] = [row_to_dict(r) for r in schedule_rows]
 
     # Fetch asset movements
-    movement_rows = conn.execute(
-        """SELECT * FROM asset_movement
-           WHERE asset_id = ?
-           ORDER BY movement_date DESC""",
-        (args.asset_id,),
-    ).fetchall()
+    am_t = Table("asset_movement")
+    am_q = (Q.from_(am_t).select(am_t.star)
+            .where(am_t.asset_id == P())
+            .orderby(am_t.movement_date, order=Order.desc))
+    movement_rows = conn.execute(am_q.get_sql(), (args.asset_id,)).fetchall()
     asset_dict["movements"] = [row_to_dict(r) for r in movement_rows]
 
     # Fetch maintenance records
-    maintenance_rows = conn.execute(
-        """SELECT * FROM asset_maintenance
-           WHERE asset_id = ?
-           ORDER BY scheduled_date DESC""",
-        (args.asset_id,),
-    ).fetchall()
+    mnt_t = Table("asset_maintenance")
+    mnt_q = (Q.from_(mnt_t).select(mnt_t.star)
+             .where(mnt_t.asset_id == P())
+             .orderby(mnt_t.scheduled_date, order=Order.desc))
+    maintenance_rows = conn.execute(mnt_q.get_sql(), (args.asset_id,)).fetchall()
     asset_dict["maintenance"] = [row_to_dict(r) for r in maintenance_rows]
 
     # Fetch disposal record if any
-    disposal_row = conn.execute(
-        "SELECT * FROM asset_disposal WHERE asset_id = ?",
-        (args.asset_id,),
-    ).fetchone()
+    ad_t = Table("asset_disposal")
+    ad_q = Q.from_(ad_t).select(ad_t.star).where(ad_t.asset_id == P())
+    disposal_row = conn.execute(ad_q.get_sql(), (args.asset_id,)).fetchone()
     asset_dict["disposal"] = row_to_dict(disposal_row) if disposal_row else None
 
     # Fetch category info
-    cat_row = conn.execute(
-        "SELECT * FROM asset_category WHERE id = ?",
-        (asset_dict["asset_category_id"],),
-    ).fetchone()
+    ac_t = Table("asset_category")
+    ac_q = Q.from_(ac_t).select(ac_t.star).where(ac_t.id == P())
+    cat_row = conn.execute(ac_q.get_sql(), (asset_dict["asset_category_id"],)).fetchone()
     asset_dict["category"] = row_to_dict(cat_row) if cat_row else None
 
     ok({"asset": asset_dict})
@@ -473,45 +488,47 @@ def list_assets(conn, args):
     Optional: --company-id, --asset-category-id, --status, --search,
               --limit, --offset
     """
-    conditions = []
+    a = Table("asset").as_("a")
+    ac = Table("asset_category").as_("ac")
     params = []
 
+    # Build dynamic WHERE with PyPika
+    cnt_q = Q.from_(a).select(fn.Count("*").as_("cnt"))
     if args.company_id:
-        conditions.append("a.company_id = ?")
+        cnt_q = cnt_q.where(a.company_id == P())
         params.append(args.company_id)
-
     if args.asset_category_id:
-        conditions.append("a.asset_category_id = ?")
+        cnt_q = cnt_q.where(a.asset_category_id == P())
         params.append(args.asset_category_id)
-
     if args.status:
-        conditions.append("a.status = ?")
+        cnt_q = cnt_q.where(a.status == P())
         params.append(args.status)
-
     if args.search:
-        conditions.append("a.asset_name LIKE ?")
+        cnt_q = cnt_q.where(a.asset_name.like(P()))
         params.append(f"%{args.search}%")
 
-    where = " AND ".join(conditions) if conditions else "1=1"
     limit = int(args.limit or "20")
     offset = int(args.offset or "0")
 
     # Get total count
-    count_row = conn.execute(
-        f"SELECT COUNT(*) as cnt FROM asset a WHERE {where}", params,
-    ).fetchone()
+    count_row = conn.execute(cnt_q.get_sql(), params).fetchone()
     total = count_row["cnt"]
 
-    # Fetch assets
-    rows = conn.execute(
-        f"""SELECT a.*, ac.name as category_name
-            FROM asset a
-            LEFT JOIN asset_category ac ON ac.id = a.asset_category_id
-            WHERE {where}
-            ORDER BY a.created_at DESC
-            LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
+    # Fetch assets with JOIN
+    list_q = (Q.from_(a).select(a.star, ac.name.as_("category_name"))
+              .left_join(ac).on(ac.id == a.asset_category_id))
+    if args.company_id:
+        list_q = list_q.where(a.company_id == P())
+    if args.asset_category_id:
+        list_q = list_q.where(a.asset_category_id == P())
+    if args.status:
+        list_q = list_q.where(a.status == P())
+    if args.search:
+        list_q = list_q.where(a.asset_name.like(P()))
+    list_q = (list_q.orderby(a.created_at, order=Order.desc)
+              .limit(P()).offset(P()))
+
+    rows = conn.execute(list_q.get_sql(), params + [limit, offset]).fetchall()
 
     assets = [row_to_dict(r) for r in rows]
     ok({"assets": assets, "total": total, "limit": limit, "offset": offset,
@@ -563,10 +580,11 @@ def generate_depreciation_schedule(conn, args):
     total_months = useful_life * 12
 
     # Delete existing pending schedule entries (allow regeneration)
-    conn.execute(
-        "DELETE FROM depreciation_schedule WHERE asset_id = ? AND status = 'pending'",
-        (args.asset_id,),
-    )
+    ds_t = Table("depreciation_schedule")
+    del_q = (Q.from_(ds_t).delete()
+             .where(ds_t.asset_id == P())
+             .where(ds_t.status == ValueWrapper("pending")))
+    conn.execute(del_q.get_sql(), (args.asset_id,))
 
     schedule_entries = []
     accumulated = Decimal("0")
@@ -689,12 +707,13 @@ def generate_depreciation_schedule(conn, args):
         err(f"Unsupported depreciation method: {dep_method}")
 
     # Insert schedule entries
+    ds_ins_q = (Q.into(ds_t)
+                .columns("id", "asset_id", "schedule_date", "depreciation_amount",
+                          "accumulated_amount", "book_value_after", "status", "fiscal_year")
+                .insert(P(), P(), P(), P(), P(), P(), P(), P()))
+    ds_ins_sql = ds_ins_q.get_sql()
     for entry in schedule_entries:
-        conn.execute(
-            """INSERT INTO depreciation_schedule
-               (id, asset_id, schedule_date, depreciation_amount,
-                accumulated_amount, book_value_after, status, fiscal_year)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        conn.execute(ds_ins_sql,
             (entry["id"], entry["asset_id"], entry["schedule_date"],
              entry["depreciation_amount"], entry["accumulated_amount"],
              entry["book_value_after"], entry["status"], entry["fiscal_year"]),
@@ -730,22 +749,22 @@ def post_depreciation(conn, args):
     - CR Accumulated Depreciation account (from category)
     """
     schedule_entry = None
+    ds_t = Table("depreciation_schedule")
 
     if args.depreciation_schedule_id:
-        schedule_entry = conn.execute(
-            "SELECT * FROM depreciation_schedule WHERE id = ?",
-            (args.depreciation_schedule_id,),
-        ).fetchone()
+        ds_q = Q.from_(ds_t).select(ds_t.star).where(ds_t.id == P())
+        schedule_entry = conn.execute(ds_q.get_sql(), (args.depreciation_schedule_id,)).fetchone()
         if not schedule_entry:
             err(f"Depreciation schedule entry {args.depreciation_schedule_id} not found")
     elif args.asset_id and args.posting_date:
         # Find the schedule entry for this asset on or before posting_date
-        schedule_entry = conn.execute(
-            """SELECT * FROM depreciation_schedule
-               WHERE asset_id = ? AND schedule_date <= ? AND status = 'pending'
-               ORDER BY schedule_date ASC LIMIT 1""",
-            (args.asset_id, args.posting_date),
-        ).fetchone()
+        ds_q = (Q.from_(ds_t).select(ds_t.star)
+                .where(ds_t.asset_id == P())
+                .where(ds_t.schedule_date <= P())
+                .where(ds_t.status == ValueWrapper("pending"))
+                .orderby(ds_t.schedule_date)
+                .limit(1))
+        schedule_entry = conn.execute(ds_q.get_sql(), (args.asset_id, args.posting_date)).fetchone()
         if not schedule_entry:
             err(f"No pending depreciation schedule entry found for asset {args.asset_id} "
                  f"on or before {args.posting_date}")
@@ -819,12 +838,11 @@ def post_depreciation(conn, args):
         err(f"GL posting failed: {e}")
 
     # Update depreciation_schedule entry
-    conn.execute(
-        """UPDATE depreciation_schedule
-           SET status = 'posted', journal_entry_id = ?
-           WHERE id = ?""",
-        (voucher_id, sched_dict["id"]),
-    )
+    ds_upd_q = (Q.update(ds_t)
+                .set(Field("status"), ValueWrapper("posted"))
+                .set(Field("journal_entry_id"), P())
+                .where(ds_t.id == P()))
+    conn.execute(ds_upd_q.get_sql(), (voucher_id, sched_dict["id"]))
 
     # Update asset: current_book_value and accumulated_depreciation
     new_accum = round_currency(
@@ -834,14 +852,13 @@ def post_depreciation(conn, args):
         to_decimal(asset_dict["gross_value"]) - new_accum
     )
 
-    conn.execute(
-        """UPDATE asset
-           SET current_book_value = ?,
-               accumulated_depreciation = ?,
-               updated_at = datetime('now')
-           WHERE id = ?""",
-        (str(new_book_value), str(new_accum), sched_dict["asset_id"]),
-    )
+    asset_t = Table("asset")
+    asset_upd_q = (Q.update(asset_t)
+                   .set(Field("current_book_value"), P())
+                   .set(Field("accumulated_depreciation"), P())
+                   .set(Field("updated_at"), LiteralValue("datetime('now')"))
+                   .where(asset_t.id == P()))
+    conn.execute(asset_upd_q.get_sql(), (str(new_book_value), str(new_accum), sched_dict["asset_id"]))
 
     audit(conn, "erpclaw-assets", "post-depreciation", "asset", sched_dict["asset_id"],
            old_values={"current_book_value": asset_dict["current_book_value"],
@@ -881,19 +898,20 @@ def run_depreciation(conn, args):
     _validate_company_exists(conn, args.company_id)
 
     # Find all pending entries for assets in this company
-    pending_entries = conn.execute(
-        """SELECT ds.*, a.company_id, a.asset_category_id, a.naming_series,
-                  a.gross_value, a.accumulated_depreciation, a.current_book_value,
-                  a.status as asset_status
-           FROM depreciation_schedule ds
-           JOIN asset a ON a.id = ds.asset_id
-           WHERE a.company_id = ?
-             AND ds.schedule_date <= ?
-             AND ds.status = 'pending'
-             AND a.status IN ('submitted', 'in_use')
-           ORDER BY ds.schedule_date ASC""",
-        (args.company_id, args.posting_date),
-    ).fetchall()
+    ds_t = Table("depreciation_schedule").as_("ds")
+    a_t = Table("asset").as_("a")
+    pend_q = (Q.from_(ds_t)
+              .join(a_t).on(a_t.id == ds_t.asset_id)
+              .select(ds_t.star, a_t.company_id, a_t.asset_category_id,
+                      a_t.naming_series, a_t.gross_value,
+                      a_t.accumulated_depreciation, a_t.current_book_value,
+                      a_t.status.as_("asset_status"))
+              .where(a_t.company_id == P())
+              .where(ds_t.schedule_date <= P())
+              .where(ds_t.status == ValueWrapper("pending"))
+              .where(a_t.status.isin([ValueWrapper("submitted"), ValueWrapper("in_use")]))
+              .orderby(ds_t.schedule_date))
+    pending_entries = conn.execute(pend_q.get_sql(), (args.company_id, args.posting_date)).fetchall()
 
     if not pending_entries:
         ok({"entries_posted": 0, "message": "No pending depreciation entries found"})
@@ -909,10 +927,9 @@ def run_depreciation(conn, args):
         entry = row_to_dict(entry_row)
 
         # Fetch category for accounts
-        cat = conn.execute(
-            "SELECT * FROM asset_category WHERE id = ?",
-            (entry["asset_category_id"],),
-        ).fetchone()
+        ac_t = Table("asset_category")
+        ac_q = Q.from_(ac_t).select(ac_t.star).where(ac_t.id == P())
+        cat = conn.execute(ac_q.get_sql(), (entry["asset_category_id"],)).fetchone()
         if not cat:
             errors.append(f"Category not found for asset {entry['asset_id']}")
             continue
@@ -963,18 +980,19 @@ def run_depreciation(conn, args):
             continue
 
         # Update schedule entry
-        conn.execute(
-            """UPDATE depreciation_schedule
-               SET status = 'posted', journal_entry_id = ?
-               WHERE id = ?""",
-            (voucher_id, entry["id"]),
-        )
+        ds_upd_t = Table("depreciation_schedule")
+        ds_upd_q = (Q.update(ds_upd_t)
+                    .set(Field("status"), ValueWrapper("posted"))
+                    .set(Field("journal_entry_id"), P())
+                    .where(ds_upd_t.id == P()))
+        conn.execute(ds_upd_q.get_sql(), (voucher_id, entry["id"]))
 
         # Re-read asset for current values (may have been updated by previous entry in batch)
-        current_asset = conn.execute(
-            "SELECT accumulated_depreciation, gross_value FROM asset WHERE id = ?",
-            (entry["asset_id"],),
-        ).fetchone()
+        asset_rd_t = Table("asset")
+        asset_rd_q = (Q.from_(asset_rd_t)
+                      .select(asset_rd_t.accumulated_depreciation, asset_rd_t.gross_value)
+                      .where(asset_rd_t.id == P()))
+        current_asset = conn.execute(asset_rd_q.get_sql(), (entry["asset_id"],)).fetchone()
         current_asset_dict = row_to_dict(current_asset)
 
         new_accum = round_currency(
@@ -984,14 +1002,12 @@ def run_depreciation(conn, args):
             to_decimal(current_asset_dict["gross_value"]) - new_accum
         )
 
-        conn.execute(
-            """UPDATE asset
-               SET current_book_value = ?,
-                   accumulated_depreciation = ?,
-                   updated_at = datetime('now')
-               WHERE id = ?""",
-            (str(new_book_value), str(new_accum), entry["asset_id"]),
-        )
+        asset_upd_q = (Q.update(asset_rd_t)
+                       .set(Field("current_book_value"), P())
+                       .set(Field("accumulated_depreciation"), P())
+                       .set(Field("updated_at"), LiteralValue("datetime('now')"))
+                       .where(asset_rd_t.id == P()))
+        conn.execute(asset_upd_q.get_sql(), (str(new_book_value), str(new_accum), entry["asset_id"]))
 
         posted_count += 1
         posted_details.append({
@@ -1053,11 +1069,12 @@ def record_asset_movement(conn, args):
 
     movement_id = str(uuid.uuid4())
 
-    conn.execute(
-        """INSERT INTO asset_movement
-           (id, asset_id, movement_type, from_location, to_location,
-            from_employee_id, to_employee_id, movement_date, reason)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+    am_t = Table("asset_movement")
+    am_ins_q = (Q.into(am_t)
+                .columns("id", "asset_id", "movement_type", "from_location", "to_location",
+                          "from_employee_id", "to_employee_id", "movement_date", "reason")
+                .insert(P(), P(), P(), P(), P(), P(), P(), P(), P()))
+    conn.execute(am_ins_q.get_sql(),
         (movement_id, args.asset_id, movement_type,
          args.from_location or asset_dict.get("location"),
          args.to_location,
@@ -1087,6 +1104,7 @@ def record_asset_movement(conn, args):
     if update_fields:
         update_fields.append("updated_at = datetime('now')")
         update_params.append(args.asset_id)
+        # raw SQL — dynamic column building based on which movement fields are provided
         conn.execute(
             f"UPDATE asset SET {', '.join(update_fields)} WHERE id = ?",
             update_params,
@@ -1129,11 +1147,12 @@ def schedule_maintenance(conn, args):
 
     maint_id = str(uuid.uuid4())
 
-    conn.execute(
-        """INSERT INTO asset_maintenance
-           (id, asset_id, maintenance_type, scheduled_date, description,
-            next_due_date, status)
-           VALUES (?, ?, ?, ?, ?, ?, 'planned')""",
+    mnt_t = Table("asset_maintenance")
+    mnt_ins_q = (Q.into(mnt_t)
+                 .columns("id", "asset_id", "maintenance_type", "scheduled_date",
+                           "description", "next_due_date", "status")
+                 .insert(P(), P(), P(), P(), P(), P(), ValueWrapper("planned")))
+    conn.execute(mnt_ins_q.get_sql(),
         (maint_id, args.asset_id, maint_type, args.scheduled_date,
          args.description, args.next_due_date),
     )
@@ -1163,10 +1182,9 @@ def complete_maintenance(conn, args):
     if not args.maintenance_id:
         err("--maintenance-id is required")
 
-    maint = conn.execute(
-        "SELECT * FROM asset_maintenance WHERE id = ?",
-        (args.maintenance_id,),
-    ).fetchone()
+    mnt_t = Table("asset_maintenance")
+    mnt_q = Q.from_(mnt_t).select(mnt_t.star).where(mnt_t.id == P())
+    maint = conn.execute(mnt_q.get_sql(), (args.maintenance_id,)).fetchone()
     if not maint:
         err(f"Maintenance record {args.maintenance_id} not found")
 
@@ -1182,15 +1200,15 @@ def complete_maintenance(conn, args):
 
     old_values = {"status": maint_dict["status"]}
 
-    conn.execute(
-        """UPDATE asset_maintenance
-           SET status = 'completed',
-               actual_date = ?,
-               cost = ?,
-               performed_by = ?,
-               description = ?,
-               updated_at = datetime('now')
-           WHERE id = ?""",
+    mnt_upd_q = (Q.update(mnt_t)
+                 .set(Field("status"), ValueWrapper("completed"))
+                 .set(Field("actual_date"), P())
+                 .set(Field("cost"), P())
+                 .set(Field("performed_by"), P())
+                 .set(Field("description"), P())
+                 .set(Field("updated_at"), LiteralValue("datetime('now')"))
+                 .where(mnt_t.id == P()))
+    conn.execute(mnt_upd_q.get_sql(),
         (actual_date, cost, performed_by, description, args.maintenance_id),
     )
 
@@ -1278,11 +1296,13 @@ def dispose_asset(conn, args):
     # Create disposal record
     disposal_id = str(uuid.uuid4())
 
-    conn.execute(
-        """INSERT INTO asset_disposal
-           (id, asset_id, disposal_date, disposal_method, sale_amount,
-            book_value_at_disposal, gain_or_loss, buyer_details)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+    ad_t = Table("asset_disposal")
+    ad_ins_q = (Q.into(ad_t)
+                .columns("id", "asset_id", "disposal_date", "disposal_method",
+                          "sale_amount", "book_value_at_disposal", "gain_or_loss",
+                          "buyer_details")
+                .insert(P(), P(), P(), P(), P(), P(), P(), P()))
+    conn.execute(ad_ins_q.get_sql(),
         (disposal_id, args.asset_id, args.disposal_date, disposal_method,
          str(round_currency(sale_amount)),
          str(round_currency(current_book_value)),
@@ -1397,21 +1417,20 @@ def dispose_asset(conn, args):
         err(f"GL posting failed: {e}")
 
     # Update disposal record with journal reference
-    conn.execute(
-        "UPDATE asset_disposal SET journal_entry_id = ? WHERE id = ?",
-        (disposal_id, disposal_id),
-    )
+    ad_upd_q = (Q.update(ad_t)
+                .set(Field("journal_entry_id"), P())
+                .where(ad_t.id == P()))
+    conn.execute(ad_upd_q.get_sql(), (disposal_id, disposal_id))
 
     # Update asset status
     new_status = "sold" if disposal_method == "sale" else "scrapped"
-    conn.execute(
-        """UPDATE asset
-           SET status = ?,
-               current_book_value = '0',
-               updated_at = datetime('now')
-           WHERE id = ?""",
-        (new_status, args.asset_id),
-    )
+    asset_t = Table("asset")
+    asset_disp_q = (Q.update(asset_t)
+                    .set(Field("status"), P())
+                    .set(Field("current_book_value"), ValueWrapper("0"))
+                    .set(Field("updated_at"), LiteralValue("datetime('now')"))
+                    .where(asset_t.id == P()))
+    conn.execute(asset_disp_q.get_sql(), (new_status, args.asset_id))
 
     audit(conn, "erpclaw-assets", "dispose-asset", "asset", args.asset_id,
            old_values={"status": asset_dict["status"],
@@ -1452,18 +1471,18 @@ def asset_register_report(conn, args):
     as_of_date = args.as_of_date or _today_str()
 
     # Fetch all assets for the company
-    assets = conn.execute(
-        """SELECT a.id, a.naming_series, a.asset_name, a.asset_category_id,
-                  a.purchase_date, a.gross_value, a.salvage_value,
-                  a.depreciation_method, a.useful_life_years,
-                  a.status, a.location, a.custodian_employee_id,
-                  ac.name as category_name
-           FROM asset a
-           LEFT JOIN asset_category ac ON ac.id = a.asset_category_id
-           WHERE a.company_id = ?
-           ORDER BY ac.name, a.naming_series""",
-        (args.company_id,),
-    ).fetchall()
+    a = Table("asset").as_("a")
+    ac = Table("asset_category").as_("ac")
+    reg_q = (Q.from_(a)
+             .select(a.id, a.naming_series, a.asset_name, a.asset_category_id,
+                     a.purchase_date, a.gross_value, a.salvage_value,
+                     a.depreciation_method, a.useful_life_years,
+                     a.status, a.location, a.custodian_employee_id,
+                     ac.name.as_("category_name"))
+             .left_join(ac).on(ac.id == a.asset_category_id)
+             .where(a.company_id == P())
+             .orderby(ac.name).orderby(a.naming_series))
+    assets = conn.execute(reg_q.get_sql(), (args.company_id,)).fetchall()
 
     register = []
     total_gross = Decimal("0")
@@ -1476,12 +1495,12 @@ def asset_register_report(conn, args):
         gross = to_decimal(asset["gross_value"])
 
         # Calculate accumulated depreciation as of the date using Decimal
-        posted_dep_entries = conn.execute(
-            """SELECT depreciation_amount
-               FROM depreciation_schedule
-               WHERE asset_id = ? AND status = 'posted' AND schedule_date <= ?""",
-            (asset_id, as_of_date),
-        ).fetchall()
+        ds_t = Table("depreciation_schedule")
+        dep_q = (Q.from_(ds_t).select(ds_t.depreciation_amount)
+                 .where(ds_t.asset_id == P())
+                 .where(ds_t.status == ValueWrapper("posted"))
+                 .where(ds_t.schedule_date <= P()))
+        posted_dep_entries = conn.execute(dep_q.get_sql(), (asset_id, as_of_date)).fetchall()
 
         accum_dep = Decimal("0")
         for dep_row in posted_dep_entries:
@@ -1535,31 +1554,32 @@ def depreciation_summary(conn, args):
 
     _validate_company_exists(conn, args.company_id)
 
-    conditions = ["a.company_id = ?", "ds.status = 'posted'"]
+    ds = Table("depreciation_schedule").as_("ds")
+    a = Table("asset").as_("a")
+    ac = Table("asset_category").as_("ac")
     params = [args.company_id]
 
+    dep_sum_q = (Q.from_(ds)
+                 .join(a).on(a.id == ds.asset_id)
+                 .join(ac).on(ac.id == a.asset_category_id)
+                 .select(ac.id.as_("category_id"), ac.name.as_("category_name"),
+                         a.id.as_("asset_id"), a.naming_series, a.asset_name,
+                         ds.depreciation_amount, ds.schedule_date)
+                 .where(a.company_id == P())
+                 .where(ds.status == ValueWrapper("posted")))
+
     if args.from_date:
-        conditions.append("ds.schedule_date >= ?")
+        dep_sum_q = dep_sum_q.where(ds.schedule_date >= P())
         params.append(args.from_date)
 
     if args.to_date:
-        conditions.append("ds.schedule_date <= ?")
+        dep_sum_q = dep_sum_q.where(ds.schedule_date <= P())
         params.append(args.to_date)
 
-    where = " AND ".join(conditions)
+    dep_sum_q = dep_sum_q.orderby(ac.name).orderby(a.naming_series).orderby(ds.schedule_date)
 
     # Fetch posted depreciation entries grouped by category
-    rows = conn.execute(
-        f"""SELECT ac.id as category_id, ac.name as category_name,
-                   a.id as asset_id, a.naming_series, a.asset_name,
-                   ds.depreciation_amount, ds.schedule_date
-            FROM depreciation_schedule ds
-            JOIN asset a ON a.id = ds.asset_id
-            JOIN asset_category ac ON ac.id = a.asset_category_id
-            WHERE {where}
-            ORDER BY ac.name, a.naming_series, ds.schedule_date""",
-        params,
-    ).fetchall()
+    rows = conn.execute(dep_sum_q.get_sql(), params).fetchall()
 
     # Group by category
     categories = {}
@@ -1640,7 +1660,9 @@ def status_action(conn, args):
     """
     company_id = args.company_id
     if not company_id:
-        row = conn.execute("SELECT id FROM company LIMIT 1").fetchone()
+        co_t = Table("company")
+        co_q = Q.from_(co_t).select(co_t.id).limit(1)
+        row = conn.execute(co_q.get_sql()).fetchone()
         if not row:
             err("No company found. Create one with erpclaw-setup first.",
                  suggestion="Run 'tutorial' to create a demo company, or 'setup company' to create your own.")
@@ -1649,83 +1671,79 @@ def status_action(conn, args):
     _validate_company_exists(conn, company_id)
 
     # Assets by status
-    status_rows = conn.execute(
-        """SELECT status, COUNT(*) as count
-           FROM asset WHERE company_id = ?
-           GROUP BY status""",
-        (company_id,),
-    ).fetchall()
+    asset_t = Table("asset")
+    stat_q = (Q.from_(asset_t)
+              .select(asset_t.status, fn.Count("*").as_("count"))
+              .where(asset_t.company_id == P())
+              .groupby(asset_t.status))
+    status_rows = conn.execute(stat_q.get_sql(), (company_id,)).fetchall()
     assets_by_status = {r["status"]: r["count"] for r in status_rows}
 
     # Total book value
-    bv_row = conn.execute(
-        """SELECT COALESCE(COUNT(*), 0) as total_assets
-           FROM asset WHERE company_id = ?""",
-        (company_id,),
-    ).fetchone()
+    bv_q = (Q.from_(asset_t)
+            .select(fn.Coalesce(fn.Count("*"), 0).as_("total_assets"))
+            .where(asset_t.company_id == P()))
+    bv_row = conn.execute(bv_q.get_sql(), (company_id,)).fetchone()
 
     # Calculate total book value using Decimal
-    asset_bv_rows = conn.execute(
-        "SELECT current_book_value FROM asset WHERE company_id = ?",
-        (company_id,),
-    ).fetchall()
+    bv_sel_q = (Q.from_(asset_t).select(asset_t.current_book_value)
+                .where(asset_t.company_id == P()))
+    asset_bv_rows = conn.execute(bv_sel_q.get_sql(), (company_id,)).fetchall()
     total_book_value = Decimal("0")
     for r in asset_bv_rows:
         total_book_value = round_currency(total_book_value + to_decimal(r["current_book_value"]))
 
     # Total gross value
-    asset_gv_rows = conn.execute(
-        "SELECT gross_value FROM asset WHERE company_id = ?",
-        (company_id,),
-    ).fetchall()
+    gv_sel_q = (Q.from_(asset_t).select(asset_t.gross_value)
+                .where(asset_t.company_id == P()))
+    asset_gv_rows = conn.execute(gv_sel_q.get_sql(), (company_id,)).fetchall()
     total_gross_value = Decimal("0")
     for r in asset_gv_rows:
         total_gross_value = round_currency(total_gross_value + to_decimal(r["gross_value"]))
 
     # Pending depreciation entries
-    pending_dep = conn.execute(
-        """SELECT COUNT(*) as count
-           FROM depreciation_schedule ds
-           JOIN asset a ON a.id = ds.asset_id
-           WHERE a.company_id = ? AND ds.status = 'pending'""",
-        (company_id,),
-    ).fetchone()
+    ds_t = Table("depreciation_schedule").as_("ds")
+    a_t = Table("asset").as_("a")
+    pend_q = (Q.from_(ds_t)
+              .join(a_t).on(a_t.id == ds_t.asset_id)
+              .select(fn.Count("*").as_("count"))
+              .where(a_t.company_id == P())
+              .where(ds_t.status == ValueWrapper("pending")))
+    pending_dep = conn.execute(pend_q.get_sql(), (company_id,)).fetchone()
 
     # Overdue depreciation (pending entries with schedule_date < today)
     today = _today_str()
-    overdue_dep = conn.execute(
-        """SELECT COUNT(*) as count
-           FROM depreciation_schedule ds
-           JOIN asset a ON a.id = ds.asset_id
-           WHERE a.company_id = ? AND ds.status = 'pending' AND ds.schedule_date < ?""",
-        (company_id, today),
-    ).fetchone()
+    overdue_q = (Q.from_(ds_t)
+                 .join(a_t).on(a_t.id == ds_t.asset_id)
+                 .select(fn.Count("*").as_("count"))
+                 .where(a_t.company_id == P())
+                 .where(ds_t.status == ValueWrapper("pending"))
+                 .where(ds_t.schedule_date < P()))
+    overdue_dep = conn.execute(overdue_q.get_sql(), (company_id, today)).fetchone()
 
     # Upcoming maintenance (next 30 days)
     thirty_days = (date.today() + timedelta(days=30)).isoformat()
-    upcoming_maint = conn.execute(
-        """SELECT am.*, a.naming_series, a.asset_name
-           FROM asset_maintenance am
-           JOIN asset a ON a.id = am.asset_id
-           WHERE a.company_id = ?
-             AND am.status IN ('planned', 'overdue')
-             AND am.scheduled_date <= ?
-           ORDER BY am.scheduled_date ASC
-           LIMIT 10""",
-        (company_id, thirty_days),
-    ).fetchall()
+    am_t = Table("asset_maintenance").as_("am")
+    a2_t = Table("asset").as_("a")
+    up_q = (Q.from_(am_t)
+            .join(a2_t).on(a2_t.id == am_t.asset_id)
+            .select(am_t.star, a2_t.naming_series, a2_t.asset_name)
+            .where(a2_t.company_id == P())
+            .where(am_t.status.isin([ValueWrapper("planned"), ValueWrapper("overdue")]))
+            .where(am_t.scheduled_date <= P())
+            .orderby(am_t.scheduled_date)
+            .limit(10))
+    upcoming_maint = conn.execute(up_q.get_sql(), (company_id, thirty_days)).fetchall()
     upcoming_maint_list = [row_to_dict(r) for r in upcoming_maint]
 
     # Overdue maintenance
-    overdue_maint = conn.execute(
-        """SELECT COUNT(*) as count
-           FROM asset_maintenance am
-           JOIN asset a ON a.id = am.asset_id
-           WHERE a.company_id = ?
-             AND am.status IN ('planned', 'overdue')
-             AND am.scheduled_date < ?""",
-        (company_id, today),
-    ).fetchone()
+    od_mnt_q = (Q.from_(am_t)
+                .join(a2_t).on(a2_t.id == am_t.asset_id)
+                .select(fn.Count("*").as_("count"))
+                .where(a2_t.company_id == P())
+                .where(am_t.status.isin([ValueWrapper("planned"), ValueWrapper("overdue")]))
+                .where(am_t.scheduled_date < P()))
+    overdue_maint = conn.execute(od_mnt_q.get_sql(), (company_id, today)).fetchone()
 
     ok({
         "dashboard": "Asset Management Status",

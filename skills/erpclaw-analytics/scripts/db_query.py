@@ -28,6 +28,8 @@ from erpclaw_lib.dependencies import (
 )
 from erpclaw_lib.validation import check_input_lengths
 from erpclaw_lib.response import ok, err
+from erpclaw_lib.query import Q, P, Table, Field, fn, Case, Order, Criterion, Not, NULL, DecimalSum, DecimalAbs
+from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +178,7 @@ def _get_account_balance(conn, company_id, root_type=None, account_type=None,
         where.append("g.posting_date <= ?")
         params.append(to_date)
 
+    # raw SQL — dynamic IN clause with variable-length lists
     where_clause = " AND ".join(where)
     row = conn.execute(
         f"""SELECT
@@ -223,6 +226,7 @@ def _get_account_balances_grouped(conn, company_id, root_type, from_date, to_dat
         join_clause = ""
         group_col = "a.id"
 
+    # raw SQL — dynamic columns/joins/grouping determined at runtime
     where_clause = " AND ".join(where)
     rows = conn.execute(
         f"""SELECT {select_col},
@@ -350,13 +354,15 @@ def action_status(conn, args):
 
     # If company provided, add company-level stats
     if args.company_id:
-        gl_count = conn.execute(
-            "SELECT COUNT(*) as cnt FROM gl_entry WHERE is_cancelled = 0"
-        ).fetchone()["cnt"]
-        acct_count = conn.execute(
-            "SELECT COUNT(*) as cnt FROM account WHERE company_id = ? AND is_group = 0",
-            (args.company_id,),
-        ).fetchone()["cnt"]
+        gl = Table("gl_entry")
+        q = Q.from_(gl).select(fn.Count("*").as_("cnt")).where(gl.is_cancelled == 0)
+        gl_count = conn.execute(q.get_sql()).fetchone()["cnt"]
+
+        acct = Table("account")
+        q = (Q.from_(acct).select(fn.Count("*").as_("cnt"))
+             .where(acct.company_id == P())
+             .where(acct.is_group == 0))
+        acct_count = conn.execute(q.get_sql(), (args.company_id,)).fetchone()["cnt"]
         result["company_stats"] = {
             "gl_entries": gl_count,
             "accounts": acct_count,
@@ -456,11 +462,12 @@ def action_liquidity_ratios(conn, args):
     inventory_value = Decimal("0")
 
     # Get all non-group asset accounts for this company
-    asset_accounts = conn.execute(
-        """SELECT id, account_type FROM account
-           WHERE company_id = ? AND root_type = 'asset' AND is_group = 0""",
-        (company_id,),
-    ).fetchall()
+    acct_t = Table("account")
+    q = (Q.from_(acct_t).select(acct_t.id, acct_t.account_type)
+         .where(acct_t.company_id == P())
+         .where(acct_t.root_type == ValueWrapper("asset"))
+         .where(acct_t.is_group == 0))
+    asset_accounts = conn.execute(q.get_sql(), (company_id,)).fetchall()
 
     for acct in asset_accounts:
         at = acct["account_type"]
@@ -477,11 +484,11 @@ def action_liquidity_ratios(conn, args):
 
     # Current liabilities: liability accounts excluding long-term
     total_current_liabilities = Decimal("0")
-    liability_accounts = conn.execute(
-        """SELECT id, account_type FROM account
-           WHERE company_id = ? AND root_type = 'liability' AND is_group = 0""",
-        (company_id,),
-    ).fetchall()
+    q = (Q.from_(acct_t).select(acct_t.id, acct_t.account_type)
+         .where(acct_t.company_id == P())
+         .where(acct_t.root_type == ValueWrapper("liability"))
+         .where(acct_t.is_group == 0))
+    liability_accounts = conn.execute(q.get_sql(), (company_id,)).fetchall()
 
     for acct in liability_accounts:
         bal = _get_single_account_balance(conn, acct["id"], as_of, "liability")
@@ -509,13 +516,14 @@ def action_liquidity_ratios(conn, args):
 
 def _get_single_account_balance(conn, account_id, as_of_date, root_type):
     """Get balance for a single account as of a date."""
-    row = conn.execute(
-        """SELECT COALESCE(decimal_sum(debit), '0') as d,
-                  COALESCE(decimal_sum(credit), '0') as c
-           FROM gl_entry
-           WHERE account_id = ? AND posting_date <= ? AND is_cancelled = 0""",
-        (account_id, as_of_date),
-    ).fetchone()
+    gl = Table("gl_entry")
+    q = (Q.from_(gl)
+         .select(fn.Coalesce(DecimalSum(gl.debit), ValueWrapper("0")).as_("d"),
+                 fn.Coalesce(DecimalSum(gl.credit), ValueWrapper("0")).as_("c"))
+         .where(gl.account_id == P())
+         .where(gl.posting_date <= P())
+         .where(gl.is_cancelled == 0))
+    row = conn.execute(q.get_sql(), (account_id, as_of_date)).fetchone()
     debit = _d(row["d"])
     credit = _d(row["c"])
     if root_type in ("liability", "equity", "income"):
@@ -653,7 +661,7 @@ def action_expense_breakdown(conn, args):
     company_id = args.company_id
     from_date = args.from_date
     to_date = args.to_date
-    group_by = getattr(args, "group_by", "account") or "account"
+    group_by = getattr(args, "group_by", None) or "account"
 
     if group_by not in ("account", "cost_center"):
         err("--group-by must be 'account' or 'cost_center'")
@@ -690,7 +698,7 @@ def action_cost_trend(conn, args):
     company_id = args.company_id
     from_date = args.from_date
     to_date = args.to_date
-    periodicity = getattr(args, "periodicity", "monthly") or "monthly"
+    periodicity = getattr(args, "periodicity", None) or "monthly"
     account_id = getattr(args, "account_id", None)
 
     periods = _get_period_breaks(from_date, to_date, periodicity)
@@ -742,14 +750,15 @@ def action_cost_trend(conn, args):
 
 def _get_single_account_balance_period(conn, account_id, from_date, to_date):
     """Get net movement for a single account in a period."""
-    row = conn.execute(
-        """SELECT COALESCE(decimal_sum(debit), '0') as d,
-                  COALESCE(decimal_sum(credit), '0') as c
-           FROM gl_entry
-           WHERE account_id = ? AND posting_date >= ? AND posting_date <= ?
-           AND is_cancelled = 0""",
-        (account_id, from_date, to_date),
-    ).fetchone()
+    gl = Table("gl_entry")
+    q = (Q.from_(gl)
+         .select(fn.Coalesce(DecimalSum(gl.debit), ValueWrapper("0")).as_("d"),
+                 fn.Coalesce(DecimalSum(gl.credit), ValueWrapper("0")).as_("c"))
+         .where(gl.account_id == P())
+         .where(gl.posting_date >= P())
+         .where(gl.posting_date <= P())
+         .where(gl.is_cancelled == 0))
+    row = conn.execute(q.get_sql(), (account_id, from_date, to_date)).fetchone()
     # For expense accounts, balance = debit - credit
     return _d(row["d"]) - _d(row["c"])
 
@@ -874,31 +883,32 @@ def action_revenue_by_customer(conn, args):
         err(dep["error"])
 
     company_id = args.company_id
-    limit = int(getattr(args, "limit", "20") or "20")
-    offset = int(getattr(args, "offset", "0") or "0")
+    limit = int(getattr(args, "limit", None) or "20")
+    offset = int(getattr(args, "offset", None) or "0")
 
-    rows = conn.execute(
-        """SELECT c.id as customer_id, c.name as customer_name,
-                  COUNT(si.id) as invoice_count,
-                  COALESCE(decimal_sum(si.grand_total), '0') as total_revenue
-           FROM sales_invoice si
-           JOIN customer c ON si.customer_id = c.id
-           WHERE c.company_id = ? AND si.status IN ('submitted', 'paid')
-           AND si.posting_date >= ? AND si.posting_date <= ?
-           GROUP BY c.id, c.name
-           ORDER BY total_revenue DESC
-           LIMIT ? OFFSET ?""",
-        (company_id, args.from_date, args.to_date, limit, offset),
-    ).fetchall()
+    si = Table("sales_invoice")
+    c = Table("customer")
 
-    total_row = conn.execute(
-        """SELECT COALESCE(decimal_sum(si.grand_total), '0') as total
-           FROM sales_invoice si
-           JOIN customer c ON si.customer_id = c.id
-           WHERE c.company_id = ? AND si.status IN ('submitted', 'paid')
-           AND si.posting_date >= ? AND si.posting_date <= ?""",
-        (company_id, args.from_date, args.to_date),
-    ).fetchone()
+    q = (Q.from_(si).join(c).on(si.customer_id == c.id)
+         .select(c.id.as_("customer_id"), c.name.as_("customer_name"),
+                 fn.Count(si.id).as_("invoice_count"),
+                 fn.Coalesce(DecimalSum(si.grand_total), ValueWrapper("0")).as_("total_revenue"))
+         .where(c.company_id == P())
+         .where(si.status.isin([ValueWrapper("submitted"), ValueWrapper("paid")]))
+         .where(si.posting_date >= P())
+         .where(si.posting_date <= P())
+         .groupby(c.id, c.name)
+         .orderby(Field("total_revenue"), order=Order.desc)
+         .limit(P()).offset(P()))
+    rows = conn.execute(q.get_sql(), (company_id, args.from_date, args.to_date, limit, offset)).fetchall()
+
+    q_total = (Q.from_(si).join(c).on(si.customer_id == c.id)
+               .select(fn.Coalesce(DecimalSum(si.grand_total), ValueWrapper("0")).as_("total"))
+               .where(c.company_id == P())
+               .where(si.status.isin([ValueWrapper("submitted"), ValueWrapper("paid")]))
+               .where(si.posting_date >= P())
+               .where(si.posting_date <= P()))
+    total_row = conn.execute(q_total.get_sql(), (company_id, args.from_date, args.to_date)).fetchone()
 
     grand_total = _d(total_row["total"])
     customers = []
@@ -936,34 +946,39 @@ def action_revenue_by_item(conn, args):
         err(dep["error"])
 
     company_id = args.company_id
-    limit = int(getattr(args, "limit", "20") or "20")
-    offset = int(getattr(args, "offset", "0") or "0")
+    limit = int(getattr(args, "limit", None) or "20")
+    offset = int(getattr(args, "offset", None) or "0")
 
-    rows = conn.execute(
-        """SELECT i.id as item_id, i.item_name as item_name,
-                  decimal_sum(sii.quantity) as total_qty,
-                  decimal_sum(sii.amount) as total_amount
-           FROM sales_invoice_item sii
-           JOIN sales_invoice si ON sii.sales_invoice_id = si.id
-           JOIN item i ON sii.item_id = i.id
-           JOIN customer c ON si.customer_id = c.id
-           WHERE c.company_id = ? AND si.status IN ('submitted', 'paid')
-           AND si.posting_date >= ? AND si.posting_date <= ?
-           GROUP BY i.id, i.item_name
-           ORDER BY total_amount DESC
-           LIMIT ? OFFSET ?""",
-        (company_id, args.from_date, args.to_date, limit, offset),
-    ).fetchall()
+    sii = Table("sales_invoice_item")
+    si = Table("sales_invoice")
+    it = Table("item")
+    c = Table("customer")
 
-    total_row = conn.execute(
-        """SELECT COALESCE(decimal_sum(sii.amount), '0') as total
-           FROM sales_invoice_item sii
-           JOIN sales_invoice si ON sii.sales_invoice_id = si.id
-           JOIN customer c ON si.customer_id = c.id
-           WHERE c.company_id = ? AND si.status IN ('submitted', 'paid')
-           AND si.posting_date >= ? AND si.posting_date <= ?""",
-        (company_id, args.from_date, args.to_date),
-    ).fetchone()
+    q = (Q.from_(sii)
+         .join(si).on(sii.sales_invoice_id == si.id)
+         .join(it).on(sii.item_id == it.id)
+         .join(c).on(si.customer_id == c.id)
+         .select(it.id.as_("item_id"), it.item_name.as_("item_name"),
+                 DecimalSum(sii.quantity).as_("total_qty"),
+                 DecimalSum(sii.amount).as_("total_amount"))
+         .where(c.company_id == P())
+         .where(si.status.isin([ValueWrapper("submitted"), ValueWrapper("paid")]))
+         .where(si.posting_date >= P())
+         .where(si.posting_date <= P())
+         .groupby(it.id, it.item_name)
+         .orderby(Field("total_amount"), order=Order.desc)
+         .limit(P()).offset(P()))
+    rows = conn.execute(q.get_sql(), (company_id, args.from_date, args.to_date, limit, offset)).fetchall()
+
+    q_total = (Q.from_(sii)
+               .join(si).on(sii.sales_invoice_id == si.id)
+               .join(c).on(si.customer_id == c.id)
+               .select(fn.Coalesce(DecimalSum(sii.amount), ValueWrapper("0")).as_("total"))
+               .where(c.company_id == P())
+               .where(si.status.isin([ValueWrapper("submitted"), ValueWrapper("paid")]))
+               .where(si.posting_date >= P())
+               .where(si.posting_date <= P()))
+    total_row = conn.execute(q_total.get_sql(), (company_id, args.from_date, args.to_date)).fetchone()
 
     grand_total = _d(total_row["total"])
     items = []
@@ -999,23 +1014,27 @@ def action_revenue_trend(conn, args):
     company_id = args.company_id
     from_date = args.from_date
     to_date = args.to_date
-    periodicity = getattr(args, "periodicity", "monthly") or "monthly"
+    periodicity = getattr(args, "periodicity", None) or "monthly"
     modules = _check_modules(conn)
 
     use_invoices = modules.get("erpclaw-selling", False)
     periods = _get_period_breaks(from_date, to_date, periodicity)
     trend = []
 
+    if use_invoices:
+        si = Table("sales_invoice")
+        c = Table("customer")
+        q_inv = (Q.from_(si).join(c).on(si.customer_id == c.id)
+                 .select(fn.Coalesce(DecimalSum(si.grand_total), ValueWrapper("0")).as_("total"))
+                 .where(c.company_id == P())
+                 .where(si.status.isin([ValueWrapper("submitted"), ValueWrapper("paid")]))
+                 .where(si.posting_date >= P())
+                 .where(si.posting_date <= P()))
+        inv_sql = q_inv.get_sql()
+
     for p in periods:
         if use_invoices:
-            row = conn.execute(
-                """SELECT COALESCE(decimal_sum(si.grand_total), '0') as total
-                   FROM sales_invoice si
-                   JOIN customer c ON si.customer_id = c.id
-                   WHERE c.company_id = ? AND si.status IN ('submitted', 'paid')
-                   AND si.posting_date >= ? AND si.posting_date <= ?""",
-                (company_id, p["from_date"], p["to_date"]),
-            ).fetchone()
+            row = conn.execute(inv_sql, (company_id, p["from_date"], p["to_date"])).fetchone()
             amount = _d(row["total"])
         else:
             amount = _get_account_balance(
@@ -1068,17 +1087,18 @@ def action_customer_concentration(conn, args):
 
     company_id = args.company_id
 
-    rows = conn.execute(
-        """SELECT c.name as customer_name,
-                  COALESCE(decimal_sum(si.grand_total), '0') as revenue
-           FROM sales_invoice si
-           JOIN customer c ON si.customer_id = c.id
-           WHERE c.company_id = ? AND si.status IN ('submitted', 'paid')
-           AND si.posting_date >= ? AND si.posting_date <= ?
-           GROUP BY c.id, c.name
-           ORDER BY revenue DESC""",
-        (company_id, args.from_date, args.to_date),
-    ).fetchall()
+    si = Table("sales_invoice")
+    c = Table("customer")
+    q = (Q.from_(si).join(c).on(si.customer_id == c.id)
+         .select(c.name.as_("customer_name"),
+                 fn.Coalesce(DecimalSum(si.grand_total), ValueWrapper("0")).as_("revenue"))
+         .where(c.company_id == P())
+         .where(si.status.isin([ValueWrapper("submitted"), ValueWrapper("paid")]))
+         .where(si.posting_date >= P())
+         .where(si.posting_date <= P())
+         .groupby(c.id, c.name)
+         .orderby(Field("revenue"), order=Order.desc))
+    rows = conn.execute(q.get_sql(), (company_id, args.from_date, args.to_date)).fetchall()
 
     total = sum(_d(r["revenue"]) for r in rows)
     if total == 0:
@@ -1209,6 +1229,7 @@ def action_abc_analysis(conn, args):
         where.append("sle.posting_date <= ?")
         params.append(as_of)
 
+    # raw SQL — HAVING with arithmetic expression (value + 0 > 0)
     rows = conn.execute(
         f"""SELECT i.id as item_id, i.item_name as item_name,
                    COALESCE(decimal_sum(sle.stock_value_difference), '0') as value
@@ -1337,10 +1358,10 @@ def action_aging_inventory(conn, args):
 
     company_id = args.company_id
     as_of = args.as_of_date
-    buckets_str = getattr(args, "aging_buckets", "30,60,90,120") or "30,60,90,120"
+    buckets_str = getattr(args, "aging_buckets", None) or "30,60,90,120"
     bucket_limits = [int(b) for b in buckets_str.split(",")]
 
-    # Get latest SLE per item with positive qty
+    # raw SQL — HAVING with arithmetic expression (qty_balance + 0 > 0)
     rows = conn.execute(
         """SELECT i.id as item_id, i.item_name as item_name,
                   MAX(sle.posting_date) as last_movement,
@@ -1413,42 +1434,39 @@ def action_headcount_analytics(conn, args):
 
     company_id = args.company_id
     as_of = getattr(args, "as_of_date", None)
-    group_by = getattr(args, "group_by", "department") or "department"
+    group_by = getattr(args, "group_by", None) or "department"
 
-    where = ["e.company_id = ?", "e.status = 'active'"]
+    e = Table("employee")
+
+    # Build base WHERE criterion
+    crit = (e.company_id == P()) & (e.status == ValueWrapper("active"))
     params = [company_id]
     if as_of:
-        where.append("e.date_of_joining <= ?")
+        crit = crit & (e.date_of_joining <= P())
         params.append(as_of)
 
-    where_clause = " AND ".join(where)
-
     # Total headcount
-    total = conn.execute(
-        f"SELECT COUNT(*) as cnt FROM employee e WHERE {where_clause}",
-        params,
-    ).fetchone()["cnt"]
+    q = Q.from_(e).select(fn.Count("*").as_("cnt")).where(crit)
+    total = conn.execute(q.get_sql(), params).fetchone()["cnt"]
 
     # Group by department or designation
     if group_by == "department" and table_exists(conn, "department"):
-        breakdown_rows = conn.execute(
-            f"""SELECT COALESCE(d.name, 'Unassigned') as group_name, COUNT(*) as cnt
-                FROM employee e
-                LEFT JOIN department d ON e.department_id = d.id
-                WHERE {where_clause}
-                GROUP BY group_name
-                ORDER BY cnt DESC""",
-            params,
-        ).fetchall()
+        d = Table("department")
+        q = (Q.from_(e).left_join(d).on(e.department_id == d.id)
+             .select(fn.Coalesce(d.name, ValueWrapper("Unassigned")).as_("group_name"),
+                     fn.Count("*").as_("cnt"))
+             .where(crit)
+             .groupby(Field("group_name"))
+             .orderby(Field("cnt"), order=Order.desc))
+        breakdown_rows = conn.execute(q.get_sql(), params).fetchall()
     else:
-        breakdown_rows = conn.execute(
-            f"""SELECT COALESCE(e.status, 'Unknown') as group_name, COUNT(*) as cnt
-                FROM employee e
-                WHERE {where_clause}
-                GROUP BY group_name
-                ORDER BY cnt DESC""",
-            params,
-        ).fetchall()
+        q = (Q.from_(e)
+             .select(fn.Coalesce(e.status, ValueWrapper("Unknown")).as_("group_name"),
+                     fn.Count("*").as_("cnt"))
+             .where(crit)
+             .groupby(Field("group_name"))
+             .orderby(Field("cnt"), order=Order.desc))
+        breakdown_rows = conn.execute(q.get_sql(), params).fetchall()
 
     breakdown = []
     for r in breakdown_rows:
@@ -1484,28 +1502,26 @@ def action_payroll_analytics(conn, args):
     to_date = args.to_date
     department_id = getattr(args, "department_id", None)
 
-    where = [
-        "pr.company_id = ?", "pr.status = 'submitted'",
-        "pr.period_start >= ?", "pr.period_end <= ?"
-    ]
+    ss = Table("salary_slip")
+    pr = Table("payroll_run")
+
+    crit = ((pr.company_id == P()) &
+            (pr.status == ValueWrapper("submitted")) &
+            (pr.period_start >= P()) &
+            (pr.period_end <= P()))
     params = [company_id, from_date, to_date]
 
     if department_id:
-        where.append("pr.department_id = ?")
+        crit = crit & (pr.department_id == P())
         params.append(department_id)
 
-    where_clause = " AND ".join(where)
-
-    row = conn.execute(
-        f"""SELECT COUNT(DISTINCT ss.id) as slip_count,
-                   COALESCE(decimal_sum(ss.gross_pay), '0') as total_gross,
-                   COALESCE(decimal_sum(ss.net_pay), '0') as total_net,
-                   COALESCE(decimal_sum(ss.total_deductions), '0') as total_deductions
-            FROM salary_slip ss
-            JOIN payroll_run pr ON ss.payroll_run_id = pr.id
-            WHERE {where_clause}""",
-        params,
-    ).fetchone()
+    q = (Q.from_(ss).join(pr).on(ss.payroll_run_id == pr.id)
+         .select(fn.Count(ss.id, alias="slip_count").distinct(),
+                 fn.Coalesce(DecimalSum(ss.gross_pay), ValueWrapper("0")).as_("total_gross"),
+                 fn.Coalesce(DecimalSum(ss.net_pay), ValueWrapper("0")).as_("total_net"),
+                 fn.Coalesce(DecimalSum(ss.total_deductions), ValueWrapper("0")).as_("total_deductions"))
+         .where(crit))
+    row = conn.execute(q.get_sql(), params).fetchone()
 
     ok({
         "period": {"from_date": from_date, "to_date": to_date},
@@ -1538,34 +1554,28 @@ def action_leave_utilization(conn, args):
     to_date = getattr(args, "to_date", None)
 
     # Total allocated leaves
-    alloc_where = ["e.company_id = ?"]
-    alloc_params = [company_id]
-
-    alloc_row = conn.execute(
-        f"""SELECT COALESCE(decimal_sum(la.total_leaves), '0') as total_allocated
-            FROM leave_allocation la
-            JOIN employee e ON la.employee_id = e.id
-            WHERE {' AND '.join(alloc_where)}""",
-        alloc_params,
-    ).fetchone()
+    la = Table("leave_allocation")
+    e = Table("employee")
+    q_alloc = (Q.from_(la).join(e).on(la.employee_id == e.id)
+               .select(fn.Coalesce(DecimalSum(la.total_leaves), ValueWrapper("0")).as_("total_allocated"))
+               .where(e.company_id == P()))
+    alloc_row = conn.execute(q_alloc.get_sql(), (company_id,)).fetchone()
 
     # Used leaves (approved applications)
-    used_where = ["e.company_id = ?", "lapp.status = 'approved'"]
+    lapp = Table("leave_application")
+    crit = (e.company_id == P()) & (lapp.status == ValueWrapper("approved"))
     used_params = [company_id]
     if from_date:
-        used_where.append("lapp.from_date >= ?")
+        crit = crit & (lapp.from_date >= P())
         used_params.append(from_date)
     if to_date:
-        used_where.append("lapp.to_date <= ?")
+        crit = crit & (lapp.to_date <= P())
         used_params.append(to_date)
 
-    used_row = conn.execute(
-        f"""SELECT COALESCE(decimal_sum(lapp.total_days), '0') as total_used
-            FROM leave_application lapp
-            JOIN employee e ON lapp.employee_id = e.id
-            WHERE {' AND '.join(used_where)}""",
-        used_params,
-    ).fetchone()
+    q_used = (Q.from_(lapp).join(e).on(lapp.employee_id == e.id)
+              .select(fn.Coalesce(DecimalSum(lapp.total_days), ValueWrapper("0")).as_("total_used"))
+              .where(crit))
+    used_row = conn.execute(q_used.get_sql(), used_params).fetchone()
 
     total_allocated = _d(alloc_row["total_allocated"])
     total_used = _d(used_row["total_used"])
@@ -1609,6 +1619,7 @@ def action_project_profitability(conn, args):
 
     where_clause = " AND ".join(where)
 
+    # raw SQL — COALESCE with arithmetic expressions (col + 0) for type coercion
     projects = conn.execute(
         f"""SELECT p.id, p.project_name, p.status,
                    COALESCE(p.estimated_cost + 0, 0) as est_cost,
@@ -1676,7 +1687,7 @@ def action_quality_dashboard(conn, args):
 
     where_clause = " AND ".join(where)
 
-    # Inspection summary (status: accepted = pass, rejected = fail)
+    # raw SQL — SUM(CASE WHEN ...) aggregate pattern
     row = conn.execute(
         f"""SELECT COUNT(*) as total,
                    SUM(CASE WHEN qi.status = 'accepted' THEN 1 ELSE 0 END) as passed,
@@ -1694,18 +1705,16 @@ def action_quality_dashboard(conn, args):
     # Non-conformance count if table exists
     nc_count = 0
     if table_exists(conn, "non_conformance"):
-        nc_where = ["1=1"]
+        nc = Table("non_conformance")
+        q_nc = Q.from_(nc).select(fn.Count("*").as_("cnt"))
         nc_params = []
         if from_date:
-            nc_where.append("nc.created_at >= ?")
+            q_nc = q_nc.where(nc.created_at >= P())
             nc_params.append(from_date)
         if to_date:
-            nc_where.append("nc.created_at <= ?")
+            q_nc = q_nc.where(nc.created_at <= P())
             nc_params.append(to_date)
-        nc_row = conn.execute(
-            f"SELECT COUNT(*) as cnt FROM non_conformance nc WHERE {' AND '.join(nc_where)}",
-            nc_params,
-        ).fetchone()
+        nc_row = conn.execute(q_nc.get_sql(), nc_params).fetchone()
         nc_count = nc_row["cnt"]
 
     ok({
@@ -1736,6 +1745,7 @@ def action_support_metrics(conn, args):
     from_date = getattr(args, "from_date", None)
     to_date = getattr(args, "to_date", None)
 
+    # raw SQL — subquery IN and SUM(CASE WHEN ...) aggregate patterns
     # issue has no company_id — filter through customer_id
     company_filter = "AND i.customer_id IN (SELECT id FROM customer WHERE company_id = ?)"
     where = [f"1=1 {company_filter}"]
@@ -1846,15 +1856,16 @@ def action_executive_dashboard(conn, args):
 
     # Section 2: Selling (optional)
     if modules.get("erpclaw-selling"):
-        inv_row = conn.execute(
-            """SELECT COUNT(*) as cnt,
-                      COALESCE(decimal_sum(si.grand_total), '0') as total
-               FROM sales_invoice si
-               JOIN customer c ON si.customer_id = c.id
-               WHERE c.company_id = ? AND si.status IN ('submitted', 'paid')
-               AND si.posting_date >= ? AND si.posting_date <= ?""",
-            (company_id, from_date, to_date),
-        ).fetchone()
+        si = Table("sales_invoice")
+        c_tbl = Table("customer")
+        q = (Q.from_(si).join(c_tbl).on(si.customer_id == c_tbl.id)
+             .select(fn.Count("*").as_("cnt"),
+                     fn.Coalesce(DecimalSum(si.grand_total), ValueWrapper("0")).as_("total"))
+             .where(c_tbl.company_id == P())
+             .where(si.status.isin([ValueWrapper("submitted"), ValueWrapper("paid")]))
+             .where(si.posting_date >= P())
+             .where(si.posting_date <= P()))
+        inv_row = conn.execute(q.get_sql(), (company_id, from_date, to_date)).fetchone()
         ar = _get_account_balance(
             conn, company_id, account_type="receivable", as_of_date=to_date
         )
@@ -1893,10 +1904,11 @@ def action_executive_dashboard(conn, args):
 
     # Section 5: HR (optional)
     if modules.get("erpclaw-hr"):
-        emp_count = conn.execute(
-            "SELECT COUNT(*) as cnt FROM employee WHERE company_id = ? AND status = 'active'",
-            (company_id,),
-        ).fetchone()["cnt"]
+        emp = Table("employee")
+        q = (Q.from_(emp).select(fn.Count("*").as_("cnt"))
+             .where(emp.company_id == P())
+             .where(emp.status == ValueWrapper("active")))
+        emp_count = conn.execute(q.get_sql(), (company_id,)).fetchone()["cnt"]
         dashboard["hr"] = {
             "available": True,
             "active_employees": emp_count,
@@ -1906,6 +1918,7 @@ def action_executive_dashboard(conn, args):
 
     # Section 6: Support (optional)
     if modules.get("erpclaw-support") and table_exists(conn, "customer"):
+        # raw SQL — correlated subquery IN
         open_issues = conn.execute(
             """SELECT COUNT(*) as cnt FROM issue
                WHERE status = 'open'
@@ -2008,10 +2021,11 @@ def action_company_scorecard(conn, args):
 
     # HR grade (optional)
     if modules.get("erpclaw-hr"):
-        emp_count = conn.execute(
-            "SELECT COUNT(*) as cnt FROM employee WHERE company_id = ? AND status = 'active'",
-            (company_id,),
-        ).fetchone()["cnt"]
+        emp_tbl = Table("employee")
+        q = (Q.from_(emp_tbl).select(fn.Count("*").as_("cnt"))
+             .where(emp_tbl.company_id == P())
+             .where(emp_tbl.status == ValueWrapper("active")))
+        emp_count = conn.execute(q.get_sql(), (company_id,)).fetchone()["cnt"]
         if emp_count > 0 and revenue > 0:
             rev_per_emp = revenue / Decimal(str(emp_count))
             grades["workforce"] = {
@@ -2063,7 +2077,7 @@ def action_metric_trend(conn, args):
     company_id = args.company_id
     from_date = getattr(args, "from_date", None)
     to_date = getattr(args, "to_date", None)
-    periodicity = getattr(args, "periodicity", "monthly") or "monthly"
+    periodicity = getattr(args, "periodicity", None) or "monthly"
     modules = _check_modules(conn)
 
     from datetime import date as dt_date
@@ -2089,9 +2103,14 @@ def action_metric_trend(conn, args):
     if metric == "headcount":
         if not modules.get("erpclaw-hr"):
             err("headcount metric requires erpclaw-hr to be installed.")
+        _emp = Table("employee")
+        _hc_q = (Q.from_(_emp).select(fn.Count("*").as_("cnt"))
+                 .where(_emp.company_id == P())
+                 .where(_emp.status == ValueWrapper("active"))
+                 .where(_emp.date_of_joining <= P()))
+        _hc_sql = _hc_q.get_sql()
         METRIC_HANDLERS["headcount"] = lambda p: Decimal(str(conn.execute(
-            "SELECT COUNT(*) as cnt FROM employee WHERE company_id = ? AND status = 'active' AND date_of_joining <= ?",
-            (company_id, p["to_date"]),
+            _hc_sql, (company_id, p["to_date"]),
         ).fetchone()["cnt"]))
 
     if metric not in METRIC_HANDLERS:
@@ -2180,10 +2199,12 @@ def action_period_comparison(conn, args):
                 col["net_income"] = _s(rev - exp)
             elif metric == "headcount":
                 if modules.get("erpclaw-hr"):
-                    cnt = conn.execute(
-                        "SELECT COUNT(*) as cnt FROM employee WHERE company_id = ? AND status = 'active' AND date_of_joining <= ?",
-                        (company_id, p["to_date"]),
-                    ).fetchone()["cnt"]
+                    _emp_t = Table("employee")
+                    _hc_q2 = (Q.from_(_emp_t).select(fn.Count("*").as_("cnt"))
+                              .where(_emp_t.company_id == P())
+                              .where(_emp_t.status == ValueWrapper("active"))
+                              .where(_emp_t.date_of_joining <= P()))
+                    cnt = conn.execute(_hc_q2.get_sql(), (company_id, p["to_date"])).fetchone()["cnt"]
                     col["headcount"] = cnt
                 else:
                     col["headcount"] = None
@@ -2268,6 +2289,7 @@ def action_analyze_query_performance(conn, args):
             continue
 
         try:
+            # raw SQL — EXPLAIN QUERY PLAN (DDL/PRAGMA, not convertible)
             explain_sql = f"EXPLAIN QUERY PLAN {sql}"
             rows = conn.execute(explain_sql, params).fetchall()
             total_queries += 1
@@ -2300,6 +2322,7 @@ def action_analyze_query_performance(conn, args):
         except sqlite3.OperationalError:
             continue  # Table might not exist
 
+    # raw SQL — sqlite_master is a system table (PRAGMA/DDL scope)
     # Index coverage stats
     tables_result = conn.execute(
         "SELECT COUNT(*) as cnt FROM sqlite_master WHERE type='index'"
