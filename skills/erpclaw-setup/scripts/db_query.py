@@ -11,6 +11,7 @@ import argparse
 import glob as glob_mod
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -1339,6 +1340,11 @@ def add_user(conn, args):
     email = getattr(args, "email", None)
     full_name = getattr(args, "full_name", None)
     company_id = args.company_id
+
+    # Validate email format if provided
+    _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    if email and not _EMAIL_RE.match(email):
+        err(f"Invalid email format for --email: '{email}'")
 
     # Check uniqueness
     tu = Table("erp_user")

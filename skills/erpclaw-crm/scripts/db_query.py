@@ -10,6 +10,7 @@ Output: JSON to stdout, exit 0 on success, exit 1 on error.
 import argparse
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -153,6 +154,11 @@ def add_lead(conn, args):
 
     if args.source and args.source not in VALID_LEAD_SOURCES:
         err(f"--source must be one of {VALID_LEAD_SOURCES}")
+
+    # Validate email format if provided
+    _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    if args.email and not _EMAIL_RE.match(args.email):
+        err(f"Invalid email format for --email: '{args.email}'")
 
     company_id = _resolve_company_id(conn, args)
     lead_id = str(uuid.uuid4())

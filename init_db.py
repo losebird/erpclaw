@@ -295,27 +295,6 @@ CREATE TABLE IF NOT EXISTS chat_message (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chat_message_session ON chat_message(session_id);
-
--- Registry tables for extensible types (verticals register their own values)
-CREATE TABLE IF NOT EXISTS voucher_type_registry (
-    voucher_type TEXT NOT NULL,
-    skill_name   TEXT NOT NULL,
-    label        TEXT NOT NULL,
-    target_table TEXT NOT NULL CHECK(target_table IN ('gl_entry','stock_ledger_entry','payment_allocation')),
-    PRIMARY KEY (voucher_type, target_table)
-);
-
-CREATE TABLE IF NOT EXISTS party_type_registry (
-    party_type  TEXT PRIMARY KEY,
-    skill_name  TEXT NOT NULL,
-    label       TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS account_type_registry (
-    account_type TEXT PRIMARY KEY,
-    skill_name   TEXT NOT NULL,
-    label        TEXT NOT NULL
-);
 """
 
 
@@ -336,7 +315,15 @@ CREATE TABLE IF NOT EXISTS account (
     account_number  TEXT UNIQUE,
     parent_id       TEXT REFERENCES account(id) ON DELETE RESTRICT,
     root_type       TEXT NOT NULL CHECK(root_type IN ('asset','liability','equity','income','expense')),
-    account_type    TEXT,  -- validated via account_type_registry
+    account_type    TEXT CHECK(account_type IN (
+                        'bank','cash','receivable','payable','stock',
+                        'fixed_asset','accumulated_depreciation',
+                        'cost_of_goods_sold','tax','equity','revenue',
+                        'expense','stock_received_not_billed',
+                        'stock_adjustment','rounding','exchange_gain_loss',
+                        'depreciation','payroll_payable','temporary',
+                        'asset_received_not_billed'
+                    )),
     currency        TEXT NOT NULL DEFAULT 'USD',
     is_group        INTEGER NOT NULL DEFAULT 0 CHECK(is_group IN (0,1)),
     is_frozen       INTEGER NOT NULL DEFAULT 0 CHECK(is_frozen IN (0,1)),
@@ -363,7 +350,7 @@ CREATE TABLE IF NOT EXISTS gl_entry (
     posting_date    TEXT NOT NULL,     -- YYYY-MM-DD
     created_at      TEXT DEFAULT (datetime('now')),
     account_id      TEXT NOT NULL REFERENCES account(id) ON DELETE RESTRICT,
-    party_type      TEXT,  -- validated via party_type_registry
+    party_type      TEXT CHECK(party_type IN ('customer','supplier','employee')),
     party_id        TEXT,
     debit           TEXT NOT NULL DEFAULT '0',   -- decimal(18,6)
     credit          TEXT NOT NULL DEFAULT '0',   -- decimal(18,6)
@@ -371,12 +358,20 @@ CREATE TABLE IF NOT EXISTS gl_entry (
     debit_base      TEXT NOT NULL DEFAULT '0',   -- decimal(18,6) in company currency
     credit_base     TEXT NOT NULL DEFAULT '0',   -- decimal(18,6) in company currency
     exchange_rate   TEXT NOT NULL DEFAULT '1',    -- decimal(12,6)
-    voucher_type    TEXT NOT NULL,  -- validated via voucher_type_registry
+    voucher_type    TEXT NOT NULL CHECK(voucher_type IN (
+                        'journal_entry','sales_invoice','purchase_invoice',
+                        'payment_entry','stock_entry','depreciation_entry',
+                        'payroll_entry','period_closing','expense_claim',
+                        'asset_disposal','stock_reconciliation',
+                        'purchase_receipt','delivery_note',
+                        'credit_note','debit_note','work_order',
+                        'exchange_rate_revaluation','stock_revaluation',
+                        'elimination_entry'
+                    )),
     voucher_id      TEXT NOT NULL,
     entry_set       TEXT NOT NULL DEFAULT 'primary',  -- 'primary', 'cogs', 'tax' etc.
     cost_center_id  TEXT REFERENCES cost_center(id) ON DELETE RESTRICT,
     project_id      TEXT,
-    dimensions_json TEXT NOT NULL DEFAULT '{}',  -- vertical-specific GL dimensions (JSON)
     remarks         TEXT,
     fiscal_year     TEXT,
     is_cancelled    INTEGER NOT NULL DEFAULT 0 CHECK(is_cancelled IN (0,1)),
@@ -394,7 +389,6 @@ CREATE INDEX IF NOT EXISTS idx_gl_entry_fiscal_year ON gl_entry(fiscal_year);
 CREATE INDEX IF NOT EXISTS idx_gl_entry_party ON gl_entry(party_type, party_id);
 CREATE INDEX IF NOT EXISTS idx_gl_entry_cost_center ON gl_entry(cost_center_id);
 CREATE INDEX IF NOT EXISTS idx_gl_entry_is_cancelled ON gl_entry(is_cancelled);
-CREATE INDEX IF NOT EXISTS idx_gl_entry_project ON gl_entry(project_id);
 
 CREATE TABLE IF NOT EXISTS fiscal_year (
     id              TEXT PRIMARY KEY,
@@ -602,7 +596,7 @@ CREATE TABLE IF NOT EXISTS payment_entry (
     naming_series   TEXT,
     payment_type    TEXT NOT NULL CHECK(payment_type IN ('receive','pay','internal_transfer')),
     posting_date    TEXT NOT NULL,
-    party_type      TEXT,  -- validated via party_type_registry
+    party_type      TEXT CHECK(party_type IN ('customer','supplier','employee')),
     party_id        TEXT,
     paid_from_account TEXT NOT NULL REFERENCES account(id) ON DELETE RESTRICT,
     paid_to_account TEXT NOT NULL REFERENCES account(id) ON DELETE RESTRICT,
@@ -610,7 +604,6 @@ CREATE TABLE IF NOT EXISTS payment_entry (
     received_amount TEXT NOT NULL DEFAULT '0',
     payment_currency TEXT NOT NULL DEFAULT 'USD',
     exchange_rate   TEXT NOT NULL DEFAULT '1',
-    payment_method  TEXT DEFAULT '',  -- cash, check, bank_transfer, credit_card, wire, ach, other
     reference_number TEXT,
     reference_date  TEXT,
     status          TEXT NOT NULL DEFAULT 'draft'
@@ -630,7 +623,10 @@ CREATE INDEX IF NOT EXISTS idx_payment_entry_co_status_date ON payment_entry(com
 CREATE TABLE IF NOT EXISTS payment_allocation (
     id              TEXT PRIMARY KEY,
     payment_entry_id TEXT NOT NULL REFERENCES payment_entry(id) ON DELETE RESTRICT,
-    voucher_type    TEXT NOT NULL,  -- validated via voucher_type_registry
+    voucher_type    TEXT NOT NULL CHECK(voucher_type IN (
+                        'sales_invoice','purchase_invoice',
+                        'credit_note','debit_note'
+                    )),
     voucher_id      TEXT NOT NULL,
     allocated_amount TEXT NOT NULL DEFAULT '0',
     exchange_gain_loss TEXT NOT NULL DEFAULT '0',
@@ -656,7 +652,7 @@ CREATE TABLE IF NOT EXISTS payment_ledger_entry (
     id              TEXT PRIMARY KEY,
     posting_date    TEXT NOT NULL,
     account_id      TEXT NOT NULL REFERENCES account(id) ON DELETE RESTRICT,
-    party_type      TEXT NOT NULL,  -- validated via party_type_registry
+    party_type      TEXT NOT NULL CHECK(party_type IN ('customer','supplier','employee')),
     party_id        TEXT NOT NULL,
     voucher_type    TEXT NOT NULL,
     voucher_id      TEXT NOT NULL,
@@ -1639,7 +1635,12 @@ CREATE TABLE IF NOT EXISTS stock_ledger_entry (
     valuation_rate  TEXT NOT NULL DEFAULT '0',
     stock_value     TEXT NOT NULL DEFAULT '0',
     stock_value_difference TEXT NOT NULL DEFAULT '0',
-    voucher_type    TEXT NOT NULL,  -- validated via voucher_type_registry
+    voucher_type    TEXT NOT NULL CHECK(voucher_type IN (
+                        'stock_entry','purchase_receipt','delivery_note',
+                        'stock_reconciliation','work_order',
+                        'sales_invoice','credit_note','purchase_invoice','debit_note',
+                        'stock_revaluation'
+                    )),
     voucher_id      TEXT NOT NULL,
     batch_id        TEXT,
     serial_number   TEXT,
@@ -3686,118 +3687,6 @@ ALL_DDL_BLOCKS = [
 ]
 
 
-def _seed_type_registries(conn):
-    """Seed voucher_type_registry, party_type_registry, account_type_registry
-    with core ERPClaw types. Idempotent via INSERT OR IGNORE."""
-
-    # GL entry voucher types (core skills)
-    gl_voucher_types = [
-        ("journal_entry", "erpclaw-journals", "Journal Entry"),
-        ("sales_invoice", "erpclaw-selling", "Sales Invoice"),
-        ("purchase_invoice", "erpclaw-buying", "Purchase Invoice"),
-        ("payment_entry", "erpclaw-payments", "Payment Entry"),
-        ("stock_entry", "erpclaw-inventory", "Stock Entry"),
-        ("depreciation_entry", "erpclaw-assets", "Depreciation Entry"),
-        ("payroll_entry", "erpclaw-payroll", "Payroll Entry"),
-        ("period_closing", "erpclaw-gl", "Period Closing"),
-        ("expense_claim", "erpclaw-hr", "Expense Claim"),
-        ("asset_disposal", "erpclaw-assets", "Asset Disposal"),
-        ("stock_reconciliation", "erpclaw-inventory", "Stock Reconciliation"),
-        ("purchase_receipt", "erpclaw-buying", "Purchase Receipt"),
-        ("delivery_note", "erpclaw-selling", "Delivery Note"),
-        ("credit_note", "erpclaw-selling", "Credit Note"),
-        ("debit_note", "erpclaw-buying", "Debit Note"),
-        ("work_order", "erpclaw-manufacturing", "Work Order"),
-        ("exchange_rate_revaluation", "erpclaw-gl", "Exchange Rate Revaluation"),
-        ("stock_revaluation", "erpclaw-inventory", "Stock Revaluation"),
-        ("elimination_entry", "erpclaw-gl", "Elimination Entry"),
-    ]
-    for vt, skill, label in gl_voucher_types:
-        conn.execute(
-            "INSERT OR IGNORE INTO voucher_type_registry (voucher_type, skill_name, label, target_table) "
-            "VALUES (?, ?, ?, 'gl_entry')",
-            (vt, skill, label),
-        )
-
-    # Stock ledger entry voucher types
-    sle_voucher_types = [
-        ("stock_entry", "erpclaw-inventory", "Stock Entry"),
-        ("purchase_receipt", "erpclaw-buying", "Purchase Receipt"),
-        ("delivery_note", "erpclaw-selling", "Delivery Note"),
-        ("stock_reconciliation", "erpclaw-inventory", "Stock Reconciliation"),
-        ("work_order", "erpclaw-manufacturing", "Work Order"),
-        ("sales_invoice", "erpclaw-selling", "Sales Invoice"),
-        ("credit_note", "erpclaw-selling", "Credit Note"),
-        ("purchase_invoice", "erpclaw-buying", "Purchase Invoice"),
-        ("debit_note", "erpclaw-buying", "Debit Note"),
-        ("stock_revaluation", "erpclaw-inventory", "Stock Revaluation"),
-    ]
-    for vt, skill, label in sle_voucher_types:
-        conn.execute(
-            "INSERT OR IGNORE INTO voucher_type_registry (voucher_type, skill_name, label, target_table) "
-            "VALUES (?, ?, ?, 'stock_ledger_entry')",
-            (vt, skill, label),
-        )
-
-    # Payment allocation voucher types
-    pa_voucher_types = [
-        ("sales_invoice", "erpclaw-selling", "Sales Invoice"),
-        ("purchase_invoice", "erpclaw-buying", "Purchase Invoice"),
-        ("credit_note", "erpclaw-selling", "Credit Note"),
-        ("debit_note", "erpclaw-buying", "Debit Note"),
-    ]
-    for vt, skill, label in pa_voucher_types:
-        conn.execute(
-            "INSERT OR IGNORE INTO voucher_type_registry (voucher_type, skill_name, label, target_table) "
-            "VALUES (?, ?, ?, 'payment_allocation')",
-            (vt, skill, label),
-        )
-
-    # Party types
-    party_types = [
-        ("customer", "erpclaw-selling", "Customer"),
-        ("supplier", "erpclaw-buying", "Supplier"),
-        ("employee", "erpclaw-hr", "Employee"),
-    ]
-    for pt, skill, label in party_types:
-        conn.execute(
-            "INSERT OR IGNORE INTO party_type_registry (party_type, skill_name, label) "
-            "VALUES (?, ?, ?)",
-            (pt, skill, label),
-        )
-
-    # Account types
-    account_types = [
-        ("bank", "erpclaw-gl", "Bank"),
-        ("cash", "erpclaw-gl", "Cash"),
-        ("receivable", "erpclaw-selling", "Receivable"),
-        ("payable", "erpclaw-buying", "Payable"),
-        ("stock", "erpclaw-inventory", "Stock"),
-        ("fixed_asset", "erpclaw-assets", "Fixed Asset"),
-        ("accumulated_depreciation", "erpclaw-assets", "Accumulated Depreciation"),
-        ("cost_of_goods_sold", "erpclaw-selling", "Cost of Goods Sold"),
-        ("tax", "erpclaw-tax", "Tax"),
-        ("equity", "erpclaw-gl", "Equity"),
-        ("revenue", "erpclaw-selling", "Revenue"),
-        ("expense", "erpclaw-gl", "Expense"),
-        ("stock_received_not_billed", "erpclaw-buying", "Stock Received Not Billed"),
-        ("stock_adjustment", "erpclaw-inventory", "Stock Adjustment"),
-        ("rounding", "erpclaw-gl", "Rounding"),
-        ("exchange_gain_loss", "erpclaw-gl", "Exchange Gain/Loss"),
-        ("depreciation", "erpclaw-assets", "Depreciation"),
-        ("payroll_payable", "erpclaw-payroll", "Payroll Payable"),
-        ("temporary", "erpclaw-gl", "Temporary"),
-        ("asset_received_not_billed", "erpclaw-assets", "Asset Received Not Billed"),
-        ("trust", "erpclaw-gl", "Trust"),
-    ]
-    for at, skill, label in account_types:
-        conn.execute(
-            "INSERT OR IGNORE INTO account_type_registry (account_type, skill_name, label) "
-            "VALUES (?, ?, ?)",
-            (at, skill, label),
-        )
-
-
 def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
     """Initialize the ERPClaw database with all tables."""
     # Ensure the directory exists
@@ -3846,10 +3735,6 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                    VALUES (?, ?, ?, ?)""",
                 (str(uuid.uuid4()), role_name, desc, is_sys)
             )
-        conn.commit()
-
-        # Seed type registries (idempotent — INSERT OR IGNORE)
-        _seed_type_registries(conn)
         conn.commit()
 
         # Verify: count tables

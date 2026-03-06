@@ -9,6 +9,10 @@ Functions:
 - get_user_companies(conn, user_id) -> list[str]
 - get_user_roles(conn, user_id, company_id=None) -> list[dict]
 - resolve_telegram_user(conn, telegram_username) -> Optional[str]
+- check_row_permission(conn, user_id, entity_type, entity_id) -> bool
+- filter_by_permission(conn, user_id, entity_type, id_column) -> (clause, params)
+- add_user_permission(conn, user_id, entity_type, entity_id, ...) -> str
+- remove_user_permission(conn, user_id, entity_type, entity_id=None) -> None
 
 Permission resolution order:
 1. If no erp_user record exists for user_id → allow (RBAC not enforced yet)
@@ -16,6 +20,12 @@ Permission resolution order:
 3. Check role_permission for matching (skill, action_pattern)
 4. Wildcard patterns: 'submit-*', 'list-*', '*'
 5. If no matching rule found → deny
+
+Row-level security (user_permission table):
+- Restricts which specific entities (company, cost_center, warehouse, etc.)
+  a user can access
+- If no user_permission rows exist for a user+entity_type, access is unrestricted
+- If rows exist, only matching entity_ids are allowed
 
 Note: RBAC is opt-in. Skills call require_permission() in actions that
 need enforcement. If RBAC tables are empty (no users created), all
@@ -230,6 +240,113 @@ def enforce_telegram_rbac(conn, telegram_user_id, skill, action):
         )
 
     require_permission(conn, user_id, skill, action)
+
+
+# ---------------------------------------------------------------------------
+# Row-level security (user_permission table)
+# ---------------------------------------------------------------------------
+
+
+def check_row_permission(conn, user_id, entity_type, entity_id):
+    """Check if a user has permission to access a specific entity row.
+
+    Returns True if:
+    - RBAC is not active
+    - User is System Manager
+    - No user_permission rows exist for this user+entity_type (unrestricted)
+    - A matching user_permission row exists for this user+entity_type+entity_id
+    """
+    if not _rbac_active(conn):
+        return True
+    if _has_system_manager(conn, user_id):
+        return True
+
+    # Check if any restrictions exist for this user + entity_type
+    restrictions = conn.execute(
+        "SELECT id FROM user_permission WHERE user_id = ? AND entity_type = ?",
+        (user_id, entity_type)
+    ).fetchone()
+
+    if not restrictions:
+        return True  # No restrictions defined = unrestricted access
+
+    # Check for specific entity permission
+    allowed = conn.execute(
+        "SELECT id FROM user_permission WHERE user_id = ? AND entity_type = ? AND entity_id = ?",
+        (user_id, entity_type, entity_id)
+    ).fetchone()
+
+    return allowed is not None
+
+
+def filter_by_permission(conn, user_id, entity_type, id_column="id"):
+    """Return a WHERE clause fragment and params for row-level filtering.
+
+    Returns (where_clause, params) tuple.
+    - If RBAC not active or user is System Manager: ("1=1", [])
+    - If no restrictions for user+entity_type: ("1=1", [])
+    - If restrictions exist: ("{id_column} IN (SELECT entity_id FROM user_permission WHERE ...)", [user_id, entity_type])
+    """
+    if not _rbac_active(conn):
+        return "1=1", []
+    if _has_system_manager(conn, user_id):
+        return "1=1", []
+
+    # Check if any restrictions exist
+    restrictions = conn.execute(
+        "SELECT id FROM user_permission WHERE user_id = ? AND entity_type = ?",
+        (user_id, entity_type)
+    ).fetchone()
+
+    if not restrictions:
+        return "1=1", []  # No restrictions = see everything
+
+    clause = f"{id_column} IN (SELECT entity_id FROM user_permission WHERE user_id = ? AND entity_type = ?)"
+    return clause, [user_id, entity_type]
+
+
+def add_user_permission(conn, user_id, entity_type, entity_id,
+                        can_read=True, can_write=False,
+                        can_submit=False, can_cancel=False):
+    """Add a row-level permission for a user.
+
+    Args:
+        user_id: the user to grant permission to
+        entity_type: the entity type being restricted (e.g. 'company', 'warehouse')
+        entity_id: the specific entity ID to allow
+        can_read: allow read access (default True)
+        can_write: allow write access (default False)
+        can_submit: allow submit access (default False)
+        can_cancel: allow cancel access (default False)
+    """
+    import uuid
+    perm_id = str(uuid.uuid4())
+    conn.execute(
+        """INSERT INTO user_permission
+           (id, user_id, entity_type, entity_id, can_read, can_write, can_submit, can_cancel)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (perm_id, user_id, entity_type, entity_id,
+         1 if can_read else 0, 1 if can_write else 0,
+         1 if can_submit else 0, 1 if can_cancel else 0)
+    )
+    return perm_id
+
+
+def remove_user_permission(conn, user_id, entity_type, entity_id=None):
+    """Remove row-level permission(s) for a user.
+
+    If entity_id is None, removes ALL permissions for user+entity_type.
+    """
+    if entity_id:
+        conn.execute(
+            "DELETE FROM user_permission WHERE user_id = ? AND entity_type = ? AND entity_id = ?",
+            (user_id, entity_type, entity_id)
+        )
+    else:
+        conn.execute(
+            "DELETE FROM user_permission WHERE user_id = ? AND entity_type = ?",
+            (user_id, entity_type)
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -74,6 +74,14 @@ def trial_balance(conn, args):
 
     from_date = args.from_date
     to_date = args.to_date
+    project_id = getattr(args, "project_id", None)
+
+    # Build optional project filter clause and params
+    proj_clause = ""
+    proj_params = ()
+    if project_id:
+        proj_clause = " AND project_id = ?"
+        proj_params = (project_id,)
 
     # Get all accounts for the company
     acct_t = Table("account")
@@ -109,8 +117,8 @@ def trial_balance(conn, args):
                 """SELECT COALESCE(decimal_sum(debit), '0') as d,
                           COALESCE(decimal_sum(credit), '0') as c
                    FROM gl_entry WHERE account_id = ? AND posting_date < ?
-                   AND is_cancelled = 0""",
-                (aid, from_date),
+                   AND is_cancelled = 0""" + proj_clause,
+                (aid, from_date) + proj_params,
             ).fetchone()
         else:
             opening = {"d": 0, "c": 0}
@@ -122,16 +130,16 @@ def trial_balance(conn, args):
                           COALESCE(decimal_sum(credit), '0') as c
                    FROM gl_entry WHERE account_id = ?
                    AND posting_date >= ? AND posting_date <= ?
-                   AND is_cancelled = 0""",
-                (aid, from_date, to_date),
+                   AND is_cancelled = 0""" + proj_clause,
+                (aid, from_date, to_date) + proj_params,
             ).fetchone()
         else:
             period = conn.execute(
                 """SELECT COALESCE(decimal_sum(debit), '0') as d,
                           COALESCE(decimal_sum(credit), '0') as c
                    FROM gl_entry WHERE account_id = ?
-                   AND posting_date <= ? AND is_cancelled = 0""",
-                (aid, to_date),
+                   AND posting_date <= ? AND is_cancelled = 0""" + proj_clause,
+                (aid, to_date) + proj_params,
             ).fetchone()
 
         op_d = _d(opening["d"])
@@ -180,6 +188,13 @@ def profit_and_loss(conn, args):
     if not args.to_date:
         err("--to-date is required")
 
+    project_id = getattr(args, "project_id", None)
+    proj_join_clause = ""
+    proj_params = ()
+    if project_id:
+        proj_join_clause = " AND g.project_id = ?"
+        proj_params = (project_id,)
+
     # Raw SQL: too complex for PyPika, readability preserved
     # (COALESCE(decimal_sum(...)) arithmetic in SELECT, LEFT JOIN with date range in ON clause,
     #  HAVING on computed alias — PyPika doesn't support HAVING on aliased expressions cleanly)
@@ -189,12 +204,12 @@ def profit_and_loss(conn, args):
            FROM account a
            LEFT JOIN gl_entry g ON g.account_id = a.id
                AND g.posting_date >= ? AND g.posting_date <= ?
-               AND g.is_cancelled = 0
+               AND g.is_cancelled = 0""" + proj_join_clause + """
            WHERE a.company_id = ? AND a.root_type = 'income' AND a.is_group = 0
            GROUP BY a.id
            HAVING amount != 0
            ORDER BY a.account_number, a.name""",
-        (args.from_date, args.to_date, company_id),
+        (args.from_date, args.to_date) + proj_params + (company_id,),
     ).fetchall()
 
     # Raw SQL: too complex for PyPika, readability preserved
@@ -204,12 +219,12 @@ def profit_and_loss(conn, args):
            FROM account a
            LEFT JOIN gl_entry g ON g.account_id = a.id
                AND g.posting_date >= ? AND g.posting_date <= ?
-               AND g.is_cancelled = 0
+               AND g.is_cancelled = 0""" + proj_join_clause + """
            WHERE a.company_id = ? AND a.root_type = 'expense' AND a.is_group = 0
            GROUP BY a.id
            HAVING amount != 0
            ORDER BY a.account_number, a.name""",
-        (args.from_date, args.to_date, company_id),
+        (args.from_date, args.to_date) + proj_params + (company_id,),
     ).fetchall()
 
     income = [{"account": r["name"], "account_id": r["id"], "amount": _s(_d(r["amount"]))}
@@ -240,6 +255,17 @@ def balance_sheet(conn, args):
     if not args.as_of_date:
         err("--as-of-date is required")
 
+    project_id = getattr(args, "project_id", None)
+    proj_join_clause = ""
+    proj_where_clause = ""
+    proj_join_params = ()
+    proj_where_params = ()
+    if project_id:
+        proj_join_clause = " AND g.project_id = ?"
+        proj_where_clause = " AND g.project_id = ?"
+        proj_join_params = (project_id,)
+        proj_where_params = (project_id,)
+
     def _section(root_type, debit_positive=True):
         # Raw SQL: too complex for PyPika, readability preserved
         # (LEFT JOIN with date filter in ON clause, HAVING on computed aliases)
@@ -249,12 +275,12 @@ def balance_sheet(conn, args):
                       COALESCE(decimal_sum(g.credit), '0') as total_credit
                FROM account a
                LEFT JOIN gl_entry g ON g.account_id = a.id
-                   AND g.posting_date <= ? AND g.is_cancelled = 0
+                   AND g.posting_date <= ? AND g.is_cancelled = 0""" + proj_join_clause + """
                WHERE a.company_id = ? AND a.root_type = ? AND a.is_group = 0
                GROUP BY a.id
                HAVING total_debit != 0 OR total_credit != 0
                ORDER BY a.account_number, a.name""",
-            (args.as_of_date, company_id, root_type),
+            (args.as_of_date,) + proj_join_params + (company_id, root_type),
         ).fetchall()
 
         items = []
@@ -299,16 +325,16 @@ def balance_sheet(conn, args):
                FROM gl_entry g JOIN account a ON a.id = g.account_id
                WHERE a.company_id = ? AND a.root_type = 'income'
                AND g.posting_date >= ? AND g.posting_date <= ?
-               AND g.is_cancelled = 0""",
-            (company_id, fy_start, args.as_of_date),
+               AND g.is_cancelled = 0""" + proj_where_clause,
+            (company_id, fy_start, args.as_of_date) + proj_where_params,
         ).fetchone()
         exp = conn.execute(
             """SELECT COALESCE(decimal_sum(debit), '0') - COALESCE(decimal_sum(credit), '0') as amt
                FROM gl_entry g JOIN account a ON a.id = g.account_id
                WHERE a.company_id = ? AND a.root_type = 'expense'
                AND g.posting_date >= ? AND g.posting_date <= ?
-               AND g.is_cancelled = 0""",
-            (company_id, fy_start, args.as_of_date),
+               AND g.is_cancelled = 0""" + proj_where_clause,
+            (company_id, fy_start, args.as_of_date) + proj_where_params,
         ).fetchone()
         net_income_ytd = _d(inc["amt"]) - _d(exp["amt"])
 

@@ -35,7 +35,7 @@ except ImportError:
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw-setup first: clawhub install erpclaw-setup", "suggestion": "clawhub install erpclaw-setup"}))
     sys.exit(1)
 
-REQUIRED_TABLES = ["company", "account"]
+REQUIRED_TABLES = ["company", "account", "party_type_registry"]
 
 VALID_TAX_TYPES = ("sales", "purchase", "both")
 VALID_CHARGE_TYPES = (
@@ -429,13 +429,27 @@ def list_tax_rules(conn, args):
 
 def resolve_tax_template(conn, args):
     """Auto-select tax template by matching tax rules in priority order."""
-    if not args.party_type or args.party_type not in ("customer", "supplier"):
-        err("--party-type must be 'customer' or 'supplier'")
+    if not args.party_type:
+        err("--party-type is required")
+    # Validate against registered party types
+    valid = conn.execute("SELECT party_type FROM party_type_registry WHERE party_type = ?",
+                         (args.party_type,)).fetchone()
+    if not valid:
+        all_types = [r[0] for r in conn.execute("SELECT party_type FROM party_type_registry").fetchall()]
+        err(f"--party-type '{args.party_type}' is not registered. Valid types: {', '.join(all_types)}")
     if not args.party_id:
         err("--party-id is required")
     company_id = resolve_company_id(conn, getattr(args, 'company_id', None))
 
-    tx_type = args.transaction_type or ("sales" if args.party_type == "customer" else "purchase")
+    if args.transaction_type:
+        tx_type = args.transaction_type
+    elif args.party_type == "customer":
+        tx_type = "sales"
+    elif args.party_type == "supplier":
+        tx_type = "purchase"
+    else:
+        # Generic party type — default to sales; caller should provide --transaction-type
+        tx_type = "sales"
 
     # Check party exemption (customer or supplier table)
     is_exempt = False
@@ -447,6 +461,10 @@ def resolve_tax_template(conn, args):
     elif args.party_type == "supplier":
         q_supp = Q.from_(supp_t).select(supp_t.id).where(supp_t.id == P())
         party = conn.execute(q_supp.get_sql(), (args.party_id,)).fetchone()
+    else:
+        # Generic party type — skip party-specific validation
+        # Tax template lookup still works via party_type field in tax rules
+        pass
 
     # Parse shipping address if provided
     shipping = _parse_json_arg(args.shipping_address, "shipping-address") if args.shipping_address else None

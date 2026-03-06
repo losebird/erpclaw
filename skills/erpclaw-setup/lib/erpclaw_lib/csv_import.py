@@ -52,6 +52,16 @@ SCHEMAS = {
 }
 
 
+def register_csv_schema(entity_type: str, schema: dict):
+    """Register a custom CSV import schema at runtime.
+
+    Called by vertical skills during init to add their own CSV import schemas.
+    Schema dict must have 'required' (list of required column names) and
+    'optional' (list of optional column names) keys, plus optional 'defaults' dict.
+    """
+    SCHEMAS[entity_type] = schema
+
+
 def validate_csv(file_path, entity_type):
     """Validate a CSV file against a schema.
 

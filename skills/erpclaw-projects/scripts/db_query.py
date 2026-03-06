@@ -2,7 +2,7 @@
 """ERPClaw Projects Skill -- db_query.py
 
 Projects, tasks, milestones, timesheets, and project reports.
-All 18 actions are routed through this single entry point.
+All 19 actions are routed through this single entry point.
 
 Usage: python3 db_query.py --action <action-name> [--flags ...]
 Output: JSON to stdout, exit 0 on success, exit 1 on error.
@@ -26,6 +26,7 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
+    from erpclaw_lib.cross_skill import create_invoice, submit_invoice, CrossSkillError
     from erpclaw_lib.query import (
         Q, P, Table, Field, fn, Case, Order,
         DecimalSum, insert_row, update_row,
@@ -1237,6 +1238,238 @@ def bill_timesheet(conn, args):
 
 
 # ---------------------------------------------------------------------------
+# 14b. create-billing-from-timesheets (T&M billing pipeline)
+# ---------------------------------------------------------------------------
+
+def create_billing_from_timesheets(conn, args):
+    """Create a Sales Invoice from unbilled timesheets for a T&M project.
+
+    Required: --project-id, --company-id, --customer-id
+    Optional: --from-date, --to-date
+
+    Gathers all submitted (unbilled) timesheet detail rows for the project,
+    groups them by employee, creates a Sales Invoice via erpclaw-selling
+    cross_skill, then marks the timesheets as billed with the invoice reference.
+    """
+    if not args.project_id:
+        err("--project-id is required")
+    if not args.company_id:
+        err("--company-id is required")
+    if not args.customer_id:
+        err("--customer-id is required")
+
+    _validate_company_exists(conn, args.company_id)
+    project = _validate_project_exists(conn, args.project_id)
+    p = row_to_dict(project)
+    _validate_customer_exists(conn, args.customer_id)
+
+    # Verify project is T&M (time_and_material)
+    if p["billing_type"] != "time_and_material":
+        err(f"Project billing type is '{p['billing_type']}', "
+            "create-billing-from-timesheets only applies to 'time_and_material' projects")
+
+    # Query unbilled timesheet details for this project
+    # Unbilled = parent timesheet status is 'submitted' (not yet 'billed')
+    td = Table("timesheet_detail")
+    ts = Table("timesheet")
+    e = Table("employee")
+
+    params = [args.project_id, args.company_id]
+
+    base_q = (Q.from_(td)
+              .join(ts).on(td.timesheet_id == ts.id)
+              .left_join(e).on(ts.employee_id == e.id)
+              .where(td.project_id == P())
+              .where(ts.company_id == P())
+              .where(ts.status == ValueWrapper("submitted"))
+              .where(td.billable == 1))
+
+    if args.from_date:
+        base_q = base_q.where(td.date >= P())
+        params.append(args.from_date)
+
+    if args.to_date:
+        base_q = base_q.where(td.date <= P())
+        params.append(args.to_date)
+
+    detail_q = (base_q
+                .select(
+                    td.id, td.timesheet_id, td.project_id, td.task_id,
+                    td.activity_type, td.hours, td.billing_rate,
+                    td.description, td.date,
+                    ts.employee_id,
+                    e.full_name.as_("employee_name"),
+                )
+                .orderby(ts.employee_id).orderby(td.date))
+
+    rows = conn.execute(detail_q.get_sql(), params).fetchall()
+
+    if not rows:
+        err("No unbilled billable timesheet entries found for this project",
+            suggestion="Ensure timesheets are submitted (not draft) and have billable=1 detail rows.")
+
+    # Group by employee to create invoice line items
+    employee_groups = {}  # employee_id -> {name, hours, amount, detail_ids, timesheet_ids}
+    all_timesheet_ids = set()
+
+    for row in rows:
+        r = row_to_dict(row)
+        emp_id = r["employee_id"]
+        emp_name = r["employee_name"] or emp_id
+        hours = to_decimal(r["hours"])
+        rate = to_decimal(r["billing_rate"])
+        line_amount = round_currency(hours * rate)
+
+        if emp_id not in employee_groups:
+            employee_groups[emp_id] = {
+                "employee_name": emp_name,
+                "total_hours": Decimal("0"),
+                "total_amount": Decimal("0"),
+                "detail_ids": [],
+                "timesheet_ids": set(),
+                "activities": [],
+            }
+
+        grp = employee_groups[emp_id]
+        grp["total_hours"] += hours
+        grp["total_amount"] += line_amount
+        grp["detail_ids"].append(r["id"])
+        grp["timesheet_ids"].add(r["timesheet_id"])
+        all_timesheet_ids.add(r["timesheet_id"])
+
+        # Collect activity info for description
+        activity = r["activity_type"] or "general"
+        if activity not in grp["activities"]:
+            grp["activities"].append(activity)
+
+    # Build invoice items — one line per employee
+    invoice_items = []
+    grand_total = Decimal("0")
+
+    for emp_id, grp in employee_groups.items():
+        total_hours = round_currency(grp["total_hours"])
+        total_amount = round_currency(grp["total_amount"])
+        grand_total += total_amount
+
+        # Calculate effective rate (weighted average)
+        effective_rate = Decimal("0")
+        if total_hours > 0:
+            effective_rate = round_currency(total_amount / total_hours)
+
+        activities_str = ", ".join(grp["activities"])
+        description = (
+            f"T&M: {grp['employee_name']} — "
+            f"{total_hours}h ({activities_str}) — "
+            f"Project: {p['project_name']}"
+        )
+
+        invoice_items.append({
+            "description": description,
+            "qty": str(total_hours),
+            "rate": str(effective_rate),
+        })
+
+    if grand_total <= 0:
+        err("Total billable amount is zero — nothing to invoice")
+
+    # Create the Sales Invoice via cross_skill
+    posting_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    remarks = (
+        f"T&M billing for project {p['project_name']} "
+        f"({p['naming_series'] or args.project_id})"
+    )
+    if args.from_date or args.to_date:
+        period = f"{args.from_date or 'start'} to {args.to_date or 'now'}"
+        remarks += f" — Period: {period}"
+
+    db_path = args.db_path or DEFAULT_DB_PATH
+
+    try:
+        inv_result = create_invoice(
+            customer_id=args.customer_id,
+            items=invoice_items,
+            company_id=args.company_id,
+            posting_date=posting_date,
+            project_id=args.project_id,
+            remarks=remarks,
+            db_path=db_path,
+        )
+    except CrossSkillError as e:
+        err(f"Failed to create invoice: {e}",
+            suggestion="Ensure erpclaw-selling is installed and the customer exists.")
+
+    invoice_id = inv_result.get("sales_invoice", {}).get("id")
+    invoice_name = inv_result.get("sales_invoice", {}).get("naming_series", "")
+    if not invoice_id:
+        err("Invoice was created but no ID returned — unexpected response from erpclaw-selling")
+
+    # Mark all affected timesheets as billed with invoice reference
+    for ts_id in all_timesheet_ids:
+        conn.execute(
+            "UPDATE timesheet SET status = 'billed', "
+            "total_billed_hours = total_billable_hours, "
+            "sales_invoice_id = ?, "
+            "updated_at = datetime('now') WHERE id = ?",
+            (invoice_id, ts_id),
+        )
+
+    # Update project actual_cost and total_billed
+    proj_q = (Q.from_(_t_project)
+              .select(_t_project.actual_cost, _t_project.total_billed)
+              .where(_t_project.id == P()))
+    proj_row = conn.execute(proj_q.get_sql(), (args.project_id,)).fetchone()
+    if proj_row:
+        new_actual = round_currency(to_decimal(proj_row["actual_cost"]) + grand_total)
+        new_billed = round_currency(to_decimal(proj_row["total_billed"]) + grand_total)
+        profit_margin = Decimal("0")
+        if new_billed > 0:
+            profit_margin = round_currency(
+                ((new_billed - new_actual) / new_billed) * Decimal("100")
+            )
+        conn.execute(
+            "UPDATE project SET actual_cost = ?, total_billed = ?, profit_margin = ?, "
+            "updated_at = datetime('now') WHERE id = ?",
+            (str(new_actual), str(new_billed), str(profit_margin), args.project_id),
+        )
+
+    audit(conn, "erpclaw-projects", "create-billing-from-timesheets",
+          "project", args.project_id,
+          new_values={
+              "invoice_id": invoice_id,
+              "invoice_name": invoice_name,
+              "total_amount": str(grand_total),
+              "timesheets_billed": len(all_timesheet_ids),
+              "employees": len(employee_groups),
+          },
+          description=f"T&M billing: created invoice {invoice_name} for {grand_total}")
+    conn.commit()
+
+    # Build response
+    employee_summary = []
+    for emp_id, grp in employee_groups.items():
+        employee_summary.append({
+            "employee_id": emp_id,
+            "employee_name": grp["employee_name"],
+            "hours": str(round_currency(grp["total_hours"])),
+            "amount": str(round_currency(grp["total_amount"])),
+            "timesheet_count": len(grp["timesheet_ids"]),
+        })
+
+    ok({
+        "invoice_id": invoice_id,
+        "invoice_name": invoice_name,
+        "project_id": args.project_id,
+        "project_name": p["project_name"],
+        "customer_id": args.customer_id,
+        "total_amount": str(grand_total),
+        "timesheets_billed": len(all_timesheet_ids),
+        "employees": employee_summary,
+        "from_date": args.from_date,
+        "to_date": args.to_date,
+    })
+
+
+# ---------------------------------------------------------------------------
 # 15. project-profitability
 # ---------------------------------------------------------------------------
 
@@ -1634,6 +1867,7 @@ ACTIONS = {
     "list-timesheets": list_timesheets,
     "submit-timesheet": submit_timesheet,
     "bill-timesheet": bill_timesheet,
+    "create-billing-from-timesheets": create_billing_from_timesheets,
     "project-profitability": project_profitability,
     "gantt-data": gantt_data,
     "resource-utilization": resource_utilization,

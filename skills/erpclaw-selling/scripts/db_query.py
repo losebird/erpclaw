@@ -2233,6 +2233,16 @@ def submit_sales_invoice(conn, args):
     fiscal_year = _get_fiscal_year(conn, posting_date)
     cost_center_id = _get_cost_center(conn, company_id)
 
+    # Collect project_ids from invoice items for GL propagation
+    item_project_ids = []
+    for sii in si_items:
+        sii_d = row_to_dict(sii)
+        item_project_ids.append(sii_d.get("project_id"))
+    # For aggregate GL entries: use first item's project_id if all items share
+    # the same project, otherwise None (mixed projects)
+    unique_projects = set(p for p in item_project_ids if p)
+    aggregate_project_id = list(unique_projects)[0] if len(unique_projects) == 1 else None
+
     # --- Revenue GL entries ---
     receivable_account_id = _get_receivable_account(conn, company_id)
     if not receivable_account_id:
@@ -2260,6 +2270,7 @@ def submit_sales_invoice(conn, args):
             "credit": str(round_currency(abs_grand_total)),
             "party_type": "customer",
             "party_id": customer_id,
+            "project_id": aggregate_project_id,
         })
     else:
         gl_entries.append({
@@ -2268,6 +2279,7 @@ def submit_sales_invoice(conn, args):
             "credit": "0",
             "party_type": "customer",
             "party_id": customer_id,
+            "project_id": aggregate_project_id,
         })
 
     # CR: Revenue (for credit notes: DR Revenue to reverse)
@@ -2277,6 +2289,7 @@ def submit_sales_invoice(conn, args):
             "debit": str(round_currency(abs_total_amount)),
             "credit": "0",
             "cost_center_id": cost_center_id,
+            "project_id": aggregate_project_id,
         })
     else:
         gl_entries.append({
@@ -2284,6 +2297,7 @@ def submit_sales_invoice(conn, args):
             "debit": "0",
             "credit": str(round_currency(abs_total_amount)),
             "cost_center_id": cost_center_id,
+            "project_id": aggregate_project_id,
         })
 
     # CR: Tax Payable (if tax exists) — for returns, use abs() and DR (reverse)
@@ -2298,6 +2312,7 @@ def submit_sales_invoice(conn, args):
                         "debit": str(round_currency(amt)),
                         "credit": "0",
                         "cost_center_id": cost_center_id,
+                        "project_id": aggregate_project_id,
                     })
                 else:
                     gl_entries.append({
@@ -2305,6 +2320,7 @@ def submit_sales_invoice(conn, args):
                         "debit": "0",
                         "credit": str(round_currency(amt)),
                         "cost_center_id": cost_center_id,
+                        "project_id": aggregate_project_id,
                     })
 
     # Generate naming series early so GL remarks include the human-readable name
@@ -2376,6 +2392,7 @@ def submit_sales_invoice(conn, args):
                 "actual_qty": str(round_currency(-qty if not is_return else qty)),
                 "incoming_rate": "0" if not is_return else str(round_currency(to_decimal(sii_dict["rate"]))),
                 "fiscal_year": fiscal_year,
+                "project_id": sii_dict.get("project_id"),
             })
 
         if sle_entries:
@@ -2413,6 +2430,7 @@ def submit_sales_invoice(conn, args):
             if cogs_gl_entries:
                 for gle in cogs_gl_entries:
                     gle["fiscal_year"] = fiscal_year
+                    gle["project_id"] = aggregate_project_id
                 # Insert COGS GL entries via shared lib (entry_set="cogs"
                 # allows multiple GL sets per voucher without idempotency conflict)
                 try:
